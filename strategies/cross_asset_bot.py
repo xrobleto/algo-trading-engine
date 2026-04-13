@@ -154,7 +154,7 @@ MAX_GROSS_EXPOSURE = 1.00         # no leverage — max 100% of sleeve
 # REBALANCE SCHEDULE
 # =============================================================================
 
-REBALANCE_WEEKDAY = 2             # Wednesday (0=Mon, 2=Wed, 4=Fri)
+REBALANCE_WEEKDAY = 0             # TEMPORARY: Monday for one-time rebalance (normally 2=Wed)
 REBALANCE_TIME_ET = (10, 30)      # 10:30 AM ET (30 min post-open for clean fills)
 REBALANCE_DEADLINE_ET = (11, 0)   # 11:00 AM ET (30 min execution window)
 
