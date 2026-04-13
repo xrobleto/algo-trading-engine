@@ -14,7 +14,6 @@ COPY ai_manager/ ai_manager/
 
 # Railway persistent volume mount point
 ENV ALGO_OUTPUT_DIR=/data
-VOLUME /data
 
 # Run from strategies/ so relative imports work
 WORKDIR /app/strategies
