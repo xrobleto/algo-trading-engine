@@ -1,0 +1,38 @@
+
+================================================================================
+INSTAGRAM POSTING INSTRUCTIONS
+Generated: 2026-01-25 15:22:34
+Posts ready: 1
+================================================================================
+
+QUICK WORKFLOW (5 minutes):
+
+1. Open Meta Business Suite: https://business.facebook.com
+   (or use the Meta Business Suite mobile app)
+
+2. Click "Create Post" → Select Instagram
+
+3. For each folder below:
+   a. Drag the image.png into Meta Business Suite
+   b. Open caption.txt, copy all text (Ctrl+A, Ctrl+C)
+   c. Paste into the caption field
+   d. Set schedule time (or post now)
+   e. Click "Schedule" or "Post"
+
+4. After posting, run: python post_ready.py --mark-posted
+
+================================================================================
+POSTS TO UPLOAD:
+================================================================================
+
+1. 01_market_context/
+   Type: market_context
+   
+   Suggested time: 08:30 AM
+
+================================================================================
+TIPS:
+- Best posting times: 8:30 AM, 12:30 PM, 5:00 PM, 7:30 PM
+- Space posts at least 2 hours apart
+- Meta Business Suite lets you schedule up to 30 days ahead
+================================================================================

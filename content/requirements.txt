@@ -1,0 +1,5 @@
+# Content Automation Dependencies
+anthropic>=0.40.0      # Claude AI for captions
+pillow>=10.0.0         # Image generation
+requests>=2.31.0       # API calls (Buffer, Beehiiv, Imgur)
+python-dotenv>=1.0.0   # Environment variables

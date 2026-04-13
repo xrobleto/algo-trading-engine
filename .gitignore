@@ -1,0 +1,29 @@
+# API keys and secrets
+config/*.env
+.env
+
+# Runtime state (lives in ALGO_OUTPUT_DIR, not source tree)
+*.json
+!package.json
+data/
+logs/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# IDE
+.vscode/
+.idea/
+
+# Google Drive internals
+*.gdoc
+*.gsheet

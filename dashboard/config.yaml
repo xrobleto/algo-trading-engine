@@ -1,0 +1,21 @@
+# User Authentication Configuration
+# Passwords are hashed using bcrypt - generate new hashes with:
+#   import streamlit_authenticator as stauth
+#   stauth.Hasher(['password123']).generate()
+
+credentials:
+  usernames:
+    admin:
+      name: Admin User
+      password: $2b$12$D.9nOyzrJFrwQhDwDwX.9ufWdswLO/yie7vj0EtxC0tC0vH7/r2Qm  # Change this!
+    demo:
+      name: Demo User
+      password: $2b$12$D.9nOyzrJFrwQhDwDwX.9ufWdswLO/yie7vj0EtxC0tC0vH7/r2Qm  # Change this!
+
+cookie:
+  expiry_days: 30
+  key: smallcap_scanner_secret_key_change_me  # Change this to a random string!
+  name: smallcap_scanner_auth
+
+preauthorized:
+  emails: []

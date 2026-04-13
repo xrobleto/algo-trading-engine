@@ -1,0 +1,66 @@
+# =============================================================================
+# Event Calendar - Macro Events That Affect Position Sizing
+# =============================================================================
+# The trend bot reduces exposure before high-impact events.
+# Update this file quarterly with upcoming FOMC, CPI, Jobs, etc.
+#
+# Risk levels:
+#   high:   20% exposure reduction, 1 day lead time (FOMC, CPI, Jobs)
+#   medium: 10% exposure reduction, 0 day lead time (GDP, retail sales)
+#   low:     5% exposure reduction, 0 day lead time (minor reports)
+
+event_risk:
+  multipliers:
+    high: 0.80
+    medium: 0.90
+    low: 0.95
+    none: 1.00
+  lead_days:
+    high: 1
+    medium: 0
+    low: 0
+
+calendar:
+  year: 2026
+  events:
+    # Q1 2026
+    "2026-01-29": {name: "FOMC Decision", risk: "high"}
+    "2026-02-07": {name: "Jobs Report (Jan)", risk: "high"}
+    "2026-02-12": {name: "CPI (Jan)", risk: "high"}
+    "2026-02-27": {name: "GDP Q4 (2nd est)", risk: "medium"}
+    "2026-03-06": {name: "Jobs Report (Feb)", risk: "high"}
+    "2026-03-11": {name: "CPI (Feb)", risk: "high"}
+    "2026-03-18": {name: "FOMC Decision", risk: "high"}
+
+    # Q2 2026
+    "2026-04-03": {name: "Jobs Report (Mar)", risk: "high"}
+    "2026-04-10": {name: "CPI (Mar)", risk: "high"}
+    "2026-04-29": {name: "GDP Q1 (1st est)", risk: "medium"}
+    "2026-05-06": {name: "FOMC Decision", risk: "high"}
+    "2026-05-08": {name: "Jobs Report (Apr)", risk: "high"}
+    "2026-05-12": {name: "CPI (Apr)", risk: "high"}
+    "2026-06-05": {name: "Jobs Report (May)", risk: "high"}
+    "2026-06-10": {name: "CPI (May)", risk: "high"}
+    "2026-06-17": {name: "FOMC Decision", risk: "high"}
+
+    # Q3 2026
+    "2026-07-02": {name: "Jobs Report (Jun)", risk: "high"}
+    "2026-07-14": {name: "CPI (Jun)", risk: "high"}
+    "2026-07-29": {name: "FOMC Decision", risk: "high"}
+    "2026-07-30": {name: "GDP Q2 (1st est)", risk: "medium"}
+    "2026-08-07": {name: "Jobs Report (Jul)", risk: "high"}
+    "2026-08-12": {name: "CPI (Jul)", risk: "high"}
+    "2026-09-04": {name: "Jobs Report (Aug)", risk: "high"}
+    "2026-09-10": {name: "CPI (Aug)", risk: "high"}
+    "2026-09-16": {name: "FOMC Decision", risk: "high"}
+
+    # Q4 2026
+    "2026-10-02": {name: "Jobs Report (Sep)", risk: "high"}
+    "2026-10-13": {name: "CPI (Sep)", risk: "high"}
+    "2026-10-29": {name: "GDP Q3 (1st est)", risk: "medium"}
+    "2026-11-04": {name: "FOMC Decision", risk: "high"}
+    "2026-11-06": {name: "Jobs Report (Oct)", risk: "high"}
+    "2026-11-10": {name: "CPI (Oct)", risk: "high"}
+    "2026-12-04": {name: "Jobs Report (Nov)", risk: "high"}
+    "2026-12-10": {name: "CPI (Nov)", risk: "high"}
+    "2026-12-16": {name: "FOMC Decision", risk: "high"}

@@ -1,0 +1,258 @@
+# ===================================================================
+# HYSA Phase 1: "WOW-only" Alerts (Buy + Sell)
+# Goal: build HYSA to $100k by March 20, 2026
+# WOW definition: alert only on unusually favorable opportunities.
+# Output: up to 3 tickers per email (buy) and up to 3 tickers per email (sell).
+# ===================================================================
+
+# =============================================================================
+# RISK LEVEL PRESETS (Change this to adjust overall aggressiveness)
+# =============================================================================
+# Level 1 (Conservative): WOW-only, very strict thresholds, fewer alerts
+# Level 2 (Moderate):     Balanced quality vs frequency, good opportunities
+# Level 3 (Aggressive):   More frequent alerts, lower quality threshold
+# =============================================================================
+risk_level: 3  # <-- CHANGE THIS: 1 (Conservative) | 2 (Moderate) | 3 (Aggressive)
+
+hysa:
+  goal_usd: 100000
+  quit_date: "2026-03-20"
+  current_hysa_usd: 76000                 # <-- set this
+  current_broker_cash_usd: 100000          # <-- optional
+  monthly_spend_estimate_usd: 12000
+
+analysis:
+  # Scheduling
+  interval_seconds: 300               # market hours cadence
+  off_hours_interval_seconds: 1800    # off-hours cadence
+  timezone: "America/Chicago"
+
+  # Indicators lookback (calendar days)
+  # Buy script needs enough history for EMA200 and 20D highs/volume averages.
+  daily_lookback_days: 520
+
+  # News
+  news_limit: 20
+  news_lookback_hours: 72
+
+  # ==========================
+  # SELL SETTINGS (Adjusted by risk_level)
+  # ==========================
+  # Level 1: Very strict (WOW-only extreme conditions)
+  # Level 2: Moderate (good opportunities)
+  # Level 3: More frequent alerts
+
+  # RSI thresholds
+  # Level 1: 74/82 | Level 2: 70/78 | Level 3: 68/75
+  rsi_overbought: 74
+  rsi_very_overbought: 82
+
+  # Extension / breakdown thresholds
+  # Level 1: 10%/12% | Level 2: 8%/10% | Level 3: 6%/8%
+  extend_over_ema20_pct: 0.10           # +10% over EMA20 = "very extended"
+  drawdown_from_20d_high_pct: 0.12      # -12% from 20D high = "meaningful breakdown"
+
+  # Require meaningful gains before recommending strength trims
+  # Level 1: 12% | Level 2: 8% | Level 3: 5%
+  min_unrealized_gain_pct_for_strength_sell: 0.12
+
+  # Alerting behavior (anti-spam)
+  # Level 1: 1440min (1 day) | Level 2: 720min (12hr) | Level 3: 360min (6hr)
+  ticker_alert_cooldown_minutes: 1440
+
+  # Email output limits
+  # Level 1: 3 | Level 2: 5 | Level 3: 8
+  max_positions_in_email: 3
+
+  # Tranche plan for sell suggestions
+  tranche_plan:
+    strength: [0.33, 0.33, 0.34]
+    riskoff:   [0.50, 0.50]
+
+  # Execution hinting (not orders)
+  limit_discount_bps: 10
+
+  # Score thresholds for alerts
+  # Level 1: 75/65 | Level 2: 65/55 | Level 3: 55/45
+  min_score_to_alert_strength: 55
+  min_score_to_alert_riskoff: 45
+
+buy:
+  # ==========================
+  # BUY SETTINGS (Adjusted by risk_level)
+  # ==========================
+  # Level 1: WOW-only high-quality setups
+  # Level 2: Good quality, more frequent alerts
+  # Level 3: Broader opportunities, higher alert frequency
+
+  cash_budget_usd: 0                     # 0 = idea engine only (no budget cap)
+
+  # Email output limits
+  # Level 1: 3 | Level 2: 5 | Level 3: 8
+  max_positions_in_email: 3
+
+  # Alerting cooldown
+  # Level 1: 1440min (1 day) | Level 2: 720min (12hr) | Level 3: 360min (6hr)
+  ticker_alert_cooldown_minutes: 1440
+
+  # Score thresholds to trigger alerts
+  # Level 1: 75/70/90 | Level 2: 65/60/80 | Level 3: 55/50/70
+  min_score_to_alert_breakout: 75        # Breakout quality threshold
+  min_score_to_alert_pullback: 70        # Pullback quality threshold
+  min_score_to_alert_meanrevert: 90      # Mean reversion (noisy, keep strict)
+
+  # Trend requirements
+  # Level 1: both true | Level 2: both true | Level 3: pullback false, breakout true
+  require_uptrend_for_pullback: true
+  require_uptrend_for_breakout: true
+
+  # Pullback range (distance from EMA20)
+  # Level 1: -3% to 0% | Level 2: -5% to 0% | Level 3: -7% to +2%
+  pullback_to_ema20_min_pct: -0.03       # -3% below EMA20 (shallow pullbacks only)
+  pullback_to_ema20_max_pct:  0.00       # at/under EMA20 only
+
+  # Max extension above EMA20 (avoid chasing)
+  # Level 1: 6% | Level 2: 8% | Level 3: 10%
+  max_extension_above_ema20_pct: 0.06
+
+  # Breakout proximity to 20-day high
+  # Level 1: 0.2% | Level 2: 0.5% | Level 3: 1.0%
+  breakout_near_20d_high_buffer_pct: 0.002  # within 0.2% of 20D high (very tight)
+
+  # Breakout volume requirement
+  # Level 1: 2.5x | Level 2: 2.0x | Level 3: 1.5x
+  breakout_volume_ratio_min: 2.5
+
+  # Mean reversion RSI threshold (oversold)
+  # Level 1: 25 | Level 2: 28 | Level 3: 30
+  meanrevert_rsi_max: 25
+
+  # Risk / sizing
+  # Level 1: $200/$3000 | Level 2: $300/$4500 | Level 3: $400/$6000
+  risk_per_trade_usd: 200
+  max_position_usd: 3000
+
+  # Stop loss ATR multiples
+  # Level 1: 1.5/1.7/1.8 | Level 2: 1.8/2.0/2.2 | Level 3: 2.0/2.3/2.5
+  stop_atr_mult_pullback: 1.5
+  stop_atr_mult_breakout: 1.7
+  stop_atr_mult_meanrevert: 1.8
+
+  entry_slippage_bps: 5
+
+# Universe for BUY alerts (watchlist)
+# (Sell alerts still come from your holdings via Robinhood activity parsing.)
+universe:
+  # Source options:
+  #   "file"   - Load from file only (your curated list)
+  #   "list"   - Load from list: below
+  #   "reddit" - Load from Reddit trending only
+  #   "hybrid" - Combine file + Reddit trending (RECOMMENDED)
+  source: "hybrid"
+
+  # File-based universe (used when source is "file" or "hybrid")
+  file_path: "../data/inputs/buy_universe.txt"
+
+  # List-based universe (used when source is "list")
+  list: []
+
+  # Reddit integration (used when source is "reddit" or "hybrid")
+  include_reddit_trending: true
+  reddit_trending_limit: 30              # Max tickers to pull from Reddit
+  min_mentions: 20                       # Min mentions to include
+
+  # Advanced Reddit filtering
+  reddit:
+    limit: 30
+    min_mentions: 20
+    only_bullish: false                  # If true, only include bullish sentiment stocks
+    exclude_bearish: true                # If true, exclude stocks with bearish sentiment
+    min_sentiment: -0.3                  # Minimum sentiment score (-1 to 1)
+
+  # Holdings integration
+  include_holdings: true
+  min_holdings_qty_to_skip: 0.0          # set >0 if you want to skip tickers you already own
+
+brokers:
+  - broker_name: "Robinhood"
+    broker_type: "robinhood_activity"
+    enabled: true
+    file_path: "../data/inputs/robinhood_activity.csv"
+    delimiter: ","
+    column_map:
+      activity_date: "Activity Date"
+      instrument: "Instrument"
+      trans_code: "Trans Code"
+      quantity: "Quantity"
+      price: "Price"
+      amount: "Amount"
+
+email:
+  subject_prefix: "[HYSA Phase 1 Sell Alert]"
+  subject_prefix_buy: "[WOW Buy Alert]"
+  send_empty_emails: false
+
+paths:
+  # Sell script
+  state_file: "../data/state/alert_state.json"
+  cache_dir: "../data/cache"
+  log_file: "../logs/sell_alerts.log"
+
+  # Buy script
+  buy_state_file: "../data/state/buy_alert_state.json"
+  buy_log_file: "../logs/buy_alerts.log"
+
+polygon:
+  base_url: "https://api.polygon.io"
+
+# =============================================================================
+# RISK LEVEL REFERENCE GUIDE
+# =============================================================================
+# Quick reference for what changes when you adjust risk_level (1-3)
+#
+# ┌─────────────────────────────────────────────────────────────────────────┐
+# │ PARAMETER                           │ Level 1  │ Level 2  │ Level 3    │
+# ├─────────────────────────────────────┼──────────┼──────────┼────────────┤
+# │ SELL ALERTS                         │          │          │            │
+# ├─────────────────────────────────────┼──────────┼──────────┼────────────┤
+# │ RSI Overbought                      │ 74       │ 70       │ 68         │
+# │ RSI Very Overbought                 │ 82       │ 78       │ 75         │
+# │ Extension over EMA20                │ 10%      │ 8%       │ 6%         │
+# │ Drawdown from 20D high              │ 12%      │ 10%      │ 8%         │
+# │ Min gain for strength sell          │ 12%      │ 8%       │ 5%         │
+# │ Alert cooldown                      │ 1 day    │ 12 hrs   │ 6 hrs      │
+# │ Max positions per email             │ 3        │ 5        │ 8          │
+# │ Min score (strength/riskoff)        │ 75/65    │ 65/55    │ 55/45      │
+# ├─────────────────────────────────────┼──────────┼──────────┼────────────┤
+# │ BUY ALERTS                          │          │          │            │
+# ├─────────────────────────────────────┼──────────┼──────────┼────────────┤
+# │ Max positions per email             │ 3        │ 5        │ 8          │
+# │ Alert cooldown                      │ 1 day    │ 12 hrs   │ 6 hrs      │
+# │ Min score (breakout/pullback/MR)    │ 75/70/90 │ 65/60/80 │ 55/50/70   │
+# │ Pullback range (from EMA20)         │ -3% to 0%│ -5% to 0%│ -7% to +2% │
+# │ Max extension above EMA20           │ 6%       │ 8%       │ 10%        │
+# │ Breakout proximity to 20D high      │ 0.2%     │ 0.5%     │ 1.0%       │
+# │ Breakout volume ratio min           │ 2.5x     │ 2.0x     │ 1.5x       │
+# │ Mean reversion RSI max              │ 25       │ 28       │ 30         │
+# │ Risk per trade                      │ $200     │ $300     │ $400       │
+# │ Max position size                   │ $3,000   │ $4,500   │ $6,000     │
+# │ Stop ATR mult (PB/BO/MR)            │1.5/1.7/1.8│1.8/2.0/2.2│2.0/2.3/2.5│
+# │ Require uptrend (pullback)          │ Yes      │ Yes      │ No         │
+# │ Require uptrend (breakout)          │ Yes      │ Yes      │ Yes        │
+# └─────────────────────────────────────┴──────────┴──────────┴────────────┘
+#
+# EXPECTED ALERT FREQUENCY:
+# - Level 1 (Conservative): ~1-3 alerts per week (WOW-only, highest quality)
+# - Level 2 (Moderate):     ~3-8 alerts per week (good quality, balanced)
+# - Level 3 (Aggressive):   ~8-15 alerts per week (more frequent, broader)
+#
+# TRADE-OFFS:
+# - Level 1: Fewest alerts, highest win rate, may miss good opportunities
+# - Level 2: Balanced quality vs quantity, recommended for most users
+# - Level 3: More opportunities, lower quality threshold, more work to filter
+#
+# RECOMMENDATION:
+# - Start with Level 1 to validate the system works and quality is high
+# - Move to Level 2 after 2-4 weeks if you want more frequent ideas
+# - Only use Level 3 if you have time to review many alerts and can filter
+# =============================================================================
