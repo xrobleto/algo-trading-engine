@@ -414,8 +414,8 @@ LEVERAGE_VOL_LOOKBACK = 20            # 20-day realized vol for targeting
 # Trade-off: Signals use "as of yesterday close" data.
 # Note: is_rebalance_window_dynamic() requires clock.is_open=True.
 REBALANCE_WEEKDAY = 0                 # TEMPORARY: Monday for one-time rebalance (normally 4=Fri)
-REBALANCE_TIME_ET = (11, 0)           # 11:00 AM ET (stable spreads, good liquidity)
-REBALANCE_DEADLINE_ET = (11, 15)      # do not start new rebalance after 11:15 AM ET
+REBALANCE_TIME_ET = (12, 0)           # TEMPORARY: 12:00 PM ET (11 AM CDT) for one-time rebalance (normally 11:00 AM ET)
+REBALANCE_DEADLINE_ET = (12, 15)      # TEMPORARY: 12:15 PM ET (normally 11:15 AM ET)
 
 # =========================
 # TURNOVER GOVERNOR + RANK STABILITY
