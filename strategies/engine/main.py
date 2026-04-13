@@ -23,7 +23,9 @@ import sys
 import time
 import traceback
 from datetime import datetime, timezone
+from enum import Enum
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 # Ensure the strategies directory is on the path
 SCRIPT_DIR = Path(__file__).resolve().parent.parent
@@ -39,6 +41,44 @@ from engine.portfolio_kill_switch import PortfolioKillSwitch
 from adapters.base import TickResult
 
 log = logging.getLogger("Engine")
+
+ET = ZoneInfo("America/New_York")
+
+
+# =============================================================================
+# MARKET SESSION
+# =============================================================================
+
+class MarketSession(str, Enum):
+    MARKET_OPEN = "MARKET_OPEN"    # 9:30-16:00 ET weekdays
+    PRE_MARKET = "PRE_MARKET"      # 8:00-9:30 ET weekdays
+    OFF_HOURS = "OFF_HOURS"        # evenings, weekends, holidays
+
+
+# Tick intervals per session
+SESSION_TICK_SEC = {
+    MarketSession.MARKET_OPEN: 5,     # 5 seconds — full speed
+    MarketSession.PRE_MARKET: 60,     # 1 minute — prep mode
+    MarketSession.OFF_HOURS: 300,     # 5 minutes — idle
+}
+
+
+def get_market_session() -> MarketSession:
+    """Classify current time into a market session (ET-based)."""
+    now = datetime.now(ET)
+
+    # Weekends
+    if now.weekday() >= 5:
+        return MarketSession.OFF_HOURS
+
+    hm = (now.hour, now.minute)
+
+    if (9, 30) <= hm < (16, 0):
+        return MarketSession.MARKET_OPEN
+    elif (8, 0) <= hm < (9, 30):
+        return MarketSession.PRE_MARKET
+    else:
+        return MarketSession.OFF_HOURS
 
 
 # =============================================================================
@@ -315,6 +355,7 @@ def engine_main(trend_only: bool = False) -> None:
     tick_count = 0
     heartbeat_interval = 60  # log heartbeat every N ticks (~5 min at 5s/tick)
     last_reconcile_at = time.time()
+    last_session = None  # track session transitions
 
     log.info("=" * 70)
     log.info("ENGINE RUNNING")
@@ -324,11 +365,59 @@ def engine_main(trend_only: bool = False) -> None:
         tick_count += 1
 
         try:
-            # ---- Portfolio kill switch ----
+            # ---- Portfolio kill switch (always check) ----
             ks_triggered, ks_reason = portfolio_ks.is_triggered()
             if ks_triggered:
                 log.critical(f"[ENGINE] Portfolio kill switch: {ks_reason}")
                 break
+
+            # ---- Market session awareness ----
+            session = get_market_session()
+            tick_sleep = SESSION_TICK_SEC[session]
+
+            # Log session transitions
+            if session != last_session:
+                now_et = datetime.now(ET).strftime("%H:%M ET")
+                log.info(f"[ENGINE] Session: {session.value} ({now_et})")
+                if session == MarketSession.MARKET_OPEN:
+                    log.info("[ENGINE] Market open — full-speed trading")
+                elif session == MarketSession.PRE_MARKET:
+                    log.info("[ENGINE] Pre-market — monitoring mode (60s ticks)")
+                else:
+                    log.info("[ENGINE] Off-hours — idle mode (5 min ticks)")
+                last_session = session
+
+            # ---- OFF-HOURS: minimal activity ----
+            if session == MarketSession.OFF_HOURS:
+                time.sleep(tick_sleep)
+                continue
+
+            # ---- PRE-MARKET: refresh intelligence + equity, no strategy ticks ----
+            if session == MarketSession.PRE_MARKET:
+                if intelligence.should_refresh():
+                    try:
+                        market_ctx = intelligence.refresh()
+                    except Exception as e:
+                        log.error(f"[INTELLIGENCE] Refresh failed: {e}")
+
+                try:
+                    total_equity = broker.get_equity()
+                    alloc_overrides = None
+                    if market_ctx:
+                        alloc_overrides = {
+                            sid: adj.adjusted_allocation
+                            for sid, adj in market_ctx.sleeve_adjustments.items()
+                        }
+                    sleeves.refresh(total_equity, ledger, alloc_overrides)
+                except Exception as e:
+                    log.error(f"[ENGINE] Failed to refresh equity: {e}")
+
+                time.sleep(tick_sleep)
+                continue
+
+            # ================================================================
+            # MARKET_OPEN: full trading behavior
+            # ================================================================
 
             # ---- Market intelligence refresh ----
             if intelligence.should_refresh():
@@ -388,9 +477,6 @@ def engine_main(trend_only: bool = False) -> None:
                 log.error(f"[ENGINE] Failed to save ownership ledger: {e}")
 
             # ---- Periodic reconciliation ----
-            # Resolves pending ledger entries against broker order status and
-            # re-checks broker positions. Mutates ledger in place, so adapter
-            # references remain valid.
             now_ts = time.time()
             if now_ts - last_reconcile_at >= config.reconcile_interval_sec:
                 try:
@@ -414,7 +500,7 @@ def engine_main(trend_only: bool = False) -> None:
                 log_heartbeat(sleeves, ledger, adapters, tick_count)
 
             # ---- Sleep ----
-            time.sleep(config.tick_interval_sec)
+            time.sleep(tick_sleep)
 
         except KeyboardInterrupt:
             log.info("[ENGINE] Keyboard interrupt")
