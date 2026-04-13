@@ -4,5 +4,3 @@ builder = "dockerfile"
 [deploy]
 startCommand = "python -m engine.main"
 region = "us-east-1"
-restartPolicyType = "on-failure"
-restartPolicyMaxRetries = 10
