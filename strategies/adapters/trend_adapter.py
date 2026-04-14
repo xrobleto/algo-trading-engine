@@ -23,6 +23,11 @@ from engine.config import SleeveConfig
 from engine.ownership import OwnershipLedger
 from engine.sleeves import SleeveContext, SleeveManager
 
+try:
+    from engine import atd_notify
+except ImportError:
+    atd_notify = None  # ATD trade notifications disabled
+
 log = logging.getLogger("Engine")
 
 # Minimum seconds between trend ticks (trend bot internally sleeps 60s)
@@ -337,6 +342,20 @@ class TrendAdapter(StrategyAdapter):
             # Submit to broker
             result = self._original_submit_order(order_request)
 
+            # Best-effort price at time of fill (for ATD notifications + ledger)
+            _order_price = None
+            try:
+                if result and result.filled_avg_price:
+                    _order_price = float(result.filled_avg_price)
+            except (AttributeError, TypeError, ValueError):
+                pass
+            if _order_price is None:
+                try:
+                    _pos = self._trading.get_open_position(symbol)
+                    _order_price = float(_pos.current_price)
+                except Exception:
+                    _order_price = notional / qty if qty > 0 else 0.0
+
             # Update ownership ledger
             broker_order_id = str(result.id) if result and hasattr(result, 'id') else None
 
@@ -344,11 +363,35 @@ class TrendAdapter(StrategyAdapter):
                 # SELL = closing a position → mark existing entries as closed
                 for entry in self.ledger.get_active_entries("TREND"):
                     if entry.symbol == symbol:
+                        # Capture entry data before closing for ATD notification
+                        entry_qty = entry.fill_qty or entry.qty
+                        entry_price = entry.fill_price or (
+                            entry.notional_at_entry / entry.qty
+                            if entry.qty > 0 else 0.0
+                        )
+                        entry_time = entry.registered_at
+
                         self.ledger.mark_closed(entry.client_order_id)
                         log.info(f"[TREND] Ownership closed: {symbol} (was {entry.client_order_id[:40]})")
+
+                        # Notify ATD of exit (fire-and-forget)
+                        if atd_notify and _order_price:
+                            try:
+                                pnl = (_order_price - entry_price) * entry_qty
+                                atd_notify.notify_exit(
+                                    symbol=symbol,
+                                    side=entry.side,
+                                    entry_price=entry_price,
+                                    exit_price=_order_price,
+                                    quantity=entry_qty,
+                                    pnl=pnl,
+                                    entry_time=entry_time,
+                                )
+                            except Exception as e:
+                                log.debug(f"[ATD] Exit notification error: {e}")
             else:
                 # BUY = opening/adding to position → register new entry
-                self.ledger.register_order(
+                entry_obj = self.ledger.register_order(
                     strategy_id="TREND",
                     symbol=symbol,
                     side=side,
@@ -357,6 +400,22 @@ class TrendAdapter(StrategyAdapter):
                     broker_order_id=broker_order_id,
                     notional=notional,
                 )
+                # Store best-effort fill price for accurate exit P&L later
+                if _order_price and entry_obj:
+                    entry_obj.fill_price = _order_price
+                    entry_obj.fill_qty = qty
+
+                # Notify ATD of entry (fire-and-forget)
+                if atd_notify and _order_price:
+                    try:
+                        atd_notify.notify_entry(
+                            symbol=symbol,
+                            side=side,
+                            entry_price=_order_price,
+                            quantity=qty,
+                        )
+                    except Exception as e:
+                        log.debug(f"[ATD] Entry notification error: {e}")
 
             return result
 
