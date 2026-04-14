@@ -105,6 +105,30 @@ def classify_symbol(symbol: str) -> str:
     return "UNKNOWN"
 
 
+# Mirrors engine/config.py order_prefix + legacy_prefixes per sleeve.
+# Used to classify dynamically-discovered symbols (e.g., SIMPLE's QBTS) that
+# aren't in any known_symbols set but were placed by the engine.
+ORDER_PREFIX_MAP: Dict[str, str] = {
+    "ENG_TREND_": "TREND",
+    "ENG_SIMPLE_": "SIMPLE",
+    "ENG_XASSET_": "CROSSASSET",
+    # Legacy prefixes (pre-unified-engine)
+    "TBOT_": "TREND",
+    "XABOT_": "CROSSASSET",
+    "dir_": "SIMPLE",
+}
+
+
+def classify_by_order_prefix(client_order_id: str) -> str:
+    """Classify a client_order_id to a sleeve by prefix match."""
+    if not client_order_id:
+        return "UNKNOWN"
+    for prefix, sleeve in ORDER_PREFIX_MAP.items():
+        if client_order_id.startswith(prefix):
+            return sleeve
+    return "UNKNOWN"
+
+
 # ---------------------------------------------------------------------------
 # ALPACA CLIENT
 # ---------------------------------------------------------------------------
@@ -140,8 +164,8 @@ class AlpacaClient:
     def get_positions(self) -> list:
         return self._get("positions")
 
-    def get_orders(self, status: str = "open") -> list:
-        return self._get(f"orders?status={status}&limit=50")
+    def get_orders(self, status: str = "open", limit: int = 50) -> list:
+        return self._get(f"orders?status={status}&limit={limit}")
 
     def get_portfolio_history(self, period: str = "1M", timeframe: str = "1D") -> dict:
         return self._get(f"account/portfolio/history?period={period}&timeframe={timeframe}")
@@ -303,14 +327,32 @@ def main():
     entries = ledger.get("entries", {})
     position_owners: Dict[str, str] = {}
 
-    # Config-based classification is authoritative
+    # Tier 1: Config-based classification (hardcoded known_symbols)
     for p in positions:
         sym = p.get("symbol", "")
         c = classify_symbol(sym)
         if c != "UNKNOWN":
             position_owners[sym] = c
 
-    # Ledger fallback for symbols not in any known_symbols set
+    # Tier 2: Order-prefix classification (catches SIMPLE's dynamic universe
+    # and any other engine-placed symbols not in known_symbols sets).
+    unassigned_syms = {
+        p.get("symbol", "") for p in positions
+        if p.get("symbol", "") and p.get("symbol", "") not in position_owners
+    }
+    if unassigned_syms:
+        try:
+            closed_orders = alpaca.get_orders(status="closed", limit=200)
+            for order in closed_orders:
+                sym = order.get("symbol", "")
+                if sym in unassigned_syms and sym not in position_owners:
+                    owner = classify_by_order_prefix(order.get("client_order_id", ""))
+                    if owner != "UNKNOWN":
+                        position_owners[sym] = owner
+        except Exception:
+            pass  # Silent fail — fall through to Tier 3
+
+    # Tier 3: Local ledger fallback (only useful when dashboard runs on engine host)
     for coid, entry in entries.items():
         sym = entry.get("symbol", "")
         if sym not in position_owners and entry.get("status") in ("filled", "pending", "partially_filled"):
