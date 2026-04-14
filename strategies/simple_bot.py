@@ -365,6 +365,18 @@ ENABLE_TRAILING_STOP = True     # Use trailing stop to protect profits
 TRAILING_STOP_ACTIVATION_R = 0.75  # v50: Activate at 0.75R (was 0.60R — too tight, triggered by normal vol)
 TRAILING_STOP_DISTANCE_R = 0.60    # v50: Trail by 0.60R (was 0.50R — more room for follow-through)
 
+# v51: Multi-level take-profit ladder
+# Replaces single 3.0R scalp exit with TP1 (scale out) → breakeven SL → TP2 (scale out) → runner (trail).
+# Ladder is software-managed because Alpaca brackets close the full position atomically on TP hit.
+# Entry order class switches from "bracket" to "oto" with a stop-loss child only.
+USE_TP_LADDER = True                      # Set False to revert to single-TP bracket behavior
+TP1_R = 1.5                               # First take-profit at 1.5R
+TP2_R = 3.0                               # Second take-profit at 3.0R (= legacy SCALP_TP_R)
+TP1_SCALE_PCT = 0.50                      # Sell 50% at TP1
+TP2_SCALE_PCT = 0.25                      # Sell 25% at TP2
+# Runner = 1 - TP1_SCALE_PCT - TP2_SCALE_PCT = 0.25 (rides trailing stop)
+MOVE_SL_TO_BREAKEVEN_AFTER_TP1 = True     # After TP1 fills, resize stop to entry fill price
+
 # v45 IMPROVEMENT #9: Adaptive Trailing Stop Distance
 # Adjusts trail distance based on move strength and time of day.
 # Strong runners get more room; weak grinds get taken off quickly.
@@ -5064,6 +5076,23 @@ class TradeIntent:
     highest_price_seen: float = 0.0
     trailing_stop_price: float = 0.0
 
+    # v51: Multi-level TP ladder state (software-managed, all persisted)
+    tp1_price: float = 0.0
+    tp1_qty: int = 0
+    tp1_filled: bool = False
+    tp1_fill_price: Optional[float] = None
+    tp1_filled_at: Optional[str] = None
+
+    tp2_price: float = 0.0
+    tp2_qty: int = 0
+    tp2_filled: bool = False
+    tp2_fill_price: Optional[float] = None
+    tp2_filled_at: Optional[str] = None
+
+    # runner_qty already exists above (used for the runner leg)
+    stop_order_id: Optional[str] = None       # Active broker-side stop order (OTO child or resized stop)
+    sl_moved_to_breakeven: bool = False
+
     def to_dict(self) -> dict:
         """Convert to dict for JSON serialization."""
         return {
@@ -5092,6 +5121,19 @@ class TradeIntent:
             "trailing_activated": self.trailing_activated,
             "highest_price_seen": self.highest_price_seen,
             "trailing_stop_price": self.trailing_stop_price,
+            # v51: TP ladder state
+            "tp1_price": self.tp1_price,
+            "tp1_qty": self.tp1_qty,
+            "tp1_filled": self.tp1_filled,
+            "tp1_fill_price": self.tp1_fill_price,
+            "tp1_filled_at": self.tp1_filled_at,
+            "tp2_price": self.tp2_price,
+            "tp2_qty": self.tp2_qty,
+            "tp2_filled": self.tp2_filled,
+            "tp2_fill_price": self.tp2_fill_price,
+            "tp2_filled_at": self.tp2_filled_at,
+            "stop_order_id": self.stop_order_id,
+            "sl_moved_to_breakeven": self.sl_moved_to_breakeven,
         }
 
     @staticmethod
@@ -5123,6 +5165,19 @@ class TradeIntent:
             trailing_activated=data.get("trailing_activated", False),
             highest_price_seen=data.get("highest_price_seen", 0.0),
             trailing_stop_price=data.get("trailing_stop_price", 0.0),
+            # v51: TP ladder state (defaults make old state files load cleanly)
+            tp1_price=data.get("tp1_price", 0.0),
+            tp1_qty=data.get("tp1_qty", 0),
+            tp1_filled=data.get("tp1_filled", False),
+            tp1_fill_price=data.get("tp1_fill_price"),
+            tp1_filled_at=data.get("tp1_filled_at"),
+            tp2_price=data.get("tp2_price", 0.0),
+            tp2_qty=data.get("tp2_qty", 0),
+            tp2_filled=data.get("tp2_filled", False),
+            tp2_fill_price=data.get("tp2_fill_price"),
+            tp2_filled_at=data.get("tp2_filled_at"),
+            stop_order_id=data.get("stop_order_id"),
+            sl_moved_to_breakeven=data.get("sl_moved_to_breakeven", False),
         )
 
     def is_entry_timed_out(self) -> bool:
@@ -6453,8 +6508,56 @@ class MomentumBot:
             scalp_r = (scalp_tp_price - entry_limit) / risk_per_share if risk_per_share > 0 else 0
             runner_r = (runner_tp_price - entry_limit) / risk_per_share if risk_per_share > 0 else 0
 
-            # Log entry plan based on whether runner is enabled
-            if runner_qty > 0:
+            # v51: Multi-level TP ladder computation.
+            # When USE_TP_LADDER is True, we submit ONE OTO entry for total_qty
+            # with a stop-loss child only — TPs are managed software-side via
+            # manage_positions() firing partial market sells at TP1 / TP2.
+            # Fields stored on TradeIntent for crash-recovery and exit logic.
+            tp1_price = 0.0
+            tp2_price = 0.0
+            tp1_qty = 0
+            tp2_qty = 0
+            ladder_runner_qty = 0
+            use_ladder = USE_TP_LADDER and risk_per_share > 0
+
+            if use_ladder:
+                tp1_price = round(entry_limit + (risk_per_share * TP1_R), 2)
+                tp2_price = round(entry_limit + (risk_per_share * TP2_R), 2)
+                tp1_qty = int(total_qty * TP1_SCALE_PCT)
+                tp2_qty = int(total_qty * TP2_SCALE_PCT)
+                ladder_runner_qty = total_qty - tp1_qty - tp2_qty
+
+                # If the position is too small to split meaningfully (e.g.
+                # total_qty < 4 means some leg rounds to 0), fall back to a
+                # single bracket at TP2 — no ladder benefit available.
+                if tp1_qty < 1 or tp2_qty < 1 or ladder_runner_qty < 1:
+                    logger.warning(
+                        f"[ENTRY] {symbol}: Position too small for TP ladder "
+                        f"(total={total_qty}, splits={tp1_qty}/{tp2_qty}/{ladder_runner_qty}) "
+                        f"— falling back to single bracket"
+                    )
+                    use_ladder = False
+                    tp1_qty = tp2_qty = ladder_runner_qty = 0
+                    tp1_price = tp2_price = 0.0
+
+            # Log entry plan
+            if use_ladder:
+                logger.info(
+                    f"[ENTRY] {symbol}: Submitting OTO entry + TP LADDER | "
+                    f"total_qty={total_qty} entry=${entry_limit:.2f} stop=${stop_price:.2f}"
+                )
+                logger.info(
+                    f"[ENTRY] {symbol}:   TP1: {tp1_qty} shares @ {TP1_R}R=${tp1_price:.2f} "
+                    f"(SL->BE after fill)"
+                )
+                logger.info(
+                    f"[ENTRY] {symbol}:   TP2: {tp2_qty} shares @ {TP2_R}R=${tp2_price:.2f}"
+                )
+                logger.info(
+                    f"[ENTRY] {symbol}:   Runner: {ladder_runner_qty} shares (trailing stop "
+                    f"{TRAILING_STOP_ACTIVATION_R}R act / {TRAILING_STOP_DISTANCE_R}R trail)"
+                )
+            elif runner_qty > 0:
                 logger.info(f"[ENTRY] {symbol}: Submitting DUAL brackets | total_qty={total_qty} entry=${entry_limit:.2f} stop=${stop_price:.2f}")
                 logger.info(f"[ENTRY] {symbol}:   Scalp bracket: {scalp_qty} shares @ {scalp_r:.1f}R (TP=${scalp_tp_price:.2f})")
                 logger.info(f"[ENTRY] {symbol}:   Runner bracket: {runner_qty} shares @ {runner_r:.1f}R (TP=${runner_tp_price:.2f})")
@@ -6574,6 +6677,19 @@ class MomentumBot:
                 runner_client_order_id=runner_client_order_id
             )
 
+            # v51: Populate TP ladder fields on the intent (used by manage_positions
+            # to fire TP1/TP2 partial sells; defaults to 0 when ladder is off).
+            if use_ladder:
+                trade_manager.update_intent(
+                    symbol,
+                    tp1_price=tp1_price,
+                    tp1_qty=tp1_qty,
+                    tp2_price=tp2_price,
+                    tp2_qty=tp2_qty,
+                    # Re-purpose existing runner_qty field to hold the ladder runner
+                    runner_qty=ladder_runner_qty,
+                )
+
             # METRICS: Log entry to trade journal
             trade_journal.log_entry(symbol, intent, market_data=data, spread_bps=data.spread_bps if data else None)
 
@@ -6581,34 +6697,55 @@ class MomentumBot:
             self.pending_symbols.add(symbol)
             logger.debug(f"[ENTRY] {symbol}: Created TradeIntent | timeout={ENTRY_TIMEOUT_SEC}s | client_order_ids={scalp_client_order_id},{runner_client_order_id}")
 
-            # Submit SCALP bracket (60% of position, quick TP at 0.75R)
+            # Submit entry order.
+            # v51: When use_ladder is True, submit as OTO (stop-loss child only)
+            # for the full total_qty — TPs are managed software-side via the ladder.
+            # Otherwise use the legacy bracket (TP + SL children) for the scalp qty.
             try:
-                scalp_order = alpaca.submit_order(
-                    symbol=symbol,
-                    qty=scalp_qty,
-                    side="buy",
-                    order_type="limit",
-                    limit_price=entry_limit,
-                    time_in_force="gtc",
-                    order_class="bracket",
-                    take_profit={"limit_price": f"{scalp_tp_price:.2f}"},
-                    stop_loss={"stop_price": f"{stop_price:.2f}"},
-                    client_order_id=scalp_client_order_id  # IDEMPOTENCY
-                )
-                logger.info(f"[ENTRY] {symbol}: Scalp bracket submitted | order_id={scalp_order['id']} | client_order_id={scalp_client_order_id} | qty={scalp_qty}")
+                if use_ladder:
+                    scalp_order = alpaca.submit_order(
+                        symbol=symbol,
+                        qty=total_qty,  # full position in a single OTO entry
+                        side="buy",
+                        order_type="limit",
+                        limit_price=entry_limit,
+                        time_in_force="gtc",
+                        order_class="oto",
+                        stop_loss={"stop_price": f"{stop_price:.2f}"},
+                        client_order_id=scalp_client_order_id  # IDEMPOTENCY
+                    )
+                    logger.info(
+                        f"[ENTRY] {symbol}: OTO entry submitted (ladder mode) | "
+                        f"order_id={scalp_order['id']} | client_order_id={scalp_client_order_id} | qty={total_qty}"
+                    )
+                else:
+                    scalp_order = alpaca.submit_order(
+                        symbol=symbol,
+                        qty=scalp_qty,
+                        side="buy",
+                        order_type="limit",
+                        limit_price=entry_limit,
+                        time_in_force="gtc",
+                        order_class="bracket",
+                        take_profit={"limit_price": f"{scalp_tp_price:.2f}"},
+                        stop_loss={"stop_price": f"{stop_price:.2f}"},
+                        client_order_id=scalp_client_order_id  # IDEMPOTENCY
+                    )
+                    logger.info(f"[ENTRY] {symbol}: Scalp bracket submitted | order_id={scalp_order['id']} | client_order_id={scalp_client_order_id} | qty={scalp_qty}")
 
-                # Update intent with scalp order ID
+                # Update intent with parent order ID (used to find stop child leg later)
                 trade_manager.update_intent(symbol, scalp_order_id=scalp_order["id"])
 
             except Exception as e:
-                logger.error(f"[ENTRY] {symbol}: Failed to submit scalp bracket: {e}")
+                logger.error(f"[ENTRY] {symbol}: Failed to submit entry order: {e}")
                 trade_manager.transition_state(symbol, TradeState.FAILED)
                 self.pending_symbols.discard(symbol)
                 return
 
-            # Submit RUNNER bracket only if runner_qty > 0
-            # FIX: Skip runner order submission when RUNNER_BRACKET_PCT = 0
-            if runner_qty > 0:
+            # Submit RUNNER bracket only if runner_qty > 0 and ladder is OFF.
+            # In ladder mode the full position is already submitted as one OTO —
+            # no separate runner bracket (runner qty is managed software-side).
+            if runner_qty > 0 and not use_ladder:
                 try:
                     # NOTE: Trailing stops are NOT supported as bracket stop_loss legs in Alpaca.
                     # The previous implementation with trail_amount in stop_loss would be rejected.
@@ -6645,9 +6782,10 @@ class MomentumBot:
 
                 logger.info(f"[ENTRY] {symbol}: Dual brackets submitted | State: SUBMITTED -> waiting for fills or timeout")
             else:
-                # Scalp-only mode (runner disabled)
+                # Scalp-only mode (runner disabled) OR ladder mode (single OTO entry)
                 trade_manager.transition_state(symbol, TradeState.SUBMITTED)
-                logger.info(f"[ENTRY] {symbol}: Single bracket submitted (scalp only) | State: SUBMITTED -> waiting for fills or timeout")
+                mode_label = "OTO entry (ladder)" if use_ladder else "Single bracket (scalp only)"
+                logger.info(f"[ENTRY] {symbol}: {mode_label} submitted | State: SUBMITTED -> waiting for fills or timeout")
 
             # MODERATE FIX: Increment daily trade count after successful order submission
             risk_manager.increment_trade_count()
@@ -6985,6 +7123,77 @@ class MomentumBot:
         except Exception as e:
             logger.warning(f"[CLEANUP] Failed to cleanup pending symbols: {e}")
 
+    # ------------------------------------------------------------
+    # v51: TP-ladder helpers (used by manage_positions)
+    # ------------------------------------------------------------
+    def _sell_partial(self, symbol: str, qty: int, reason: str):
+        """
+        Market-sell a partial quantity of an open position.
+
+        Used by the TP ladder for TP1/TP2 scale-out exits. Returns the
+        submitted order dict (so caller can read `filled_qty` / `filled_avg_price`)
+        or None on failure.
+        """
+        if qty <= 0:
+            logger.warning(f"[{reason}] {symbol}: Skipping partial sell — qty={qty}")
+            return None
+        try:
+            sell_order = alpaca.submit_order(
+                symbol=symbol,
+                qty=qty,
+                side="sell",
+                order_type="market",
+                time_in_force="day",
+            )
+            logger.info(
+                f"[{reason}] {symbol}: Partial sell submitted | qty={qty} "
+                f"order_id={sell_order.get('id')}"
+            )
+            return sell_order
+        except Exception as e:
+            logger.error(f"[{reason}] {symbol}: Partial sell FAILED: {e}")
+            return None
+
+    def _resize_stop_order(self, symbol: str, new_qty: int, stop_price: float, reason: str = "RESIZE"):
+        """
+        Cancel any existing broker-side stop/bracket orders for `symbol` and
+        (optionally) submit a fresh stop order at `stop_price` for `new_qty` shares.
+
+        Used by the TP ladder to:
+          - Move SL to breakeven after TP1 fills (new_qty = remaining position)
+          - Clear the broker stop when runner begins software trailing (new_qty=0)
+
+        Returns the new stop order dict, or None if no new stop was placed.
+        """
+        try:
+            cancelled = alpaca.cancel_orders_for_symbol(symbol)
+            logger.info(f"[{reason}] {symbol}: Cancelled {cancelled} existing order(s)")
+            time.sleep(0.3)
+        except Exception as cancel_err:
+            logger.warning(f"[{reason}] {symbol}: Error cancelling brackets: {cancel_err}")
+
+        if new_qty <= 0 or stop_price <= 0:
+            logger.info(f"[{reason}] {symbol}: No replacement stop placed (qty={new_qty}, stop=${stop_price:.2f})")
+            return None
+
+        try:
+            new_stop = alpaca.submit_order(
+                symbol=symbol,
+                qty=new_qty,
+                side="sell",
+                order_type="stop",
+                stop_price=round(stop_price, 2),
+                time_in_force="gtc",
+            )
+            logger.info(
+                f"[{reason}] {symbol}: New stop submitted | qty={new_qty} stop=${stop_price:.2f} "
+                f"order_id={new_stop.get('id')}"
+            )
+            return new_stop
+        except Exception as e:
+            logger.error(f"[{reason}] {symbol}: Failed to resubmit stop: {e}")
+            return None
+
     def manage_positions(self):
         """
         Manage open positions - monitor status, software trailing stop, and reconcile with broker.
@@ -7063,6 +7272,111 @@ class MomentumBot:
                 gain_pct = (current_price - pos.entry_price) / pos.entry_price
                 risk_per_share = pos.entry_price - pos.initial_stop if pos.initial_stop else 0
                 gain_r = (current_price - pos.entry_price) / risk_per_share if risk_per_share > 0 else 0
+
+                # Broker-side qty (source of truth for remaining shares after partial fills)
+                broker_qty = int(float(broker_pos_map.get(pos.symbol, {}).get("qty", pos.qty)))
+
+                # --- v51: TP LADDER (TP1 → breakeven SL → TP2 → runner trailing) ---
+                # Runs BEFORE the software trailing stop. When the ladder is active, the
+                # trailing-stop block below only trails the remaining "runner" qty once
+                # tp2_filled. TP1/TP2 partial exits are market-sell orders; the broker
+                # stop is cancelled and re-submitted at breakeven after TP1.
+                if USE_TP_LADDER and risk_per_share > 0:
+                    intent = trade_manager.get_intent(pos.symbol)
+                    if intent and intent.tp1_price > 0 and intent.tp2_price > 0:
+
+                        # --- TP1: scale out TP1_SCALE_PCT, move SL to breakeven ---
+                        if not intent.tp1_filled and current_price >= intent.tp1_price:
+                            tp1_qty = min(intent.tp1_qty, broker_qty)
+                            logger.info(
+                                f"[TP1] {pos.symbol}: TRIGGERED! price=${current_price:.2f} "
+                                f">= tp1=${intent.tp1_price:.2f} ({gain_r:+.2f}R) | "
+                                f"Selling {tp1_qty} of {broker_qty} shares"
+                            )
+                            sell_order = self._sell_partial(pos.symbol, tp1_qty, "TP1")
+                            if sell_order is not None:
+                                try:
+                                    filled_qty = int(float(sell_order.get("filled_qty") or tp1_qty))
+                                except (TypeError, ValueError):
+                                    filled_qty = tp1_qty
+                                fill_price = sell_order.get("filled_avg_price")
+                                try:
+                                    fill_price = float(fill_price) if fill_price else current_price
+                                except (TypeError, ValueError):
+                                    fill_price = current_price
+
+                                # Resize the broker stop: breakeven for remaining shares.
+                                # `entry_price` is the actual fill price (tracked by PositionManager).
+                                remaining_qty = max(broker_qty - filled_qty, 0)
+                                breakeven_stop = (
+                                    pos.entry_price
+                                    if MOVE_SL_TO_BREAKEVEN_AFTER_TP1
+                                    else pos.initial_stop
+                                )
+                                new_stop = self._resize_stop_order(
+                                    pos.symbol, remaining_qty, breakeven_stop, reason="TP1_BE"
+                                )
+
+                                trade_manager.update_intent(
+                                    pos.symbol,
+                                    tp1_filled=True,
+                                    tp1_fill_price=fill_price,
+                                    tp1_filled_at=iso(now_et()),
+                                    sl_moved_to_breakeven=MOVE_SL_TO_BREAKEVEN_AFTER_TP1,
+                                    stop_order_id=(new_stop.get("id") if new_stop else None),
+                                )
+                                logger.info(
+                                    f"[TP1] {pos.symbol}: Filled {filled_qty}@${fill_price:.2f} | "
+                                    f"SL @ ${breakeven_stop:.2f} covering {remaining_qty} shares | "
+                                    f"Waiting for TP2 (${intent.tp2_price:.2f}) or trailing"
+                                )
+                            continue
+
+                        # --- TP2: scale out TP2_SCALE_PCT, runner goes to software trailing ---
+                        if intent.tp1_filled and not intent.tp2_filled and current_price >= intent.tp2_price:
+                            tp2_qty = min(intent.tp2_qty, broker_qty)
+                            logger.info(
+                                f"[TP2] {pos.symbol}: TRIGGERED! price=${current_price:.2f} "
+                                f">= tp2=${intent.tp2_price:.2f} ({gain_r:+.2f}R) | "
+                                f"Selling {tp2_qty} of {broker_qty} shares"
+                            )
+                            sell_order = self._sell_partial(pos.symbol, tp2_qty, "TP2")
+                            if sell_order is not None:
+                                try:
+                                    filled_qty = int(float(sell_order.get("filled_qty") or tp2_qty))
+                                except (TypeError, ValueError):
+                                    filled_qty = tp2_qty
+                                fill_price = sell_order.get("filled_avg_price")
+                                try:
+                                    fill_price = float(fill_price) if fill_price else current_price
+                                except (TypeError, ValueError):
+                                    fill_price = current_price
+
+                                # Clear broker stop — runner now rides the software trailing stop only.
+                                try:
+                                    cancelled = alpaca.cancel_orders_for_symbol(pos.symbol)
+                                    logger.info(
+                                        f"[TP2] {pos.symbol}: Cancelled {cancelled} broker order(s) "
+                                        f"— runner ({max(broker_qty - filled_qty, 0)} shares) now software-managed"
+                                    )
+                                    time.sleep(0.3)
+                                except Exception as cancel_err:
+                                    logger.warning(
+                                        f"[TP2] {pos.symbol}: Error cancelling broker stop: {cancel_err}"
+                                    )
+
+                                trade_manager.update_intent(
+                                    pos.symbol,
+                                    tp2_filled=True,
+                                    tp2_fill_price=fill_price,
+                                    tp2_filled_at=iso(now_et()),
+                                    stop_order_id=None,
+                                )
+                                logger.info(
+                                    f"[TP2] {pos.symbol}: Filled {filled_qty}@${fill_price:.2f} | "
+                                    f"Runner rides software trailing stop from here"
+                                )
+                            continue
 
                 # --- SOFTWARE TRAILING STOP ---
                 # Broker bracket stop remains as safety net; this tightens the stop as price moves favorably
