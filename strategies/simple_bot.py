@@ -876,6 +876,45 @@ def iso(dtobj: dt.datetime) -> str:
 def from_iso(s: str) -> dt.datetime:
     return dt.datetime.fromisoformat(s)
 
+# ------------------------------------------------------------
+# Ownership classification by client_order_id prefix
+# ------------------------------------------------------------
+# Used by EOD / reconcile routines to figure out which sleeve opened a
+# broker position. Needed because dynamic-universe positions can fall out
+# of position_manager.positions on restart (see reconcile_broker_state) —
+# the broker's order history is the authoritative source of "who owns
+# this symbol."
+def _classify_order_owner(client_order_id: Optional[str]) -> str:
+    """
+    Return sleeve name for a client_order_id, or "UNKNOWN" if it doesn't
+    match any known prefix pattern.
+
+    Known prefixes:
+      ENG_SIMPLE_  → SIMPLE   (engine adapter)
+      ENG_TREND_   → TREND    (engine adapter)
+      ENG_XASSET_  → XASSET   (engine adapter)
+      TBOT_        → TREND    (standalone trend_bot)
+      dir_         → DIRECTIONAL (standalone directional_bot)
+      RECONCILE_   → UNKNOWN  (synthetic entries created by reconciler)
+      "{sym}_scalp_..." / "{sym}_runner_..." → SIMPLE (standalone simple_bot)
+    """
+    cid = client_order_id or ""
+    if cid.startswith("ENG_SIMPLE_"):
+        return "SIMPLE"
+    if cid.startswith(("ENG_TREND_", "TBOT_")):
+        return "TREND"
+    if cid.startswith("ENG_XASSET_"):
+        return "XASSET"
+    if cid.startswith("dir_"):
+        return "DIRECTIONAL"
+    if cid.startswith("RECONCILE_"):
+        return "UNKNOWN"
+    # Standalone simple_bot pattern: "{SYMBOL}_scalp_..." / "{SYMBOL}_runner_..."
+    if "_scalp_" in cid or "_runner_" in cid:
+        return "SIMPLE"
+    return "UNKNOWN"
+
+
 def generate_client_order_id(symbol: str, bracket_type: str, date_str: str) -> str:
     """
     Generate unique client_order_id for order submission.
@@ -5957,6 +5996,13 @@ class MomentumBot:
         self.dynamic_universe = set()  # Additional symbols discovered via scanning
         self.last_dynamic_scan_time = 0.0  # Track last universe discovery scan
 
+        # Broker-ownership map (symbol → sleeve name), rebuilt once per trading day.
+        # Used by EOD flatten + reconcile to classify dynamic-universe positions
+        # that aren't in position_manager.positions. Populated from the broker's
+        # order history — client_order_id prefixes are the source of truth.
+        self._ownership_map: Dict[str, str] = {}
+        self._ownership_map_date: Optional[str] = None
+
         # v45: Enhanced Market Scanner
         self.market_scanner = None
         if USE_ENHANCED_SCANNER:
@@ -6932,19 +6978,104 @@ class MomentumBot:
                 trade_manager.transition_state(symbol, TradeState.FAILED)
                 self.pending_symbols.discard(symbol)
 
+    # ------------------------------------------------------------
+    # Broker-authoritative ownership helpers (for EOD + reconcile)
+    # ------------------------------------------------------------
+    def _refresh_ownership_map(self, force: bool = False) -> Dict[str, str]:
+        """
+        Build / refresh the symbol → sleeve ownership map from broker order history.
+
+        Cached per trading day to avoid hammering `/v2/orders?status=all` on
+        every 5s tick. Caller passes `force=True` to rebuild mid-day (e.g.
+        after a new entry that we want reflected before EOD).
+        """
+        today = dt.datetime.now(tz=ET).strftime("%Y-%m-%d")
+        if not force and self._ownership_map_date == today and self._ownership_map:
+            return self._ownership_map
+
+        try:
+            all_orders = alpaca.get_orders(status="all")
+        except Exception as e:
+            logger.warning(f"[OWNERSHIP] get_orders(status=all) failed: {e} — keeping stale map")
+            return self._ownership_map
+
+        # Walk orders oldest-first so the LATEST buy for a symbol wins
+        # (avoids stale classification when a symbol was re-entered by a
+        # different sleeve — unlikely, but safer).
+        owner_by_symbol: Dict[str, str] = {}
+        for order in reversed(all_orders):
+            if order.get("side") != "buy":
+                continue
+            sym = order.get("symbol")
+            if not sym:
+                continue
+            owner = _classify_order_owner(order.get("client_order_id"))
+            if owner != "UNKNOWN":
+                owner_by_symbol[sym] = owner
+
+        self._ownership_map = owner_by_symbol
+        self._ownership_map_date = today
+        logger.info(
+            f"[OWNERSHIP] Rebuilt ownership map from broker orders | "
+            f"{len(owner_by_symbol)} symbols classified | "
+            f"SIMPLE={sum(1 for o in owner_by_symbol.values() if o == 'SIMPLE')}"
+        )
+        return owner_by_symbol
+
+    def _is_simple_owned(self, symbol: str) -> bool:
+        """Return True if the broker position for `symbol` was opened by SIMPLE."""
+        return self._refresh_ownership_map().get(symbol) == "SIMPLE"
+
+    def _get_simple_owned_broker_positions(self) -> List[dict]:
+        """
+        Broker-authoritative list of open positions owned by SIMPLE.
+
+        Source of truth for EOD flatten routines — ensures dynamic-universe
+        positions that fell out of `position_manager.positions` (e.g. after
+        a mid-session restart where reconcile couldn't link them to an intent)
+        still get closed. Filters:
+          - TREND_BOT_SYMBOLS (defensive — shouldn't appear under SIMPLE anyway)
+          - Short positions (directional_bot territory)
+          - Non-SIMPLE prefix (TREND / XASSET / DIR / unknown)
+        """
+        try:
+            broker_positions = alpaca.list_positions()
+        except Exception as e:
+            logger.error(f"[EOD] Broker position fetch failed: {e}")
+            return []
+        if not broker_positions:
+            return []
+
+        owner_map = self._refresh_ownership_map()
+        owned: List[dict] = []
+        for bp in broker_positions:
+            sym = bp["symbol"]
+            if sym in TREND_BOT_SYMBOLS:
+                continue
+            if bp.get("side", "long") == "short":
+                continue  # directional_bot territory
+            if owner_map.get(sym) != "SIMPLE":
+                continue
+            owned.append(bp)
+        return owned
+
     def check_eod_close(self):
         """
         Check if it's time to close positions for end of day.
 
         Supports two modes:
         1. Gradual reduction (GRADUAL_EOD_REDUCTION=True):
-           - Starts reducing 30 min before EOD_CLOSE_TIME_ET
-           - Reduces 10% of each position every 5 minutes
+           - Starts reducing EOD_REDUCTION_START_MINUTES before EOD_CLOSE_TIME_ET
+           - Reduces EOD_REDUCTION_PERCENT of each position every 5 minutes
            - Improves execution quality and reduces market impact
         2. Immediate flatten (GRADUAL_EOD_REDUCTION=False):
            - Flattens all positions at EOD_CLOSE_TIME_ET
 
-        Level 3 Implementation: Uses flatten_symbol() to properly handle bracket orders.
+        Source of truth: BROKER POSITIONS classified by client_order_id prefix,
+        not `position_manager.positions`. This ensures dynamic-universe symbols
+        that fell out of the in-memory position_manager (e.g. after a mid-session
+        restart where reconcile couldn't link them to a TradeIntent) still get
+        flattened. See `_get_simple_owned_broker_positions()`.
         """
         now = dt.datetime.now(tz=ET)
         eod_hour, eod_minute = EOD_CLOSE_TIME_ET
@@ -6956,50 +7087,41 @@ class MomentumBot:
         reduction_start = eod_datetime - dt.timedelta(minutes=EOD_REDUCTION_START_MINUTES)
         reduction_start_time = reduction_start.time()
 
-        positions = list(position_manager.positions.values())
-        if not positions:
+        # Fast exit when not in any EOD window (cheap time check; avoids broker call)
+        in_reduction_window = (
+            GRADUAL_EOD_REDUCTION
+            and current_time >= reduction_start_time
+            and current_time < eod_time
+        )
+        in_flatten_window = current_time >= eod_time
+        if not in_reduction_window and not in_flatten_window:
             return
 
-        # --- Safety filter: only manage positions that belong to simple_bot ---
-        # Skip trend_bot symbols and any short positions (which belong to directional_bot)
-        own_positions = [p for p in positions
-                        if p.symbol not in TREND_BOT_SYMBOLS]
-        # Belt-and-suspenders: verify at broker level that these are long positions
-        # (simple_bot is long-only; shorts belong to directional_bot)
-        try:
-            broker_positions = {bp["symbol"]: bp for bp in alpaca.list_positions()}
-            own_positions = [p for p in own_positions
-                           if broker_positions.get(p.symbol, {}).get("side", "long") != "short"]
-        except Exception:
-            pass  # If broker check fails, proceed with existing filter
-        if not own_positions:
+        # Broker-authoritative list of SIMPLE-owned positions (see docstring)
+        own_broker_positions = self._get_simple_owned_broker_positions()
+        if not own_broker_positions:
             return
 
         # --- MODE 1: Gradual EOD Reduction ---
-        if GRADUAL_EOD_REDUCTION and current_time >= reduction_start_time and current_time < eod_time:
+        if in_reduction_window:
             # Check if enough time has passed since last reduction
             if self.last_eod_reduction_time:
                 minutes_since_last = (now - self.last_eod_reduction_time).total_seconds() / 60
                 if minutes_since_last < EOD_REDUCTION_INTERVAL_MINUTES:
                     return  # Not time for next reduction yet
 
-            logger.info(f"[EOD-GRADUAL] Starting position reduction pass | {len(own_positions)} position(s) | "
+            logger.info(f"[EOD-GRADUAL] Starting position reduction pass | {len(own_broker_positions)} position(s) | "
                        f"interval={EOD_REDUCTION_INTERVAL_MINUTES}min | reduction={EOD_REDUCTION_PERCENT*100:.0f}%")
             self.last_eod_reduction_time = now
 
-            for pos in own_positions:
-                symbol = pos.symbol
+            for bp in own_broker_positions:
+                symbol = bp["symbol"]
                 try:
-                    # Get current broker position
-                    broker_pos = alpaca.get_position(symbol)
-                    if not broker_pos:
-                        continue
-
-                    current_qty = int(broker_pos.get("qty", 0))
+                    current_qty = int(float(bp.get("qty", 0)))
                     if current_qty <= 0:
                         continue
 
-                    # Calculate shares to reduce (10% of current position)
+                    # Calculate shares to reduce
                     reduce_qty = max(1, int(current_qty * EOD_REDUCTION_PERCENT))
 
                     # Track total reductions for logging
@@ -7022,17 +7144,18 @@ class MomentumBot:
                         logger.info(f"[EOD-GRADUAL] {symbol}: Reduction order submitted | "
                                    f"order_id={order.get('id', 'N/A')}")
 
-                        # Update position manager with reduced quantity
+                        # Update position manager if it knows about this symbol
                         remaining_qty = current_qty - reduce_qty
+                        pm_pos = position_manager.get_position(symbol)
                         if remaining_qty <= 0:
-                            position_manager.remove_position(symbol)
+                            if pm_pos:
+                                position_manager.remove_position(symbol)
                             self.pending_symbols.discard(symbol)
                             if trade_manager.get_intent(symbol):
                                 trade_manager.transition_state(symbol, TradeState.CLOSED)
                             logger.info(f"[EOD-GRADUAL] {symbol}: Position fully closed")
-                        else:
-                            # Update position with new quantity
-                            pos.qty = remaining_qty
+                        elif pm_pos:
+                            pm_pos.qty = remaining_qty
 
                 except Exception as e:
                     logger.error(f"[EOD-GRADUAL] {symbol}: Error during reduction: {e}")
@@ -7040,31 +7163,33 @@ class MomentumBot:
             return  # Don't proceed to full flatten yet
 
         # --- MODE 2: Full Flatten at EOD Time ---
-        if current_time >= eod_time:
+        if in_flatten_window:
             # Reset reduction tracking for next day
             self.eod_reductions.clear()
             self.last_eod_reduction_time = None
 
-            logger.warning(f"[EOD] Closing {len(own_positions)} remaining position(s) at end of day")
+            logger.warning(f"[EOD] Closing {len(own_broker_positions)} remaining position(s) at end of day")
             failed_flattens = []
 
-            for pos in own_positions:
+            for bp in own_broker_positions:
+                symbol = bp["symbol"]
                 try:
-                    logger.info(f"[EOD] Flattening {pos.symbol} (cancel orders + close position)")
-                    result = alpaca.flatten_symbol(pos.symbol)
+                    logger.info(f"[EOD] Flattening {symbol} (cancel orders + close position)")
+                    result = alpaca.flatten_symbol(symbol)
 
                     if not result["errors"]:
-                        position_manager.remove_position(pos.symbol)
-                        self.pending_symbols.discard(pos.symbol)
-                        if trade_manager.get_intent(pos.symbol):
-                            trade_manager.transition_state(pos.symbol, TradeState.CLOSED)
-                            logger.info(f"[EOD] {pos.symbol}: Intent transitioned to CLOSED")
+                        if position_manager.get_position(symbol):
+                            position_manager.remove_position(symbol)
+                        self.pending_symbols.discard(symbol)
+                        if trade_manager.get_intent(symbol):
+                            trade_manager.transition_state(symbol, TradeState.CLOSED)
+                            logger.info(f"[EOD] {symbol}: Intent transitioned to CLOSED")
                     else:
-                        logger.error(f"[EOD] {pos.symbol}: Errors during flatten: {result['errors']}")
-                        failed_flattens.append(pos.symbol)
+                        logger.error(f"[EOD] {symbol}: Errors during flatten: {result['errors']}")
+                        failed_flattens.append(symbol)
                 except Exception as e:
-                    logger.error(f"[EOD] Failed to flatten {pos.symbol}: {e}")
-                    failed_flattens.append(pos.symbol)
+                    logger.error(f"[EOD] Failed to flatten {symbol}: {e}")
+                    failed_flattens.append(symbol)
 
             # LEVEL 3: Alert if any flattens failed
             if failed_flattens:
@@ -7748,9 +7873,25 @@ class MomentumBot:
                 # Check if symbol is in our trading universe OR has an active intent
                 # (bot may have entered a dynamically-discovered symbol that's not in CORE_SYMBOLS)
                 if symbol not in CORE_SYMBOLS and not existing_intent:
-                    logger.warning(f"[RECONCILE] {symbol}: Position exists but NOT in our universe and no intent - "
-                                 f"will monitor but not manage")
-                    continue
+                    # Before skipping, check broker order history: if SIMPLE opened
+                    # this position (by client_order_id prefix), adopt it as an
+                    # orphan so EOD / trailing / state-sync can manage it.
+                    # Without this, a dynamic-universe symbol whose intent was
+                    # cleaned up (by the 24h terminal-intent sweeper) would fall
+                    # through ALL management paths and survive past market close.
+                    if self._is_simple_owned(symbol):
+                        logger.warning(
+                            f"[RECONCILE] {symbol}: Not in CORE_SYMBOLS and no intent, "
+                            f"but broker order history classifies it as SIMPLE-owned "
+                            f"(dynamic-universe entry) — adopting as orphan"
+                        )
+                        # Fall through to the existing orphan-adoption path below
+                    else:
+                        logger.warning(
+                            f"[RECONCILE] {symbol}: Position exists but NOT in our universe and no intent - "
+                            f"will monitor but not manage"
+                        )
+                        continue
                 elif symbol not in CORE_SYMBOLS and existing_intent:
                     logger.info(f"[RECONCILE] {symbol}: Not in CORE_SYMBOLS but has active intent "
                               f"(state={existing_intent.state.value}) - adopting position")

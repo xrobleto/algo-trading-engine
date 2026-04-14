@@ -323,30 +323,33 @@ class SimpleAdapter(StrategyAdapter):
         """
         Ensure Simple Bot owns zero broker positions when market is closed.
 
-        Uses broker as source of truth (not position_manager) and calls
-        flatten_symbol unconditionally. flatten_symbol already cancels all
-        open orders for the symbol (including bracket TP/SL children) before
-        closing the position, so it's safe to call on a live bracket.
+        Source of truth is the BROKER + client_order_id prefix classification
+        (via `MomentumBot._get_simple_owned_broker_positions`), NOT the
+        ownership ledger. The ledger can drift when partial sells (TP1, TP2,
+        gradual EOD reductions) mark entries `closed` while the broker
+        position is still alive — previously that caused symbols like QBTS
+        to slip past the safety net and survive past market close.
 
-        Fixes the CRWV weekend incident: previously this method guarded the
-        flatten behind a has_pending_sell check, which silently skipped any
-        position whose bracket TP/SL children were still pending — i.e. every
-        Simple Bot bracket.
+        flatten_symbol already cancels all open orders for the symbol
+        (including bracket TP/SL children) before closing the position, so
+        it's safe to call on a live bracket.
+
+        Fixes the CRWV weekend incident AND the QBTS dynamic-universe gap.
         """
+        if not self._bot:
+            return
+
         try:
-            broker_positions = sb.alpaca.list_positions()
+            owned_positions = self._bot._get_simple_owned_broker_positions()
         except Exception as e:
-            log.error(f"[SIMPLE] Closed-market: broker fetch failed: {e}")
+            log.error(f"[SIMPLE] Closed-market: owned-position fetch failed: {e}")
             return
 
-        simple_symbols = self.ledger.get_active_symbols("SIMPLE")
-        if not simple_symbols:
+        if not owned_positions:
             return
 
-        for bp in broker_positions:
+        for bp in owned_positions:
             symbol = bp["symbol"]
-            if symbol not in simple_symbols:
-                continue
             log.warning(
                 f"[SIMPLE] Market CLOSED with live position {symbol} — "
                 f"flattening (cancel bracket + close)"
