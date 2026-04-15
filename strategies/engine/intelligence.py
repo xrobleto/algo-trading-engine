@@ -75,6 +75,9 @@ class SleeveAdjustment:
     risk_multiplier: float         # 0.5-1.5 for position sizing
     entry_allowed: bool            # False = block new entries
     entry_gate_reason: str         # why entries are blocked, or "ok"
+    # WS4/WS6: cumulative list of modifier reasons applied this refresh
+    # e.g. ["regime:CRISIS x0.70", "chop:x0.75 (score=0.58)"]
+    adjustment_reasons: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -175,6 +178,30 @@ POLYMARKET_RISK_SCORES = {
 # Stale context auto-revert (30 minutes)
 STALE_CONTEXT_SEC = 1800
 
+# =============================================================================
+# WS3 + WS4: MARKET-STRUCTURE MODIFIERS (breadth gate + chop dampener)
+# =============================================================================
+# Feature-flagged via env vars. Default OFF until validated in paper-trade.
+# See reports/engine_backtest_2026-04-14.md §Recommendations and
+# backtest/_runs/engine_regime_2026-04-14/composite/replay/replay_summary.md
+# for the decision trail behind these modifiers.
+
+MARKET_STRUCTURE_GATE_ENABLED = os.getenv("INTEL_MARKET_STRUCTURE_GATE", "0") == "1"
+CHOP_DAMPENER_ENABLED = os.getenv("INTEL_CHOP_DAMPENER", "0") == "1"
+
+# WS3 tunables (replay-validated thresholds, see replay_summary §WS3+WS4 tuning)
+SIMPLE_BREADTH_THRESHOLD_SCORE = 0.75   # narrowness_score threshold
+SIMPLE_BREADTH_SUSTAIN_DAYS = 10        # must be sustained N days
+SIMPLE_BREADTH_WINDOW = 63              # gap lookback window
+
+# WS4 tunables
+CHOP_RAMP_LO = 0.40           # below this, no dampening
+CHOP_RAMP_HI = 0.60           # at or above, full dampening
+TREND_CHOP_FLOOR = 0.60       # minimum TREND multiplier when fully dampened
+
+# Polygon daily-bar history needed for narrowness (63d window + 10d sustain + buffer)
+_STRUCTURE_HISTORY_DAYS = 120
+
 
 # =============================================================================
 # MARKET INTELLIGENCE LAYER
@@ -209,6 +236,16 @@ class MarketIntelligenceLayer:
         self._polymarket_client = None
         self._reddit_provider = None
         self._event_calendar: Optional[dict] = None
+
+        # WS3/WS4 microstructure signal state (refreshed once per daily bar)
+        self._ms_last_fetch_at: float = 0.0
+        self._ms_cache: Dict[str, Any] = {
+            "narrowness_score": 0.5,
+            "narrowness_sustained": False,
+            "chop_score": 0.0,
+            "available": False,
+            "fetch_time_ms": 0.0,
+        }
 
         # Intelligence-specific logger
         self._intel_log = logging.getLogger("Intelligence")
@@ -289,6 +326,10 @@ class MarketIntelligenceLayer:
                           and regime != self._previous_regime)
         self._previous_regime = regime
 
+        # WS3/WS4: refresh microstructure signals if enabled (cheap — once per refresh)
+        if MARKET_STRUCTURE_GATE_ENABLED or CHOP_DAMPENER_ENABLED:
+            self._refresh_market_structure()
+
         # Compute per-sleeve adjustments
         sleeve_adjustments = self._compute_sleeve_adjustments(regime)
 
@@ -364,17 +405,59 @@ class MarketIntelligenceLayer:
     def _compute_sleeve_adjustments(
         self, regime: MarketRegime
     ) -> Dict[str, SleeveAdjustment]:
-        """Compute bounded, velocity-limited per-sleeve adjustments."""
+        """Compute bounded, velocity-limited per-sleeve adjustments.
+
+        Pipeline:
+          1. Base regime multiplier from SLEEVE_ALLOCATION_MULTIPLIERS
+          2. WS3 SIMPLE breadth gate modifier (if enabled + sustained narrow + RISK_ON/CAUTIOUS)
+          3. WS4 TREND chop dampener modifier (if enabled)
+          4. Bound within ±ALLOCATION_SWING_PCT of base
+          5. Apply 2%/refresh velocity limit
+          6. Normalize with cash reserve
+        """
         adjustments = {}
         raw_allocations = {}
 
+        # Snapshot microstructure signals once per refresh
+        ms = self._ms_cache if (MARKET_STRUCTURE_GATE_ENABLED or CHOP_DAMPENER_ENABLED) else None
+
         for strategy_id, sleeve_config in self._config.sleeves.items():
             base = sleeve_config.allocation_pct
+            reasons: List[str] = []
 
             # Allocation multiplier from regime table
             alloc_mult = SLEEVE_ALLOCATION_MULTIPLIERS.get(
                 regime, {}
             ).get(strategy_id, 1.0)
+            reasons.append(f"regime:{regime.value}:x{alloc_mult:.2f}")
+
+            # WS3: SIMPLE breadth gate modifier (alloc haircut in addition to entry gate)
+            if (MARKET_STRUCTURE_GATE_ENABLED
+                    and strategy_id == "SIMPLE"
+                    and ms is not None
+                    and ms.get("available")
+                    and ms.get("narrowness_sustained")
+                    and regime in (MarketRegime.RISK_ON, MarketRegime.CAUTIOUS)):
+                # Alloc haircut alongside entry gate — reinforces reduction
+                gate_mod = 0.5
+                alloc_mult *= gate_mod
+                reasons.append(
+                    f"breadth_gate:x{gate_mod:.2f} (narrow_score="
+                    f"{ms.get('narrowness_score', 0.0):.2f})"
+                )
+
+            # WS4: TREND chop dampener
+            if (CHOP_DAMPENER_ENABLED
+                    and strategy_id == "TREND"
+                    and ms is not None
+                    and ms.get("available")):
+                chop_mod = self._chop_dampener(float(ms.get("chop_score", 0.0)))
+                if chop_mod < 1.0:
+                    alloc_mult *= chop_mod
+                    reasons.append(
+                        f"chop_dampener:x{chop_mod:.2f} (chop_score="
+                        f"{ms.get('chop_score', 0.0):.2f})"
+                    )
 
             # Bound allocation within ±ALLOCATION_SWING_PCT of base
             adjusted = self._bound_allocation(base, alloc_mult, ALLOCATION_SWING_PCT)
@@ -391,8 +474,8 @@ class MarketIntelligenceLayer:
             ).get(strategy_id, 1.0)
             risk_mult = max(RISK_MULTIPLIER_MIN, min(RISK_MULTIPLIER_MAX, risk_mult))
 
-            # Entry gate
-            entry_allowed, gate_reason = self._compute_entry_gate(regime, strategy_id)
+            # Entry gate (may consume WS3 microstructure signal for SIMPLE)
+            entry_allowed, gate_reason = self._compute_entry_gate(regime, strategy_id, ms)
 
             adjustments[strategy_id] = SleeveAdjustment(
                 strategy_id=strategy_id,
@@ -402,6 +485,7 @@ class MarketIntelligenceLayer:
                 risk_multiplier=risk_mult,
                 entry_allowed=entry_allowed,
                 entry_gate_reason=gate_reason,
+                adjustment_reasons=reasons,
             )
 
         # Normalize: ensure allocations + cash ≤ 1.0
@@ -450,11 +534,138 @@ class MarketIntelligenceLayer:
 
     @staticmethod
     def _compute_entry_gate(
-        regime: MarketRegime, strategy_id: str
+        regime: MarketRegime,
+        strategy_id: str,
+        microstructure: Optional[Dict[str, Any]] = None,
     ) -> Tuple[bool, str]:
+        # Existing CRISIS gate
         if regime == MarketRegime.CRISIS and strategy_id == "SIMPLE":
             return False, "CRISIS regime: intraday entries blocked"
+        # WS3: sustained-narrow breadth gate for SIMPLE in "looks calm but isn't" regimes
+        if (MARKET_STRUCTURE_GATE_ENABLED
+                and strategy_id == "SIMPLE"
+                and microstructure is not None
+                and microstructure.get("available")
+                and microstructure.get("narrowness_sustained")
+                and regime in (MarketRegime.RISK_ON, MarketRegime.CAUTIOUS)):
+            nscore = microstructure.get("narrowness_score", 0.0)
+            return (
+                False,
+                f"breadth_narrow: sustained narrow leadership detected "
+                f"(score={nscore:.2f}, regime={regime.value})",
+            )
         return True, "ok"
+
+    @staticmethod
+    def _chop_dampener(chop_score: float) -> float:
+        """WS4 dampener: ramp 1.0 at chop<=CHOP_RAMP_LO down to TREND_CHOP_FLOOR at >=CHOP_RAMP_HI."""
+        if chop_score <= CHOP_RAMP_LO:
+            return 1.0
+        if chop_score >= CHOP_RAMP_HI:
+            return TREND_CHOP_FLOOR
+        frac = (chop_score - CHOP_RAMP_LO) / (CHOP_RAMP_HI - CHOP_RAMP_LO)
+        return 1.0 - frac * (1.0 - TREND_CHOP_FLOOR)
+
+    # -------------------------------------------------------------------------
+    # WS3/WS4: MARKET STRUCTURE SIGNAL FETCHER
+    # -------------------------------------------------------------------------
+
+    def _refresh_market_structure(self) -> None:
+        """
+        Refresh narrowness (WS3) and chop (WS4) signals from Polygon daily bars.
+        Cached on the instance and refreshed at most once per ~4 hours (daily
+        bars don't change faster than that). On failure, signals are marked
+        unavailable and modifiers become no-ops.
+        """
+        # Refresh at most every 4 hours
+        if (time.time() - self._ms_last_fetch_at) < 4 * 3600 and self._ms_cache.get("available"):
+            return
+
+        t0 = time.time()
+        try:
+            import pandas as pd
+            import requests
+            from datetime import date, timedelta
+
+            api_key = os.getenv("POLYGON_API_KEY", "")
+            if not api_key:
+                raise RuntimeError("no POLYGON_API_KEY for market-structure fetch")
+
+            # Lazy import of shared WS2 utilities
+            _SHARED_PATH = str(_PROJECT_ROOT / "strategies")
+            if _SHARED_PATH not in sys.path:
+                sys.path.insert(0, _SHARED_PATH)
+            from shared.market_regime import (  # type: ignore
+                narrowness_score as _narrow_score,
+                narrowness_sustained as _narrow_sust,
+                chop_score as _chop_score,
+            )
+
+            end = date.today()
+            start = end - timedelta(days=_STRUCTURE_HISTORY_DAYS + 90)  # extra buffer
+
+            def _fetch_daily(ticker: str) -> "pd.DataFrame":
+                url = (
+                    f"https://api.polygon.io/v2/aggs/ticker/{ticker}/range/1/day/"
+                    f"{start.isoformat()}/{end.isoformat()}?adjusted=true&sort=asc&limit=5000"
+                    f"&apiKey={api_key}"
+                )
+                resp = requests.get(url, timeout=15)
+                resp.raise_for_status()
+                results = resp.json().get("results", []) or []
+                if not results:
+                    raise RuntimeError(f"no daily bars for {ticker}")
+                rows = [
+                    {
+                        "ts": pd.Timestamp(r["t"], unit="ms").date(),
+                        "high": float(r["h"]),
+                        "low": float(r["l"]),
+                        "close": float(r["c"]),
+                    }
+                    for r in results
+                ]
+                return pd.DataFrame(rows)
+
+            spy = _fetch_daily("SPY")
+            rsp = _fetch_daily("RSP")
+
+            spy_close = pd.Series(spy["close"].values, name="SPY")
+            rsp_close = pd.Series(rsp["close"].values, name="RSP")
+
+            n_score = float(_narrow_score(
+                spy_close, rsp_close, window=SIMPLE_BREADTH_WINDOW,
+            ))
+            n_sust = bool(_narrow_sust(
+                spy_close, rsp_close,
+                threshold_score=SIMPLE_BREADTH_THRESHOLD_SCORE,
+                sustain_days=SIMPLE_BREADTH_SUSTAIN_DAYS,
+                window=SIMPLE_BREADTH_WINDOW,
+            ))
+            c_score = float(_chop_score(spy[["high", "low", "close"]]))
+
+            self._ms_cache = {
+                "narrowness_score": n_score,
+                "narrowness_sustained": n_sust,
+                "chop_score": c_score,
+                "available": True,
+                "fetch_time_ms": (time.time() - t0) * 1000,
+                "spy_bar_count": int(len(spy)),
+            }
+            self._ms_last_fetch_at = time.time()
+            self._intel_log.info(
+                f"[MS] narrowness_score={n_score:.3f} sustained={n_sust} "
+                f"chop={c_score:.3f} (bars={len(spy)})"
+            )
+        except Exception as e:
+            self._intel_log.warning(f"[MS] market-structure fetch failed: {e}")
+            self._ms_cache = {
+                "narrowness_score": 0.5,
+                "narrowness_sustained": False,
+                "chop_score": 0.0,
+                "available": False,
+                "fetch_time_ms": (time.time() - t0) * 1000,
+                "error": str(e),
+            }
 
     # -------------------------------------------------------------------------
     # DATA SOURCE FETCHERS (each error-isolated)
@@ -842,6 +1053,25 @@ class MarketIntelligenceLayer:
                 "entry_gates": {
                     sid: adj.entry_allowed
                     for sid, adj in ctx.sleeve_adjustments.items()
+                },
+                "gate_reasons": {
+                    sid: adj.entry_gate_reason
+                    for sid, adj in ctx.sleeve_adjustments.items()
+                    if not adj.entry_allowed
+                },
+                "adjustment_reasons": {
+                    sid: adj.adjustment_reasons
+                    for sid, adj in ctx.sleeve_adjustments.items()
+                    if adj.adjustment_reasons
+                },
+                "market_structure": {
+                    "enabled": MARKET_STRUCTURE_GATE_ENABLED or CHOP_DAMPENER_ENABLED,
+                    "gate_enabled": MARKET_STRUCTURE_GATE_ENABLED,
+                    "chop_enabled": CHOP_DAMPENER_ENABLED,
+                    "available": self._ms_cache.get("available", False),
+                    "narrowness_score": round(self._ms_cache.get("narrowness_score", 0.5), 3),
+                    "narrowness_sustained": self._ms_cache.get("narrowness_sustained", False),
+                    "chop_score": round(self._ms_cache.get("chop_score", 0.0), 3),
                 },
                 "elapsed_ms": round(elapsed_ms, 0),
             }

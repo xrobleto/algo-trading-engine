@@ -15,6 +15,11 @@ __pycache__/
 .venv/
 venv/
 
+# Backtest outputs and caches (runtime artifacts, not source)
+backtest/_runs/
+backtest/_cache_xasset/
+backtest/_cache/
+
 # OS
 .DS_Store
 Thumbs.db
