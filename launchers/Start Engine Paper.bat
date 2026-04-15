@@ -37,6 +37,17 @@ for /f "usebackq eol=# tokens=1,* delims==" %%a in ("%ENV_FILE%") do (
     if not "%%a"=="" set "%%a=%%b"
 )
 
+REM === Intelligence-layer feature flags (WS3 breadth gate + WS4 chop dampener) ===
+REM These modify SIMPLE/TREND allocations based on market microstructure. Default
+REM off in production. Turned ON here for paper validation per the engine
+REM backtest recommendations. Inspect JSONL decisions at:
+REM   %LOCAL_ROOT%\logs\intelligence_decisions.jsonl
+REM to verify gate_fire days and chop_dampener firing match expectations.
+set "INTEL_MARKET_STRUCTURE_GATE=1"
+set "INTEL_CHOP_DAMPENER=1"
+echo [INTEL] WS3 breadth gate ENABLED (INTEL_MARKET_STRUCTURE_GATE=1)
+echo [INTEL] WS4 chop dampener ENABLED (INTEL_CHOP_DAMPENER=1)
+
 REM === Run engine from local copy with auto-restart ===
 cd /d "%SRC_DIR%\strategies"
 :loop
