@@ -42,6 +42,7 @@ class TrendAdapter(StrategyAdapter):
     - Monkey-patch trading.submit_order() → validate sleeve + register ownership
     - Monkey-patch generate_client_order_id() → ENG_TREND_ prefix
     - Monkey-patch get_portfolio_equity() → return sleeve equity
+    - Monkey-patch get_positions() → filter to TREND-owned symbols via ledger
     - Rate-limit tick() to ~60s (trend bot's natural cadence)
     """
 
@@ -71,6 +72,7 @@ class TrendAdapter(StrategyAdapter):
         self._original_get_portfolio_equity = None
         self._original_emergency_shutdown = None
         self._original_get_account = None
+        self._original_get_positions = None
 
     # =========================================================================
     # LIFECYCLE
@@ -562,7 +564,24 @@ class TrendAdapter(StrategyAdapter):
 
         self._trading.get_account = patched_get_account
 
-        log.info("[TREND] Monkey-patches applied (submit_order, order_id, equity, kill_switch, get_account)")
+        # --- Patch 6: Sleeve-scoped get_positions() ---
+        # trend_bot.get_positions() reads trading.get_all_positions() directly,
+        # picking up positions owned by other sleeves (e.g., CROSSASSET's DBC).
+        # That produces phantom drift (a symbol TREND used to own but CROSSASSET
+        # now holds looks massively off-target) and triggers spurious mini-
+        # rebalances that cascade into correlated-buy storms (2026-04-15 SMH/
+        # SOXX drift buys were triggered this way by stale DBC targets).
+        # Filter to the ownership ledger so TREND sees only what TREND owns.
+        self._original_get_positions = tb.get_positions
+
+        def patched_get_positions(trading_client):
+            all_positions = self._original_get_positions(trading_client)
+            trend_symbols = self.ledger.get_active_symbols("TREND")
+            return {sym: data for sym, data in all_positions.items() if sym in trend_symbols}
+
+        tb.get_positions = patched_get_positions
+
+        log.info("[TREND] Monkey-patches applied (submit_order, order_id, equity, kill_switch, get_account, get_positions)")
 
     def _remove_patches(self) -> None:
         """Restore original functions."""
@@ -580,5 +599,7 @@ class TrendAdapter(StrategyAdapter):
             tb.kill_switch.execute_emergency_shutdown = self._original_emergency_shutdown
         if self._original_get_account and self._trading:
             self._trading.get_account = self._original_get_account
+        if self._original_get_positions:
+            tb.get_positions = self._original_get_positions
 
         log.info("[TREND] Monkey-patches removed")
