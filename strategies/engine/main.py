@@ -183,6 +183,34 @@ def engine_main(trend_only: bool = False) -> None:
     log.info(f"State dir: {config.state_dir}")
 
     # -------------------------------------------------------------------------
+    # 1b. Optional one-shot strategy-state reset (for clean live-mode init)
+    # Set RESET_STRATEGY_STATE=1 in the environment to wipe per-strategy state
+    # files BEFORE adapters load them. Only wipes strategy state — leaves the
+    # ownership ledger and trade journals intact. Remove the env var after the
+    # next successful startup to avoid wiping state on every restart.
+    # -------------------------------------------------------------------------
+    if os.getenv("RESET_STRATEGY_STATE", "0") == "1":
+        from pathlib import Path as _Path
+        _state_dir = _Path(config.state_dir)
+        _targets = [
+            "cross_asset_state.json",
+            "trend_vol_target_state.json",
+            "momentum_bot_state.json",
+            "momentum_bot_trade_intents.json",
+            "momentum_bot_heartbeat.jsonl",
+            "signal_features.jsonl",
+        ]
+        log.warning("=" * 70)
+        log.warning("[RESET_STRATEGY_STATE=1] Wiping per-strategy state files")
+        for _fname in _targets:
+            _fpath = _state_dir / _fname
+            if _fpath.exists():
+                _fpath.unlink()
+                log.warning(f"  removed: {_fpath}")
+        log.warning("REMEMBER: unset RESET_STRATEGY_STATE after this deploy stabilizes")
+        log.warning("=" * 70)
+
+    # -------------------------------------------------------------------------
     # 2. Initialize broker
     # -------------------------------------------------------------------------
     broker = create_broker_from_env()
