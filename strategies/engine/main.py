@@ -213,12 +213,13 @@ def engine_main(trend_only: bool = False) -> None:
         env_var="KILL_SWITCH"
     )
 
-    # Pre-check kill switch
+    # Pre-check kill switch — log but do not exit. The in-tick check blocks
+    # new orders while allowing exits; exiting here would crashloop the
+    # container and make it impossible to remove the kill switch file via SSH.
     ks_triggered, ks_reason = portfolio_ks.is_triggered()
     if ks_triggered:
-        log.critical(f"Portfolio kill switch active: {ks_reason}")
-        log.critical("Clear the kill switch file/env var and restart.")
-        return
+        log.critical(f"Portfolio kill switch active at startup: {ks_reason}")
+        log.critical("Engine will continue running; new entries will be BLOCKED until cleared.")
 
     # -------------------------------------------------------------------------
     # 5b. Market intelligence layer
