@@ -33,7 +33,7 @@ from engine.config import EngineConfig
 # ---------------------------------------------------------------------------
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent  # G:\My Drive\Algo_Trading
 _UTILITIES_PATH = str(_PROJECT_ROOT / "utilities")
-_AI_MANAGER_PATH = str(_PROJECT_ROOT / "ai_manager" / "src")
+_AI_MANAGER_PATH = str(_PROJECT_ROOT / "ai_manager")
 
 if _UTILITIES_PATH not in sys.path:
     sys.path.insert(0, _UTILITIES_PATH)
@@ -676,8 +676,8 @@ class MarketIntelligenceLayer:
         t0 = time.time()
         try:
             if self._macro_analyzer is None:
-                from providers.fred_client import FREDClient
-                from signals.macro import MacroAnalyzer
+                from src.providers.fred_client import FREDClient
+                from src.signals.macro import MacroAnalyzer
                 fred = FREDClient()
                 self._macro_analyzer = MacroAnalyzer(fred_client=fred)
 
