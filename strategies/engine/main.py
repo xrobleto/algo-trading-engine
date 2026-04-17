@@ -367,10 +367,15 @@ def engine_main(trend_only: bool = False) -> None:
 
         try:
             # ---- Portfolio kill switch (always check) ----
+            # Kill switch blocks new entries via the submit_order monkey-patch;
+            # exits flow through normally. Keep the engine alive (idle-tick)
+            # so the operator can SSH in and clear the file when ready.
             ks_triggered, ks_reason = portfolio_ks.is_triggered()
             if ks_triggered:
-                log.critical(f"[ENGINE] Portfolio kill switch: {ks_reason}")
-                break
+                if tick_count % 60 == 1:  # log once per ~5 min at 5s ticks
+                    log.critical(f"[ENGINE] Portfolio kill switch active: {ks_reason}")
+                time.sleep(5.0)
+                continue
 
             # ---- Market session awareness ----
             session = get_market_session()
