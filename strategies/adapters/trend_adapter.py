@@ -43,6 +43,9 @@ class TrendAdapter(StrategyAdapter):
     - Monkey-patch generate_client_order_id() → ENG_TREND_ prefix
     - Monkey-patch get_portfolio_equity() → return sleeve equity
     - Monkey-patch get_positions() → filter to TREND-owned symbols via ledger
+    - Monkey-patch check_drift_mini_rebalance_needed() → filter target weights
+      to exclude symbols owned by OTHER sleeves (prevents phantom drift from
+      stale cross-sleeve targets).
     - Rate-limit tick() to ~60s (trend bot's natural cadence)
     """
 
@@ -73,6 +76,7 @@ class TrendAdapter(StrategyAdapter):
         self._original_emergency_shutdown = None
         self._original_get_account = None
         self._original_get_positions = None
+        self._original_check_drift_mini = None
 
     # =========================================================================
     # LIFECYCLE
@@ -581,7 +585,50 @@ class TrendAdapter(StrategyAdapter):
 
         tb.get_positions = patched_get_positions
 
-        log.info("[TREND] Monkey-patches applied (submit_order, order_id, equity, kill_switch, get_account, get_positions)")
+        # --- Patch 7: Sleeve-scoped last_target_weights in drift check ---
+        # Patch 6 filters the CURRENT positions; Patch 7 is its counterpart for
+        # TARGET weights. When TREND rebalances, it may rank a ticker that is
+        # subsequently claimed by another sleeve (e.g., DBC is in TREND's
+        # DEFENSIVE_TICKERS universe and is also a default CROSSASSET holding).
+        # TREND's ownership check blocks execution, but the symbol lingers in
+        # state.last_target_weights at its ranked weight. Next drift check:
+        #   current_w[DBC]=0   (Patch 6 filtered it out)
+        #   target_w[DBC]=0.31 (still in state from last rebalance)
+        #   drift = 0.31 → above threshold → phantom drift mini-rebalance.
+        # Patch 7 masks target weights for symbols actively owned by OTHER
+        # sleeves before the drift calc so the pair (curr, tgt) is (0, 0).
+        self._original_check_drift_mini = tb.check_drift_mini_rebalance_needed
+
+        def patched_check_drift_mini(state, positions, total_equity, trading_client):
+            orig_targets = state.last_target_weights
+            if orig_targets:
+                filtered_targets = {
+                    sym: w for sym, w in orig_targets.items()
+                    if not self.ledger.is_symbol_owned_by_other(sym, "TREND")
+                }
+                if len(filtered_targets) != len(orig_targets):
+                    removed = set(orig_targets.keys()) - set(filtered_targets.keys())
+                    log.debug(
+                        f"[TREND] Patch 7: masked {len(removed)} cross-sleeve target(s) "
+                        f"from drift check: {sorted(removed)}"
+                    )
+                state.last_target_weights = filtered_targets
+                try:
+                    return self._original_check_drift_mini(
+                        state, positions, total_equity, trading_client
+                    )
+                finally:
+                    state.last_target_weights = orig_targets
+            return self._original_check_drift_mini(
+                state, positions, total_equity, trading_client
+            )
+
+        tb.check_drift_mini_rebalance_needed = patched_check_drift_mini
+
+        log.info(
+            "[TREND] Monkey-patches applied (submit_order, order_id, equity, "
+            "kill_switch, get_account, get_positions, check_drift_mini)"
+        )
 
     def _remove_patches(self) -> None:
         """Restore original functions."""
@@ -601,5 +648,7 @@ class TrendAdapter(StrategyAdapter):
             self._trading.get_account = self._original_get_account
         if self._original_get_positions:
             tb.get_positions = self._original_get_positions
+        if self._original_check_drift_mini:
+            tb.check_drift_mini_rebalance_needed = self._original_check_drift_mini
 
         log.info("[TREND] Monkey-patches removed")
