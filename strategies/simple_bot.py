@@ -5069,6 +5069,80 @@ class TradeState(Enum):
     FAILED = "FAILED"                     # Entry timeout or error
     CANCELLED = "CANCELLED"               # Cancelled before fill
 
+
+# ---------------------------------------------------------------------------
+# Patch 8 — fill classification helper (2026-04-20)
+#
+# Background: on 2026-04-20 a ladder-mode entry on MP filled 18/18 shares via
+# a single OTO scalp order, but `sync_intent_with_broker_orders` tagged the
+# intent as PARTIALLY_FILLED (because only the "scalp" leg filled — the
+# runner leg is software-managed in ladder mode and has no broker order to
+# fill). The 45-second entry-timeout handler then read that state, took the
+# "partial fill" branch, cancelled the protective stop, and flattened a
+# fully-established position for a -$1.62 scratch.
+#
+# Root cause: legacy logic treated `runner_qty > 0` as "expecting a separate
+# runner broker order". In ladder mode the full position ships in one OTO
+# entry and `runner_qty` is re-purposed to track the software-managed runner
+# leg. The caller needs a single authoritative classifier that understands
+# all three entry shapes (single-bracket, two-bracket, ladder) and falls
+# back to the broker position qty when flags lag reality.
+# ---------------------------------------------------------------------------
+
+def classify_fill_status(
+    total_qty: int,
+    runner_qty: int,
+    runner_order_id: Optional[str],
+    scalp_filled: bool,
+    runner_filled: bool,
+    scalp_qty: int = 0,
+    broker_position_qty: int = 0,
+) -> str:
+    """Classify an entry's fill status as 'none' / 'partial' / 'full'.
+
+    Priority of evidence, highest first:
+      1. Broker position qty >= total_qty  -> 'full'   (authoritative, any mode)
+      2. Broker position qty 1..total_qty-1 -> 'partial' (safety: never cancel
+         stops while the broker reports ANY position on this symbol)
+      3. Single-bracket mode (runner_qty == 0): scalp_filled and scalp_qty
+         covers total_qty -> 'full', else 'partial' if scalp_filled else 'none'
+      4. Ladder mode (runner_qty > 0 and runner_order_id is None): the single
+         OTO entry covers the full position, so scalp_filled alone means 'full'
+      5. Legacy two-bracket mode (runner_qty > 0 with a runner_order_id):
+         both scalp_filled and runner_filled -> 'full'; exactly one -> 'partial'
+      6. Otherwise -> 'none'
+    """
+    if total_qty <= 0:
+        return 'none'
+
+    # Broker is always authoritative when it reports a position.
+    if broker_position_qty >= total_qty:
+        return 'full'
+    if 0 < broker_position_qty < total_qty:
+        # Broker has SOMETHING. Do not treat as 'none' — we must not cancel
+        # protective stops while naked shares are outstanding.
+        return 'partial'
+
+    is_single_bracket = (runner_qty == 0)
+    is_ladder_mode = (runner_qty > 0 and runner_order_id is None)
+
+    if is_single_bracket:
+        if scalp_filled and scalp_qty >= total_qty:
+            return 'full'
+        return 'partial' if scalp_filled else 'none'
+
+    if is_ladder_mode:
+        # Single OTO carries the full position. Scalp fill == entire fill.
+        return 'full' if scalp_filled else 'none'
+
+    # Legacy two-bracket: need both legs.
+    if scalp_filled and runner_filled:
+        return 'full'
+    if scalp_filled or runner_filled:
+        return 'partial'
+    return 'none'
+
+
 @dataclass
 class TradeIntent:
     """
@@ -5456,23 +5530,43 @@ class TradeManager:
                     if runner_fill_price:
                         intent.runner_fill_price = runner_fill_price
 
-                    # Determine new state based on fills
-                    if scalp_filled and runner_filled:
-                        # Both brackets filled - transition to ACTIVE_EXITS
-                        # (Broker now manages TP/SL for both brackets)
+                    # Patch 8: classify fill using mode-aware helper (handles
+                    # ladder mode where runner_qty>0 but there's no separate
+                    # runner broker order).
+                    fill_status = classify_fill_status(
+                        total_qty=intent.total_qty,
+                        runner_qty=intent.runner_qty,
+                        runner_order_id=intent.runner_order_id,
+                        scalp_filled=scalp_filled,
+                        runner_filled=runner_filled,
+                        scalp_qty=intent.scalp_qty,
+                        broker_position_qty=0,  # state-sync doesn't requery positions
+                    )
+
+                    if fill_status == 'full':
                         old_state = intent.state
                         intent.state = TradeState.ACTIVE_EXITS
                         if not intent.filled_at:
                             intent.filled_at = iso(now_et())
-                        logger.info(f"[STATE_SYNC] {symbol}: State transition | {old_state.value} -> ACTIVE_EXITS (both brackets filled)")
+                        is_ladder = intent.runner_qty > 0 and intent.runner_order_id is None
+                        mode_label = (
+                            "ladder mode — single OTO covers full position"
+                            if is_ladder else "both brackets filled"
+                        )
+                        logger.info(
+                            f"[STATE_SYNC] {symbol}: State transition | {old_state.value} -> ACTIVE_EXITS "
+                            f"({mode_label})"
+                        )
 
-                    elif scalp_filled or runner_filled:
-                        # Partial fill - transition to PARTIALLY_FILLED
+                    elif fill_status == 'partial':
+                        # True partial fill (two-bracket mode, only one leg filled).
                         old_state = intent.state
                         intent.state = TradeState.PARTIALLY_FILLED
                         filled_qty = intent.get_filled_qty()
-                        logger.warning(f"[STATE_SYNC] {symbol}: State transition | {old_state.value} -> PARTIALLY_FILLED "
-                                     f"({filled_qty}/{intent.total_qty} shares)")
+                        logger.warning(
+                            f"[STATE_SYNC] {symbol}: State transition | {old_state.value} -> PARTIALLY_FILLED "
+                            f"({filled_qty}/{intent.total_qty} shares)"
+                        )
 
                 # Save if changed
                 if state_changed:
@@ -6897,69 +6991,94 @@ class MomentumBot:
                     runner_fill_price=runner_fill_price
                 )
 
-                # Determine if fully filled BEFORE deciding whether to cancel
-                is_single_bracket = intent.runner_qty == 0
-                filled_qty = intent.get_filled_qty()
-                is_fully_filled = (is_single_bracket and scalp_filled and filled_qty == intent.total_qty) or \
-                                 (not is_single_bracket and scalp_filled and runner_filled)
+                # Patch 8: Query broker position FIRST — authoritative source of
+                # truth that lets us correctly classify ladder-mode fills (where
+                # runner_qty>0 but there's no separate runner order) and also
+                # detects stale fill data (orders filled but position gone).
+                try:
+                    current_positions = alpaca.list_positions()
+                    pos_entry = next(
+                        (pos for pos in current_positions if pos["symbol"] == symbol),
+                        None,
+                    )
+                    broker_position_qty = (
+                        int(abs(float(pos_entry["qty"]))) if pos_entry else 0
+                    )
+                    position_exists = broker_position_qty > 0
+                except Exception:
+                    broker_position_qty = 0
+                    position_exists = False
 
-                # Handle based on what filled
-                if scalp_filled or runner_filled:
+                fill_status = classify_fill_status(
+                    total_qty=intent.total_qty,
+                    runner_qty=intent.runner_qty,
+                    runner_order_id=intent.runner_order_id,
+                    scalp_filled=scalp_filled,
+                    runner_filled=runner_filled,
+                    scalp_qty=intent.scalp_qty,
+                    broker_position_qty=broker_position_qty,
+                )
+                filled_qty = intent.get_filled_qty()
+                is_fully_filled = (fill_status == 'full')
+
+                # Handle based on classification
+                if fill_status == 'full':
                     avg_fill_price = intent.get_avg_fill_price()
 
-                    if is_fully_filled:
-                        # Verify position actually exists at broker before resurrecting
-                        # Orders can show "filled" even after position was closed (stop/TP hit during crash)
-                        try:
-                            current_positions = alpaca.list_positions()
-                            position_exists = any(pos["symbol"] == symbol for pos in current_positions)
-                        except Exception:
-                            position_exists = False
-
-                        if not position_exists:
-                            logger.warning(f"[TIMEOUT] {symbol}: STALE FILL DATA - orders show filled but NO POSITION at broker | "
-                                          f"Position was likely closed during downtime. Marking FAILED")
-                            trade_manager.transition_state(symbol, TradeState.FAILED)
-                            self.pending_symbols.discard(symbol)
-                        else:
-                            # COMPLETE FILL - DO NOT cancel orders! The stop/TP are protecting the position
-                            logger.info(f"[TIMEOUT] {symbol}: FULLY FILLED on timeout | filled_qty={filled_qty}/{intent.total_qty} "
-                                       f"avg_fill=${avg_fill_price:.2f} | Transitioning to FILLED state")
-
-                            # Transition to ACTIVE_EXITS since bracket stop/TP are managing the position
-                            trade_manager.transition_state(symbol, TradeState.ACTIVE_EXITS)
-
-                            # Remove from pending - position is now active with broker-managed exits
-                            self.pending_symbols.discard(symbol)
-
-                            # Log successful entry - emphasize that stop/TP are PRESERVED
-                            logger.info(f"[TIMEOUT] {symbol}: Position active - broker stop/TP orders preserved and managing risk")
+                    if not position_exists:
+                        # Orders show filled but no position at broker — stale
+                        # fill data (position was closed during downtime).
+                        logger.warning(f"[TIMEOUT] {symbol}: STALE FILL DATA - orders show filled but NO POSITION at broker | "
+                                      f"Position was likely closed during downtime. Marking FAILED")
+                        trade_manager.transition_state(symbol, TradeState.FAILED)
+                        self.pending_symbols.discard(symbol)
                     else:
-                        # TRUE PARTIAL FILL - flatten immediately
-                        # We don't want partial positions with mismatched bracket legs
-                        logger.error(f"[TIMEOUT] {symbol}: PARTIAL FILL on timeout | filled_qty={filled_qty}/{intent.total_qty} "
-                                     f"avg_fill=${avg_fill_price:.2f} | FLATTENING IMMEDIATELY")
+                        # COMPLETE FILL - DO NOT cancel orders! The stop/TP are protecting the position
+                        is_ladder = intent.runner_qty > 0 and intent.runner_order_id is None
+                        mode_tag = "ladder mode" if is_ladder else "two-bracket"
+                        fill_str = f"${avg_fill_price:.2f}" if avg_fill_price else "n/a"
+                        logger.info(f"[TIMEOUT] {symbol}: FULLY FILLED on timeout ({mode_tag}) | "
+                                    f"filled_qty={filled_qty}/{intent.total_qty} broker_qty={broker_position_qty} "
+                                    f"avg_fill={fill_str} | Transitioning to ACTIVE_EXITS")
 
-                        # Flatten immediately (cancel any remaining orders + close position)
-                        try:
-                            flatten_result = alpaca.flatten_symbol(symbol)
-                            logger.warning(f"[TIMEOUT] {symbol}: Flatten complete | {flatten_result}")
-                            trade_manager.transition_state(symbol, TradeState.CLOSED)
+                        # Transition to ACTIVE_EXITS since bracket stop/TP are managing the position
+                        trade_manager.transition_state(symbol, TradeState.ACTIVE_EXITS)
 
-                            # METRICS: Log partial fill + flatten to journal
-                            trade_journal.log_exit(symbol, intent, reason="TIMEOUT_PARTIAL_FILL", outcome="SCRATCH")
-                        except Exception as flatten_err:
-                            logger.error(f"[TIMEOUT] {symbol}: Failed to flatten after partial fill: {flatten_err}")
-                            trade_manager.transition_state(symbol, TradeState.FAILED)
-
-                            # METRICS: Log failed flatten
-                            trade_journal.log_exit(symbol, intent, reason="TIMEOUT_PARTIAL_FILL_FLATTEN_FAILED", outcome="LOSS")
-
-                        # Remove from pending
+                        # Remove from pending - position is now active with broker-managed exits
                         self.pending_symbols.discard(symbol)
 
+                        # Log successful entry - emphasize that stop/TP are PRESERVED
+                        logger.info(f"[TIMEOUT] {symbol}: Position active - broker stop/TP orders preserved and managing risk")
+
+                elif fill_status == 'partial':
+                    # TRUE PARTIAL FILL - flatten immediately. We don't want
+                    # partial positions with mismatched bracket legs.
+                    avg_fill_price = intent.get_avg_fill_price()
+                    fill_str = f"${avg_fill_price:.2f}" if avg_fill_price else "n/a"
+                    logger.error(f"[TIMEOUT] {symbol}: PARTIAL FILL on timeout | "
+                                 f"filled_qty={filled_qty}/{intent.total_qty} broker_qty={broker_position_qty} "
+                                 f"avg_fill={fill_str} | FLATTENING IMMEDIATELY")
+
+                    # Flatten immediately (cancel any remaining orders + close position)
+                    try:
+                        flatten_result = alpaca.flatten_symbol(symbol)
+                        logger.warning(f"[TIMEOUT] {symbol}: Flatten complete | {flatten_result}")
+                        trade_manager.transition_state(symbol, TradeState.CLOSED)
+
+                        # METRICS: Log partial fill + flatten to journal
+                        trade_journal.log_exit(symbol, intent, reason="TIMEOUT_PARTIAL_FILL", outcome="SCRATCH")
+                    except Exception as flatten_err:
+                        logger.error(f"[TIMEOUT] {symbol}: Failed to flatten after partial fill: {flatten_err}")
+                        trade_manager.transition_state(symbol, TradeState.FAILED)
+
+                        # METRICS: Log failed flatten
+                        trade_journal.log_exit(symbol, intent, reason="TIMEOUT_PARTIAL_FILL_FLATTEN_FAILED", outcome="LOSS")
+
+                    # Remove from pending
+                    self.pending_symbols.discard(symbol)
+
                 else:
-                    # Nothing filled - cancel all orders (safe since no position)
+                    # Nothing filled AND broker has no position - safe to cancel.
                     logger.info(f"[TIMEOUT] {symbol}: No fills - cancelling unfilled bracket orders")
                     orders_cancelled = alpaca.cancel_orders_for_symbol(symbol, confirm=True)
                     logger.info(f"[TIMEOUT] {symbol}: Cancelled {orders_cancelled} order(s)")
