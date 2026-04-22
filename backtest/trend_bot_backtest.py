@@ -1237,6 +1237,12 @@ def print_report(result: BacktestResult):
 
 def save_results(result: BacktestResult, output_path: str):
     """Save results to JSON file."""
+    # Daily equity series (for compositing with other strategy sleeves)
+    daily_equity = [
+        {"date": s.date.isoformat(), "equity": float(s.equity)}
+        for s in result.daily_snapshots
+    ]
+
     # Convert to serializable dict
     data = {
         "start_date": result.start_date.isoformat(),
@@ -1260,6 +1266,7 @@ def save_results(result: BacktestResult, output_path: str):
         "beta": result.beta,
         "information_ratio": result.information_ratio,
         "monthly_returns": result.monthly_returns,
+        "daily_equity": daily_equity,
         "config": result.config,
     }
 

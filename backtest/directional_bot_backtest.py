@@ -27,7 +27,7 @@ warnings.filterwarnings("ignore", category=DeprecationWarning)
 import requests
 import pandas as pd
 import numpy as np
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Dict, List, Optional, Tuple
@@ -87,6 +87,12 @@ BACKTEST_SYMBOLS = CORE_SYMBOLS + (SCANNER_SYMBOLS if USE_SCANNER_FEATURES and U
 
 BACKTEST_DAYS = 252
 INITIAL_CAPITAL = 111_000
+
+# --- Window override (set by CLI --start/--end) ---
+# When these are set, fetchers use explicit dates instead of "now - days" trailing window.
+# Used by engine multi-regime backtests (backtest/engine_regime_backtest.py).
+_BACKTEST_START_DATE: Optional[date] = None
+_BACKTEST_END_DATE: Optional[date] = None
 
 # ============================================================
 # LONG PARAMETERS (from simple_bot v48c)
@@ -304,8 +310,15 @@ def fetch_minute_bars(symbol: str, days: int = 30) -> Optional[pd.DataFrame]:
     """Fetch minute bars from Polygon with pagination."""
     import time as _time
 
-    end_date = datetime.now(ET).date()
-    start_date = end_date - timedelta(days=days + 10)
+    # Window override: explicit start/end (via CLI) takes precedence over trailing days
+    if _BACKTEST_END_DATE is not None:
+        end_date = _BACKTEST_END_DATE
+    else:
+        end_date = datetime.now(ET).date()
+    if _BACKTEST_START_DATE is not None:
+        start_date = _BACKTEST_START_DATE
+    else:
+        start_date = end_date - timedelta(days=days + 10)
 
     all_results = []
     chunk_size_days = 120
@@ -374,8 +387,16 @@ def fetch_minute_bars(symbol: str, days: int = 30) -> Optional[pd.DataFrame]:
 
 def fetch_daily_bars(symbol: str, days: int = 30) -> Optional[pd.DataFrame]:
     """Fetch daily bars for RVOL and SMA calculation."""
-    end_date = datetime.now(ET).date()
-    start_date = end_date - timedelta(days=days + 260)  # Extra for SMA200
+    # Window override: explicit start/end (via CLI) takes precedence over trailing days
+    if _BACKTEST_END_DATE is not None:
+        end_date = _BACKTEST_END_DATE
+    else:
+        end_date = datetime.now(ET).date()
+    if _BACKTEST_START_DATE is not None:
+        # Always pull +260 days of warmup before the window so SMA200 is primed
+        start_date = _BACKTEST_START_DATE - timedelta(days=260)
+    else:
+        start_date = end_date - timedelta(days=days + 260)  # Extra for SMA200
 
     url = f"https://api.polygon.io/v2/aggs/ticker/{symbol}/range/1/day/{start_date}/{end_date}"
     params = {
@@ -1430,13 +1451,55 @@ def save_trades(result: BacktestResult, filename: str):
             }
             for t in result.trades
         ])
+        # If window override is set, filter trades to the requested window
+        # (data fetch pulls warmup/buffer bars, so unfiltered CSV would include trades from prior days)
+        if _BACKTEST_START_DATE is not None:
+            # entry_time is already YYYY-MM-DDTHH:MM:SS from isoformat(); use string slicing
+            # for robustness (avoids pandas to_datetime dtype surprises across versions).
+            start_str = _BACKTEST_START_DATE.isoformat()
+            end_str = _BACKTEST_END_DATE.isoformat() if _BACKTEST_END_DATE is not None else "9999-12-31"
+            entry_dates = trades_df["entry_time"].astype(str).str[:10]
+            in_window = (entry_dates >= start_str) & (entry_dates <= end_str)
+            trades_df = trades_df[in_window].reset_index(drop=True)
         trades_df.to_csv(filename, index=False)
-        print(f"Trade log saved to {filename}")
+        print(f"Trade log saved to {filename} ({len(trades_df)} trades)")
 
 
 def main():
     import sys
-    ab_mode = "--compare" in sys.argv
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description="Backtest directional_bot.py strategy (long + short)",
+        epilog=(
+            "Examples:\n"
+            "  python directional_bot_backtest.py\n"
+            "  python directional_bot_backtest.py --start 2023-06-01 --end 2023-12-29\n"
+            "  python directional_bot_backtest.py --compare\n"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument("--start", type=str, help="Start date (YYYY-MM-DD). Overrides BACKTEST_DAYS.")
+    parser.add_argument("--end", type=str, help="End date (YYYY-MM-DD). Defaults to today when --start is given.")
+    parser.add_argument("--output", type=str, default=None,
+                        help="Output trades CSV path (default: directional_bot_backtest_{suffix}.csv)")
+    parser.add_argument("--compare", action="store_true",
+                        help="Run A/B comparison (baseline vs scanner v2)")
+    args = parser.parse_args()
+
+    # Apply window overrides
+    global _BACKTEST_START_DATE, _BACKTEST_END_DATE
+    if args.end:
+        _BACKTEST_END_DATE = date.fromisoformat(args.end)
+    elif args.start:
+        _BACKTEST_END_DATE = datetime.now(ET).date()
+    if args.start:
+        _BACKTEST_START_DATE = date.fromisoformat(args.start)
+
+    if _BACKTEST_START_DATE and _BACKTEST_END_DATE:
+        print(f"[WINDOW OVERRIDE] {_BACKTEST_START_DATE} -> {_BACKTEST_END_DATE}")
+
+    ab_mode = args.compare
 
     if ab_mode:
         # A/B comparison: run baseline, then scanner v2
@@ -1511,7 +1574,8 @@ def main():
         engine = BacktestEngine()
         result = engine.run_backtest(BACKTEST_SYMBOLS)
         suffix = "scanner_v2" if USE_SCANNER_FEATURES else "baseline"
-        save_trades(result, f"directional_bot_backtest_{suffix}.csv")
+        output_path = args.output or f"directional_bot_backtest_{suffix}.csv"
+        save_trades(result, output_path)
 
 
 if __name__ == "__main__":

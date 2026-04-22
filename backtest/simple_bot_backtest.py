@@ -16,7 +16,7 @@ import os
 import requests
 import pandas as pd
 import numpy as np
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Dict, List, Optional, Tuple
@@ -64,6 +64,12 @@ BACKTEST_SYMBOLS = [
 
 BACKTEST_DAYS = 252  # v48: Back to 1yr for faster iteration
 INITIAL_CAPITAL = 111_000  # v46: Match actual paper account balance
+
+# --- Window override (set by CLI --start/--end) ---
+# When these are set, fetchers use explicit dates instead of "now - days" trailing window.
+# Used by engine multi-regime backtests (backtest/engine_regime_backtest.py).
+_BACKTEST_START_DATE: Optional[date] = None
+_BACKTEST_END_DATE: Optional[date] = None
 
 # --- Entry Parameters (v44: synced with production) ---
 MIN_RELATIVE_VOLUME = 1.5      # v48b: Stricter RVOL for high conviction (gap days naturally higher)
@@ -255,8 +261,15 @@ def fetch_minute_bars(symbol: str, days: int = 30) -> Optional[pd.DataFrame]:
     """Fetch minute bars from Polygon with pagination for full coverage."""
     import time as _time
 
-    end_date = datetime.now(ET).date()
-    start_date = end_date - timedelta(days=days + 10)  # Extra buffer for weekends
+    # Window override: explicit start/end (via CLI) takes precedence over trailing days
+    if _BACKTEST_END_DATE is not None:
+        end_date = _BACKTEST_END_DATE
+    else:
+        end_date = datetime.now(ET).date()
+    if _BACKTEST_START_DATE is not None:
+        start_date = _BACKTEST_START_DATE
+    else:
+        start_date = end_date - timedelta(days=days + 10)  # Extra buffer for weekends
 
     # v47i: Paginate in ~120-day chunks to avoid 50K limit truncation
     all_results = []
@@ -326,8 +339,16 @@ def fetch_minute_bars(symbol: str, days: int = 30) -> Optional[pd.DataFrame]:
 
 def fetch_daily_bars(symbol: str, days: int = 30) -> Optional[pd.DataFrame]:
     """Fetch daily bars for RVOL calculation."""
-    end_date = datetime.now(ET).date()
-    start_date = end_date - timedelta(days=days + 30)  # Extra for 20-day average
+    # Window override: explicit start/end (via CLI) takes precedence over trailing days
+    if _BACKTEST_END_DATE is not None:
+        end_date = _BACKTEST_END_DATE
+    else:
+        end_date = datetime.now(ET).date()
+    if _BACKTEST_START_DATE is not None:
+        # Always pull +30 days of warmup before the window so RVOL/20-day avg is primed
+        start_date = _BACKTEST_START_DATE - timedelta(days=30)
+    else:
+        start_date = end_date - timedelta(days=days + 30)  # Extra for 20-day average
 
     url = f"https://api.polygon.io/v2/aggs/ticker/{symbol}/range/1/day/{start_date}/{end_date}"
     params = {
@@ -1178,6 +1199,36 @@ class BacktestEngine:
 
 def main():
     """Run the backtest."""
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description="Backtest simple_bot.py strategy",
+        epilog=(
+            "Examples:\n"
+            "  python simple_bot_backtest.py\n"
+            "  python simple_bot_backtest.py --start 2023-06-01 --end 2023-12-29\n"
+            "  python simple_bot_backtest.py --start 2025-10-01 --end 2026-04-01 --output bt_P6.csv\n"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument("--start", type=str, help="Start date (YYYY-MM-DD). Overrides BACKTEST_DAYS.")
+    parser.add_argument("--end", type=str, help="End date (YYYY-MM-DD). Defaults to today when --start is given.")
+    parser.add_argument("--output", type=str, default="simple_bot_backtest_trades.csv",
+                        help="Output trades CSV path (default: simple_bot_backtest_trades.csv)")
+    args = parser.parse_args()
+
+    # Apply window overrides
+    global _BACKTEST_START_DATE, _BACKTEST_END_DATE
+    if args.end:
+        _BACKTEST_END_DATE = date.fromisoformat(args.end)
+    elif args.start:
+        _BACKTEST_END_DATE = datetime.now(ET).date()
+    if args.start:
+        _BACKTEST_START_DATE = date.fromisoformat(args.start)
+
+    if _BACKTEST_START_DATE and _BACKTEST_END_DATE:
+        print(f"[WINDOW OVERRIDE] {_BACKTEST_START_DATE} -> {_BACKTEST_END_DATE}")
+
     engine = BacktestEngine()
     result = engine.run_backtest(BACKTEST_SYMBOLS)
 
@@ -1199,8 +1250,18 @@ def main():
             }
             for t in result.trades
         ])
-        trades_df.to_csv("simple_bot_backtest_trades.csv", index=False)
-        print("Trade log saved to simple_bot_backtest_trades.csv")
+        # If window override is set, filter trades to the requested window
+        # (data fetch includes warmup/buffer, so unfiltered CSV would include trades from prior days)
+        if _BACKTEST_START_DATE is not None:
+            # entry_time is YYYY-MM-DDTHH:MM:SS from isoformat(); use string slicing
+            # for robustness (avoids pandas to_datetime dtype surprises across versions).
+            start_str = _BACKTEST_START_DATE.isoformat()
+            end_str = _BACKTEST_END_DATE.isoformat() if _BACKTEST_END_DATE is not None else "9999-12-31"
+            entry_dates = trades_df["entry_time"].astype(str).str[:10]
+            in_window = (entry_dates >= start_str) & (entry_dates <= end_str)
+            trades_df = trades_df[in_window].reset_index(drop=True)
+        trades_df.to_csv(args.output, index=False)
+        print(f"Trade log saved to {args.output} ({len(trades_df)} trades)")
 
 
 if __name__ == "__main__":
