@@ -61,7 +61,7 @@ class EngineConfig:
 
     # Engine loop timing
     tick_interval_sec: float = 5.0       # main loop sleep
-    reconcile_interval_sec: float = 300.0  # periodic reconciliation cadence (5 min)
+    reconcile_interval_sec: float = 60.0   # periodic reconciliation cadence (1 min) — drives pending→filled ledger freshness (see Patch 9)
 
     # Live trading safety
     live_trading: bool = False

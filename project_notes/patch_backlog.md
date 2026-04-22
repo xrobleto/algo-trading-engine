@@ -79,21 +79,39 @@ re-reading the order object (not cached state) inside the guard.
 
 ## Patch 9 — Ownership ledger: pending→filled transition reconciler
 
-**Trigger**: flagged in the 2026-04-15 post-mortem. No production miss yet on
-live (promoted 2026-04-17), but the race is latent in the ledger.
+**Status**: SHIPPED 2026-04-21 via config-only fix (Option A). The original
+websocket proposal was oversized — the core reconciler had already gained a
+pending-resolution block between 2026-04-15 (when this entry was written) and
+2026-04-17 promotion, so the remaining gap was purely *latency*, not a missing
+code path.
 
-**Symptom**: entries created at order submission stay `status="pending"` in the
-ledger even after Alpaca reports the fill. `is_active` still returns True so the
-ownership filter keeps working, but the audit trail is wrong and
-`is_symbol_owned_by_other()` can't distinguish "pending that may cancel" from
-"real position".
+**What was actually happening (2026-04-21 re-analysis)**
 
-**Proposed fix**: subscribe ledger to the trade-updates stream in
-`strategies/engine/broker.py` and call `ledger.update_status(client_order_id,
-"filled" | "partially_filled" | "closed" | "canceled")` off the authoritative
-Alpaca events instead of inferring from initial submission.
+`reconciler.py` (the loop at lines 244–279) already walks every `pending`
+ledger entry on each cycle, calls `broker.get_order_by_client_id(coid)`, and
+promotes to `filled` / `partially_filled` / `cancelled` based on Alpaca's
+authoritative REST response. The *only* exposure was that this ran every
+**5 minutes** (`reconcile_interval_sec=300.0`) so `get_filled_entries()` /
+`get_deployed_notional()` / `count_active_positions()` could undercount fills
+for up to 5 minutes after submission. `is_active` still returned True during
+that window (pending counts as active), so the ownership filter and
+`is_symbol_owned_by_other()` were always correct — the risk was sizing
+undercounts, not double-ownership.
 
-**Blocked by**: nothing. Safe to ship after Patch 8 lands; same general area.
+**Fix shipped**: lowered `reconcile_interval_sec` from `300.0` → `60.0` in
+`strategies/engine/config.py`. Cuts worst-case staleness by 5×. Cost is
+~2 extra REST calls/min + N_pending `get_order_by_client_id` calls; trivial
+versus Alpaca's 200/min rate limit.
+
+**Not shipped (deferred)**: the websocket/TradingStream proposal. Introducing
+a new background thread + reconnect lifecycle in `broker.py` is a lot of
+surface area for a problem the 1-min cadence already addresses. Revisit only
+if we observe a real sizing miss in sleeve-allocation logs — grep for
+allocation decisions that re-submitted because `count_active_positions` read
+low, or a `get_deployed_notional` that lagged actual deployment.
+
+**Files touched**: `strategies/engine/config.py` (one line). No changes to
+`broker.py`, `ownership.py`, or `reconciler.py`.
 
 ---
 
