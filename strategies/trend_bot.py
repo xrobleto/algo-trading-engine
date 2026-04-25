@@ -213,7 +213,10 @@ FACTOR_TICKERS = [
 ]  # v8: Removed VLUE (value factor underperforms in momentum regime)
 
 # Defensive ETFs (risk-off allocation)
-DEFENSIVE_TICKERS = ["IEF", "TLT", "GLD", "DBC"]
+# IEF, TLT, GLD, DBC have all been migrated to the CROSSASSET sleeve.
+# TREND no longer holds any defensive ETFs to avoid sleeve-boundary conflicts;
+# it holds SGOV (cash) during risk-off regimes instead.
+DEFENSIVE_TICKERS = []
 CASH_TICKER = "SGOV"
 
 # v8: Leveraged ETFs (high-beta amplifiers for strong trends)
@@ -330,7 +333,7 @@ MAX_CAPITAL_USAGE_PCT = CAPITAL_USAGE_BASE  # DEPRECATED
 # Instead of holding all eligible ETFs, rotate into top N by momentum score
 ENABLE_TOP_N_ROTATION = True          # Enable rotation strategy
 TOP_N_EQUITY = 4                      # v8: More concentrated (was 6) - hold top 4 by momentum score
-TOP_N_DEFENSIVE = 2                   # Hold top N defensive ETFs
+TOP_N_DEFENSIVE = 0                   # 0 — defensive ETFs moved to CROSSASSET sleeve
 
 # =========================
 # ENHANCED MOMENTUM RANKING (CAGR Edge)

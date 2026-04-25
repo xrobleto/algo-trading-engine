@@ -249,15 +249,47 @@ def reconcile(
     # fills that happen between reconciles (e.g. a buy placed at tick N fills
     # seconds later — without this step, the entry stays stuck at pending
     # forever because get_all_open_orders only returns currently-open orders).
+    #
+    # Two-path resolution:
+    #   Primary   — query Alpaca order history by client_order_id
+    #   Fallback  — if the order API returns None but the symbol is in live
+    #               broker positions, infer the fill from the position record.
+    #               This guards against transient order-history API failures
+    #               and handles notional fractional orders whose order record
+    #               may not surface cleanly via the by-client-id endpoint.
+    broker_position_map = {p["symbol"]: p for p in result.broker_positions}
+
     resolved = 0
     for coid, entry in list(existing_ledger.entries.items()):
         if entry.status != "pending":
             continue
         if coid.startswith("RECONCILE_"):
             continue  # synthetic entries have no broker order
+
         order = broker.get_order_by_client_id(coid)
+
         if order is None:
+            # Primary path failed — try position-based fallback for buy orders.
+            # A filled buy will always show up as a broker position; if we can
+            # see it there, the order must have gone through.
+            if entry.side == "buy":
+                pos = broker_position_map.get(entry.symbol)
+                if pos:
+                    fill_price = float(pos.get("avg_entry_price", 0)) or entry.fill_price or 0.0
+                    fill_qty = abs(float(pos.get("qty", entry.qty)))
+                    existing_ledger.update_status(
+                        coid, "filled",
+                        fill_price=fill_price,
+                        fill_qty=fill_qty,
+                    )
+                    log.info(
+                        f"[RECONCILE] {entry.symbol}: inferred fill from broker position "
+                        f"(order API returned None) — qty={fill_qty:.4f}, "
+                        f"avg_price={fill_price:.4f}"
+                    )
+                    resolved += 1
             continue
+
         alpaca_status = order["status"].lower()
         if "filled" in alpaca_status and "partial" not in alpaca_status:
             existing_ledger.update_status(

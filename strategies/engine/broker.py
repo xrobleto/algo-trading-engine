@@ -135,7 +135,8 @@ class BrokerFacade:
         """
         try:
             order = self._client.get_order_by_client_order_id(client_order_id)
-        except Exception:
+        except Exception as e:
+            log.debug(f"[BROKER] get_order_by_client_id({client_order_id!r}): {e}")
             return None
         return {
             "id": str(order.id),

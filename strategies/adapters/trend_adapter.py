@@ -406,10 +406,17 @@ class TrendAdapter(StrategyAdapter):
                     broker_order_id=broker_order_id,
                     notional=notional,
                 )
-                # Store best-effort fill price for accurate exit P&L later
+                # Advance ledger status to filled with best-effort price.
+                # Market orders fill near-instantly; the reconciler will overwrite
+                # fill_price/fill_qty with the actual avg_price if different.
+                # Previously this wrote fill_price directly on the entry object
+                # without advancing status, leaving the entry stuck at "pending".
                 if _order_price and entry_obj:
-                    entry_obj.fill_price = _order_price
-                    entry_obj.fill_qty = qty
+                    self.ledger.update_status(
+                        client_oid, "filled",
+                        fill_price=_order_price,
+                        fill_qty=qty,
+                    )
 
                 # Notify ATD of entry (fire-and-forget)
                 if atd_notify and _order_price:
