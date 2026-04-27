@@ -324,6 +324,29 @@ class CrossAssetAdapter(StrategyAdapter):
                     notional=notional,
                 )
 
+                # Correct notional from actual fill price; the pre-submit
+                # qty*100 fallback fires for new positions (no get_open_position
+                # available) and corrupts sleeve allocation reporting.
+                _order_price = None
+                try:
+                    if result and getattr(result, "filled_avg_price", None):
+                        _order_price = float(result.filled_avg_price)
+                except (AttributeError, TypeError, ValueError):
+                    pass
+                if _order_price is None:
+                    try:
+                        _pos = self._trading.get_open_position(symbol)
+                        _order_price = float(_pos.current_price)
+                    except Exception:
+                        _order_price = None
+                if _order_price and qty > 0:
+                    self.ledger.update_status(
+                        client_oid, "filled",
+                        fill_price=_order_price,
+                        fill_qty=qty,
+                        notional=qty * _order_price,
+                    )
+
             return result
 
         self._trading.submit_order = patched_submit_order

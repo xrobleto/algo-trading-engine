@@ -122,6 +122,7 @@ class OwnershipLedger:
         status: str,
         fill_price: Optional[float] = None,
         fill_qty: Optional[float] = None,
+        notional: Optional[float] = None,
     ) -> Optional[OwnershipEntry]:
         """Update the status of an existing entry."""
         entry = self.entries.get(client_order_id)
@@ -135,6 +136,8 @@ class OwnershipLedger:
             entry.fill_price = fill_price
         if fill_qty is not None:
             entry.fill_qty = fill_qty
+        if notional is not None:
+            entry.notional_at_entry = notional
         if status in ("closed", "cancelled"):
             entry.closed_at = datetime.now(timezone.utc).isoformat()
 

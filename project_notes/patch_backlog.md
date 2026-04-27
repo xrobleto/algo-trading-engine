@@ -130,6 +130,168 @@ by real live behavior, not paper.
 
 ---
 
+## Patch 11 — Ownership ledger `notional_at_entry` fallback corrupts sleeve allocation
+
+**Status**: DRAFTED 2026-04-27 — code patched in working tree, pending pytest +
+Railway deploy + ledger backfill. Time-sensitive: must land before the
+2026-04-29 CROSSASSET rebalance.
+
+**Trigger event** — daily review, 2026-04-27 post-close (Day 6 live)
+
+Engine tick log was reporting wildly wrong sleeve allocations:
+
+```
+[ENGINE] tick=60 | equity=$7,357 | TREND: $414/$4,782 (9%, 2pos)
+                                  | SIMPLE: $0/$1,471 (0%, 0pos)
+                                  | CROSSASSET: $2,009/$883 (228%, 4pos)
+```
+
+Ground truth from Alpaca live positions (TREND owns SMH+SOXX, CROSSASSET owns
+DBA+DBC+TBT+USO):
+
+| Sleeve | Engine reported | Actual market value | Target |
+|---|---|---|---|
+| TREND | $414 (9%) | $1,993 (27.1%) | $4,785 (65%) |
+| CROSSASSET | $2,009 (228%) | $664 (9.0%) | $883 (12%) |
+| SIMPLE | $0 (0%) | $0 (0%) | $1,472 (20%) |
+
+If Wednesday's CROSSASSET rebalance had run on these numbers, it would have
+dumped nearly the entire commodity basket trying to reduce a phantom 228%
+allocation back to 12%. Real allocation is just under-target, not over.
+
+**Symptom** — `engine_ownership_live.json` had a uniform pattern across every
+TREND and CROSSASSET filled entry: `notional_at_entry == fill_qty * 100`,
+not `fill_qty * fill_price`. The SIMPLE entry (AMZU) was correct.
+
+```
+SMH:  fill_qty=2.121, fill_price=$505.83  → notional=$212.10  (should be $1,073)
+SOXX: fill_qty=2.022, fill_price=$459.92  → notional=$202.17  (should be $930)
+DBA:  fill_qty=8.090, fill_price=$27.29   → notional=$809.04  (should be $221)
+DBC:  fill_qty=5.169, fill_price=$29.38   → notional=$516.86  (should be $152)
+TBT:  fill_qty=6.357, fill_price=$34.73   → notional=$635.74  (should be $221)
+USO:  fill_qty=0.478, fill_price=$127.78  → notional=$47.84   (should be $61)
+AMZU: fill_qty=28.0,  fill_price=$41.83   → notional=$1,171.52 (correct)
+```
+
+The engine's `get_deployed_notional(strategy_id)` (`ownership.py:188-190`) sums
+`notional_at_entry` across filled entries and that sum drives the sleeve %
+shown in tick logs. So the bug surfaces as catastrophically wrong allocation
+reporting.
+
+**Root cause** — adapter pre-submit notional estimate has a `qty * 100`
+fallback that fires for new positions:
+
+```python
+# strategies/adapters/trend_adapter.py:328-336 (and identical in cross_asset_adapter.py:284-291)
+notional = 0.0
+try:
+    pos = self._trading.get_open_position(symbol)
+    price = float(pos.current_price)
+    notional = qty * price
+except Exception:
+    notional = qty * 100  # conservative fallback
+```
+
+On a rebalance opening a *fresh* position, `get_open_position()` raises
+because no position exists yet, so the bare `qty * 100` fallback fires. That
+estimate is what gets persisted in `register_order(notional=...)`.
+
+The `100` is a stale placeholder — likely intended as an arbitrary positive
+default for the pre-submit `validate_order()` sleeve-budget check. It works
+acceptably for that ephemeral check (worst-case it underestimates and lets a
+slightly too-large order through), but persisting it in the ledger as
+`notional_at_entry` was unintended.
+
+The SIMPLE adapter avoids the bug because the SIMPLE/scalp pathway passes
+`limit_price` into `submit_order`, so `price` is populated and the fallback
+is skipped. AMZU (entered via that path) was correct.
+
+**Fix shipped to working tree (not yet deployed)**
+
+1. `strategies/engine/ownership.py` — `update_status()` now accepts a
+   `notional` kwarg and writes through to `entry.notional_at_entry`. Pure
+   additive change; existing callers unaffected.
+2. `strategies/adapters/trend_adapter.py` — the existing post-fill
+   `update_status` call (line 414) now passes
+   `notional=qty * _order_price`. `_order_price` is sourced from
+   `result.filled_avg_price` (preferred) or `get_open_position().current_price`
+   (fallback) — both reflect the actual fill, not the pre-submit estimate.
+3. `strategies/adapters/cross_asset_adapter.py` — added a post-submit price
+   lookup mirroring trend's pattern, then a `update_status(..., notional=...)`
+   call to overwrite the placeholder. CROSSASSET previously relied on the
+   reconciler to advance pending → filled; with this patch it advances
+   immediately like TREND. Reconciler will run as a no-op confirm.
+4. `strategies/engine/backfill_ledger_notional.py` (new) — one-shot script
+   that walks `engine_ownership_live.json`, recomputes
+   `notional_at_entry = fill_qty * fill_price` for filled entries, and writes
+   back with a timestamped `.bak`. Supports `--dry-run`, `--path`,
+   `--tolerance`. Required because the patched code only fixes new orders;
+   the six currently-open entries need a one-time correction.
+
+**Pre-submit estimate left as-is.** The `qty * 100` is still used to feed
+`validate_order()` for sleeve-budget gating. In theory this could let a
+too-large order through (estimate $200 vs real $1,000) — but in practice
+TREND's 65% sleeve has plenty of headroom, and Alpaca's buying-power check
+gates the order at the broker level. If we ever see a sleeve-overrun
+incident, revisit by replacing the fallback with a Polygon snapshot or
+Alpaca latest-trade call.
+
+**Backfill validation** — dry-run against the live ledger produces the
+expected sleeve totals:
+
+```
+TREND:      old=$414.27   -> new=$2,002.71   (matches market value $1,993)
+CROSSASSET: old=$2,009.48 -> new=$654.49     (matches market value $664)
+```
+
+Small residual gap is just price drift since fill — `notional_at_entry` is
+cost basis, which is the correct semantic for sleeve sizing.
+
+**Test plan**
+
+- Unit: extend `test_trend_adapter_patch7.py` (or add a new file) with a
+  test that submits a fresh BUY for a symbol with no prior position, asserts
+  the resulting ledger entry's `notional_at_entry` equals `fill_qty * fill_price`,
+  not `fill_qty * 100`.
+- Mirror the same test in a `test_cross_asset_adapter` file (does not yet
+  exist — first test for that adapter).
+- Regression: `test_ownership_update_status` should add a case asserting
+  the new `notional` kwarg overwrites `notional_at_entry` and is opt-in
+  (None → no change).
+- Smoke test post-deploy: tail one engine tick after the next TREND or
+  CROSSASSET rebalance, confirm reported sleeve % matches Alpaca market
+  value within ~5pp drift.
+
+**Deploy sequence (user-driven)**
+
+1. `pytest strategies/adapters/` locally to confirm nothing broke.
+2. Commit + push to trigger Railway deploy.
+3. `railway ssh "python3 /app/strategies/engine/backfill_ledger_notional.py --dry-run"`
+   to preview, then re-run without `--dry-run`.
+4. Restart engine (or wait for hot-reload if wired).
+5. Verify next `[ENGINE] tick=...` line shows TREND ~27% and CROSSASSET ~9%.
+
+**Blast radius** — sleeve allocation reporting + sleeve drift sizing for
+TREND and CROSSASSET. SIMPLE unaffected (entered via correct codepath).
+Worst-case if patch is wrong: rebalance behavior identical to current state
+(broken). The backfill script is reversible via the `.bak` file it writes.
+
+**Files touched**
+- `strategies/engine/ownership.py` (added `notional` kwarg to `update_status`)
+- `strategies/adapters/trend_adapter.py` (added kwarg to existing call)
+- `strategies/adapters/cross_asset_adapter.py` (added post-submit price lookup
+  + `update_status` call)
+- `strategies/engine/backfill_ledger_notional.py` (new)
+
+**Follow-up** — separately investigate why SIMPLE has produced zero entries
+in 6 trading days despite scanner consistently surfacing 5+ qualifying
+tickers (scores 53–63, RVOL 1.5–6×). May be unrelated, but the broken
+deployed-notional reporting could plausibly have made SIMPLE's gating logic
+read state incorrectly. Re-evaluate once Patch 11 is live and the ledger
+shows correct numbers.
+
+---
+
 ## Watch items (not yet a patch)
 
 - **Tradestie Reddit source 404** (since 2026-04-18 intermittent). If persistent

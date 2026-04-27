@@ -416,6 +416,7 @@ class TrendAdapter(StrategyAdapter):
                         client_oid, "filled",
                         fill_price=_order_price,
                         fill_qty=qty,
+                        notional=qty * _order_price,
                     )
 
                 # Notify ATD of entry (fire-and-forget)
