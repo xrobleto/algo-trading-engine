@@ -7250,31 +7250,86 @@ class MomentumBot:
                     logger.info(f"[EOD-GRADUAL] {symbol}: Reducing {reduce_qty}/{current_qty} shares "
                                f"(reduction #{reduction_num})")
 
-                    # Submit market sell order for partial reduction
-                    order = alpaca.submit_order(
-                        symbol=symbol,
-                        qty=reduce_qty,
-                        side="sell",
-                        order_type="market",
-                        time_in_force="gtc"
-                    )
+                    # Patch 14: Cancel any open protective orders (stop, bracket children)
+                    # before submitting the reduction sell. Without this, Alpaca returns
+                    # 403 Forbidden because the protective stop has reserved every share
+                    # (qty_available=0 at the broker). Cancellation is idempotent — the
+                    # call is a no-op once the symbol has no open orders, so the cost on
+                    # later reductions in the same EOD window is just one GET. The
+                    # protective stop is only needed during normal trading; in the final
+                    # ~15 minutes we are actively flattening, and Mode 2 full-flatten
+                    # at 15:55 ET cancels orders too, so we don't re-place a stop here.
+                    try:
+                        cancelled = alpaca.cancel_orders_for_symbol(symbol)
+                        if cancelled > 0:
+                            logger.info(f"[EOD-GRADUAL] {symbol}: Cancelled {cancelled} "
+                                       f"protective order(s) to free qty for reduction")
+                            time.sleep(0.5)  # let cancellations settle at broker
+                    except Exception as ce:
+                        logger.warning(f"[EOD-GRADUAL] {symbol}: Pre-cancel step failed: "
+                                      f"{ce} (continuing; submit may 403)")
 
-                    if order:
-                        logger.info(f"[EOD-GRADUAL] {symbol}: Reduction order submitted | "
-                                   f"order_id={order.get('id', 'N/A')}")
+                    # Submit market sell order for partial reduction, with one retry
+                    # on a 403/insufficient-qty failure (re-cancel and try once more).
+                    order = None
+                    submit_err = None
+                    for attempt in (1, 2):
+                        try:
+                            order = alpaca.submit_order(
+                                symbol=symbol,
+                                qty=reduce_qty,
+                                side="sell",
+                                order_type="market",
+                                time_in_force="gtc"
+                            )
+                            break
+                        except Exception as se:
+                            submit_err = se
+                            err_str = str(se).lower()
+                            is_qty_block = (
+                                "403" in err_str
+                                or "forbidden" in err_str
+                                or "insufficient qty" in err_str
+                                or "qty_available" in err_str
+                            )
+                            if attempt == 1 and is_qty_block:
+                                logger.warning(f"[EOD-GRADUAL] {symbol}: Submit failed "
+                                              f"(qty-blocked): {se}; cancelling open "
+                                              f"orders and retrying once")
+                                try:
+                                    alpaca.cancel_orders_for_symbol(symbol)
+                                    time.sleep(0.5)
+                                except Exception:
+                                    pass
+                                continue
+                            # Non-recoverable, or retry already failed
+                            break
 
-                        # Update position manager if it knows about this symbol
-                        remaining_qty = current_qty - reduce_qty
-                        pm_pos = position_manager.get_position(symbol)
-                        if remaining_qty <= 0:
-                            if pm_pos:
-                                position_manager.remove_position(symbol)
-                            self.pending_symbols.discard(symbol)
-                            if trade_manager.get_intent(symbol):
-                                trade_manager.transition_state(symbol, TradeState.CLOSED)
-                            logger.info(f"[EOD-GRADUAL] {symbol}: Position fully closed")
-                        elif pm_pos:
-                            pm_pos.qty = remaining_qty
+                    if order is None:
+                        # Reduction did not take; roll back the counter so we keep the
+                        # cadence (next 5-min tick will retry from the same step). The
+                        # 15:55 Mode 2 full-flatten will pick up the residue if needed.
+                        self.eod_reductions[symbol] = max(0, self.eod_reductions[symbol] - 1)
+                        logger.error(f"[EOD-GRADUAL] {symbol}: Reduction failed after "
+                                    f"retry: {submit_err}. Will retry next cycle; "
+                                    f"Mode 2 flatten at 15:55 ET will catch residue.")
+                        continue
+
+                    logger.info(f"[EOD-GRADUAL] {symbol}: Reduction order submitted | "
+                               f"order_id={order.get('id', 'N/A')}")
+
+                    # Update position manager if it knows about this symbol
+                    remaining_qty = current_qty - reduce_qty
+                    pm_pos = position_manager.get_position(symbol)
+                    if remaining_qty <= 0:
+                        if pm_pos:
+                            position_manager.remove_position(symbol)
+                        self.pending_symbols.discard(symbol)
+                        if trade_manager.get_intent(symbol):
+                            trade_manager.transition_state(symbol, TradeState.CLOSED)
+                        logger.info(f"[EOD-GRADUAL] {symbol}: Position fully closed")
+                    elif pm_pos:
+                        pm_pos.qty = remaining_qty
 
                 except Exception as e:
                     logger.error(f"[EOD-GRADUAL] {symbol}: Error during reduction: {e}")
