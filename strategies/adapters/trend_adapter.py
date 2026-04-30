@@ -45,7 +45,11 @@ class TrendAdapter(StrategyAdapter):
     - Monkey-patch get_positions() → filter to TREND-owned symbols via ledger
     - Monkey-patch check_drift_mini_rebalance_needed() → filter target weights
       to exclude symbols owned by OTHER sleeves (prevents phantom drift from
-      stale cross-sleeve targets).
+      stale cross-sleeve targets) [Patch 7].
+    - Monkey-patch rank_by_momentum() → filter input universe to exclude
+      symbols owned by OTHER sleeves at rebalance time, so weight allocation
+      only considers tradable tickers and isn't silently truncated by the
+      sleeve guard [Patch 15].
     - Rate-limit tick() to ~60s (trend bot's natural cadence)
     """
 
@@ -77,6 +81,7 @@ class TrendAdapter(StrategyAdapter):
         self._original_get_account = None
         self._original_get_positions = None
         self._original_check_drift_mini = None
+        self._original_rank_by_momentum = None
 
     # =========================================================================
     # LIFECYCLE
@@ -633,9 +638,47 @@ class TrendAdapter(StrategyAdapter):
 
         tb.check_drift_mini_rebalance_needed = patched_check_drift_mini
 
+        # --- Patch 15: Sleeve-scoped rank_by_momentum input filter ---
+        # Patch 7 is the drift-time counterpart; this is the rebalance-time one.
+        # When TREND ranks tickers at rebalance, it considers ALL_EQUITY +
+        # DEFENSIVE_TICKERS. If any of those symbols are currently owned by
+        # another sleeve (e.g., DBC by CROSSASSET), TREND will still rank them,
+        # assign them a target weight, and submit a buy — only to be rejected
+        # by the sleeve guard in submit_order. The blocked weight is NOT
+        # redistributed, so TREND ends up under-deployed.
+        # Concrete repro: 2026-04-24 weekly rebalance assigned DBC=30.33%, the
+        # buy was correctly blocked, and TREND deployed only $414 of a $4,786
+        # sleeve target (8.7%). Patch 10 emptied DEFENSIVE_TICKERS to fix this
+        # statically, but that's brittle — any future overlap (or symbol that
+        # enters cross-sleeve ownership between rebalances) reproduces the
+        # bug. This patch filters the input symbol list dynamically so weight
+        # allocation only considers tradable tickers and naturally normalizes
+        # over the trimmed universe.
+        self._original_rank_by_momentum = tb.rank_by_momentum
+
+        def patched_rank_by_momentum(bars, symbols, trading_client, top_n=0, spy_close=None):
+            if symbols:
+                filtered = [
+                    s for s in symbols
+                    if not self.ledger.is_symbol_owned_by_other(s, "TREND")
+                ]
+                if len(filtered) != len(symbols):
+                    removed = sorted(set(symbols) - set(filtered))
+                    log.info(
+                        f"[TREND] Patch 15: filtered {len(removed)} cross-sleeve-owned "
+                        f"ticker(s) from rank universe: {removed}"
+                    )
+                symbols = filtered
+            return self._original_rank_by_momentum(
+                bars, symbols, trading_client, top_n=top_n, spy_close=spy_close
+            )
+
+        tb.rank_by_momentum = patched_rank_by_momentum
+
         log.info(
             "[TREND] Monkey-patches applied (submit_order, order_id, equity, "
-            "kill_switch, get_account, get_positions, check_drift_mini)"
+            "kill_switch, get_account, get_positions, check_drift_mini, "
+            "rank_by_momentum)"
         )
 
     def _remove_patches(self) -> None:
@@ -658,5 +701,7 @@ class TrendAdapter(StrategyAdapter):
             tb.get_positions = self._original_get_positions
         if self._original_check_drift_mini:
             tb.check_drift_mini_rebalance_needed = self._original_check_drift_mini
+        if self._original_rank_by_momentum:
+            tb.rank_by_momentum = self._original_rank_by_momentum
 
         log.info("[TREND] Monkey-patches removed")
