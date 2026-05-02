@@ -138,6 +138,14 @@ class OwnershipLedger:
             entry.fill_qty = fill_qty
         if notional is not None:
             entry.notional_at_entry = notional
+        elif entry.fill_price and entry.fill_qty:
+            # Self-heal: when fill_price + fill_qty are both known and caller
+            # didn't pass an explicit notional, recompute. Prevents the qty*100
+            # placeholder from outliving the real fill once the reconciler
+            # learns the true avg_price (Patch 11 only fixed the adapter path).
+            recomputed = entry.fill_price * entry.fill_qty
+            if abs(entry.notional_at_entry - recomputed) > 0.01:
+                entry.notional_at_entry = recomputed
         if status in ("closed", "cancelled"):
             entry.closed_at = datetime.now(timezone.utc).isoformat()
 

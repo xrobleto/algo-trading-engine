@@ -365,7 +365,7 @@ class TrendAdapter(StrategyAdapter):
                     _pos = self._trading.get_open_position(symbol)
                     _order_price = float(_pos.current_price)
                 except Exception:
-                    _order_price = notional / qty if qty > 0 else 0.0
+                    _order_price = None
 
             # Update ownership ledger
             broker_order_id = str(result.id) if result and hasattr(result, 'id') else None

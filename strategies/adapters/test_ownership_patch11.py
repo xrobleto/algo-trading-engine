@@ -68,29 +68,63 @@ def test_update_status_writes_notional() -> None:
     print("PASS: test_update_status_writes_notional")
 
 
-def test_update_status_notional_omitted_preserves_value() -> None:
-    """Calling update_status without notional kwarg keeps the existing value.
-    Critical for backwards compatibility with mark_closed and pre-Patch-11 callers."""
+def test_update_status_notional_omitted_recomputes_from_fill() -> None:
+    """Patch 16: when caller omits notional but fill_price + fill_qty are both
+    known, notional_at_entry is recomputed as fill_price * fill_qty. Tightens
+    the original Patch 11 contract because the reconciler updates fill_price
+    without re-supplying notional, and the stale qty*100 placeholder must not
+    survive that update."""
     ledger = OwnershipLedger()
     ledger.register_order(
         strategy_id="X", symbol="Y", side="buy", qty=1.0,
         client_order_id="C", notional=999.0,
     )
     ledger.update_status("C", "filled", fill_price=10.0, fill_qty=1.0)
-    assert ledger.entries["C"].notional_at_entry == 999.0
-    print("PASS: test_update_status_notional_omitted_preserves_value")
+    # 10.0 * 1.0 = 10.0, replacing the stale 999.0 placeholder
+    assert ledger.entries["C"].notional_at_entry == 10.0
+    print("PASS: test_update_status_notional_omitted_recomputes_from_fill")
 
 
-def test_update_status_notional_none_is_noop() -> None:
-    """Explicitly passing notional=None must not overwrite."""
+def test_update_status_notional_none_recomputes_from_fill() -> None:
+    """Patch 16: explicit notional=None has the same self-heal semantics as
+    omission — the reconciler call sites pass through optional kwargs, so
+    None must not be a sentinel that disables the recompute."""
     ledger = OwnershipLedger()
     ledger.register_order(
         strategy_id="X", symbol="Y", side="buy", qty=1.0,
         client_order_id="C", notional=777.0,
     )
     ledger.update_status("C", "filled", fill_price=10.0, fill_qty=1.0, notional=None)
-    assert ledger.entries["C"].notional_at_entry == 777.0
-    print("PASS: test_update_status_notional_none_is_noop")
+    assert ledger.entries["C"].notional_at_entry == 10.0
+    print("PASS: test_update_status_notional_none_recomputes_from_fill")
+
+
+def test_update_status_explicit_notional_wins() -> None:
+    """An explicit notional= argument always overrides the auto-recompute."""
+    ledger = OwnershipLedger()
+    ledger.register_order(
+        strategy_id="X", symbol="Y", side="buy", qty=1.0,
+        client_order_id="C", notional=0.0,
+    )
+    # fill_price * fill_qty would be 50, but caller insists on 42
+    ledger.update_status("C", "filled", fill_price=10.0, fill_qty=5.0, notional=42.0)
+    assert ledger.entries["C"].notional_at_entry == 42.0
+    print("PASS: test_update_status_explicit_notional_wins")
+
+
+def test_update_status_recompute_skipped_when_fill_data_absent() -> None:
+    """Self-heal must NOT fire when fill_price or fill_qty is unknown — that
+    would zero out the registration-time estimate before the broker confirms.
+    Critical for mark_closed (no fill data passed) and pending->cancelled."""
+    ledger = OwnershipLedger()
+    ledger.register_order(
+        strategy_id="X", symbol="Y", side="buy", qty=1.0,
+        client_order_id="C", notional=500.0,
+    )
+    # Status-only update, no fill data: must preserve registration notional
+    ledger.update_status("C", "cancelled")
+    assert ledger.entries["C"].notional_at_entry == 500.0
+    print("PASS: test_update_status_recompute_skipped_when_fill_data_absent")
 
 
 def test_mark_closed_does_not_touch_notional() -> None:
