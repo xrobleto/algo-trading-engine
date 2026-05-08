@@ -418,7 +418,10 @@ LEVERAGE_VOL_LOOKBACK = 20            # 20-day realized vol for targeting
 # Note: is_rebalance_window_dynamic() requires clock.is_open=True.
 REBALANCE_WEEKDAY = 4                 # 0=Mon ... 4=Fri
 REBALANCE_TIME_ET = (11, 0)           # 11:00 AM ET (stable spreads, good liquidity)
-REBALANCE_DEADLINE_ET = (11, 15)      # do not start new rebalance after 11:15 AM ET
+REBALANCE_DEADLINE_ET = (15, 0)       # do not start new rebalance after 3:00 PM ET
+# Wide window (was 11:15) so one slow engine-loop iteration cannot make the
+# adapter miss the entire rebalance opportunity. The already_done_today gate
+# still ensures the rebalance runs only once per Friday.
 
 # =========================
 # TURNOVER GOVERNOR + RANK STABILITY
@@ -926,6 +929,7 @@ class BotState:
     rebalance_started_at_iso: Optional[str] = None  # Timestamp when rebalance started (for stale detection)
     last_daily_monitoring_timestamp: Optional[float] = None  # Unix timestamp of last daily monitoring run
     last_drift_mini_iso: Optional[str] = None  # ISO timestamp of last drift mini-rebalance attempt
+    last_missed_rebalance_alert_date_iso: Optional[str] = None  # Date we last alerted on missed Fri rebalance (one per Friday)
 
     # CANONICAL REGIME STATE (with hysteresis)
     # "risk_on" or "risk_off" - persists until opposite trigger is hit

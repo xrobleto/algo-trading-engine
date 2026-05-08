@@ -269,6 +269,33 @@ class TrendAdapter(StrategyAdapter):
                     f"cooldown_until={cooldown}"
                 )
 
+            # ---- Missed-rebalance alert ----
+            # Fires once per Friday if we're past the rebalance deadline and
+            # no rebalance was recorded for today. Catches silent failures
+            # like the engine loop being blocked through the entire window.
+            today_iso = dt.date().isoformat()
+            if (dt.weekday() == tb.REBALANCE_WEEKDAY
+                    and not already_done_today
+                    and (dt.hour, dt.minute) > tb.REBALANCE_DEADLINE_ET
+                    and self._state.last_missed_rebalance_alert_date_iso != today_iso):
+                deadline_h, deadline_m = tb.REBALANCE_DEADLINE_ET
+                tb.alerter.send_alert(
+                    level="CRITICAL",
+                    title="TREND missed weekly rebalance",
+                    message=(
+                        f"No rebalance recorded today and the window has closed. "
+                        f"Last rebalance: {self._state.last_rebalance_date_iso}."
+                    ),
+                    context={
+                        "today": today_iso,
+                        "last_rebalance": self._state.last_rebalance_date_iso,
+                        "deadline_et": f"{deadline_h:02d}:{deadline_m:02d}",
+                        "rebalance_in_progress": self._state.rebalance_in_progress,
+                    }
+                )
+                self._state.last_missed_rebalance_alert_date_iso = today_iso
+                tb.save_state(tb.STATE_PATH, self._state)
+
             self.record_success()
             return TickResult.OK
 
