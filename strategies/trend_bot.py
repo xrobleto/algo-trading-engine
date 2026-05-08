@@ -791,7 +791,21 @@ class Alerter:
 
     def _send_email(self, level: str, title: str, message: str):
         """Send email alert via SMTP."""
+        # Force IPv4 resolution for SMTP_SERVER. Railway containers lack
+        # IPv6 egress but smtp.gmail.com resolves to IPv6 first via DNS,
+        # so without this patch every send_message() fails with
+        # [Errno 101] Network is unreachable on the IPv6 connect attempt.
+        import socket as _socket
+        _real_getaddrinfo = _socket.getaddrinfo
+
+        def _ipv4_getaddrinfo(host, port, family=0, *args, **kwargs):
+            if host == SMTP_SERVER and family in (0, _socket.AF_UNSPEC):
+                family = _socket.AF_INET
+            return _real_getaddrinfo(host, port, family, *args, **kwargs)
+
         try:
+            _socket.getaddrinfo = _ipv4_getaddrinfo
+
             msg = MIMEMultipart()
             msg['From'] = ALERT_EMAIL_FROM
             msg['To'] = ALERT_EMAIL_TO
@@ -806,6 +820,8 @@ class Alerter:
             log.debug(f"[ALERTER] Email alert sent: {title}")
         except Exception as e:
             log.error(f"[ALERTER] Failed to send email alert: {e}")
+        finally:
+            _socket.getaddrinfo = _real_getaddrinfo
 
 
 class CircuitBreaker:
