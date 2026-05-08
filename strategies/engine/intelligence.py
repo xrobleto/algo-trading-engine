@@ -136,6 +136,15 @@ REGIME_THRESHOLDS = {
     # CRISIS: score < 35
 }
 
+# Patch 17 (2026-05-07): hysteresis band around regime thresholds. To change
+# regime, score must cross the relevant threshold by this many points; once in
+# a regime, the score may bounce within ±band of the boundary without
+# transitioning. Without this, a score sitting near a boundary (today: 46.5↔51.5
+# around the 50.0 CAUTIOUS↔RISK_OFF line) flipped the regime three times in 90
+# minutes, producing three TREND drift_mini events with sell-buy-sell wash on
+# XBI/XLE (~$2,625 turnover, $0 directional benefit).
+REGIME_HYSTERESIS_BAND = 3.0
+
 # Global risk multiplier by regime
 REGIME_RISK_MULTIPLIERS = {
     MarketRegime.RISK_ON: 1.2,
@@ -320,8 +329,9 @@ class MarketIntelligenceLayer:
         # Fuse into composite score
         composite = self._fuse_scores(scores)
 
-        # Map to regime
-        regime = self._score_to_regime(composite)
+        # Map to regime (Patch 17: hysteresis-aware — pass previous regime
+        # so transitions require crossing thresholds by REGIME_HYSTERESIS_BAND)
+        regime = self._score_to_regime(composite, previous=self._previous_regime)
         regime_changed = (self._previous_regime is not None
                           and regime != self._previous_regime)
         self._previous_regime = regime
@@ -388,15 +398,71 @@ class MarketIntelligenceLayer:
         return weighted_sum / total_weight
 
     @staticmethod
-    def _score_to_regime(score: float) -> MarketRegime:
-        if score >= REGIME_THRESHOLDS[MarketRegime.RISK_ON]:
-            return MarketRegime.RISK_ON
-        elif score >= REGIME_THRESHOLDS[MarketRegime.CAUTIOUS]:
-            return MarketRegime.CAUTIOUS
-        elif score >= REGIME_THRESHOLDS[MarketRegime.RISK_OFF]:
-            return MarketRegime.RISK_OFF
+    def _score_to_regime(
+        score: float,
+        previous: Optional[MarketRegime] = None,
+    ) -> MarketRegime:
+        """
+        Map composite score to regime, with hysteresis when a previous regime
+        is supplied. Patch 17: transitions require crossing the relevant
+        threshold by REGIME_HYSTERESIS_BAND points; the score may bounce
+        within ±band of a boundary without changing regime. Direction-aware
+        so a falling score uses the lower side of the boundary and a rising
+        score uses the upper side.
+        """
+        risk_on_t = REGIME_THRESHOLDS[MarketRegime.RISK_ON]
+        cautious_t = REGIME_THRESHOLDS[MarketRegime.CAUTIOUS]
+        risk_off_t = REGIME_THRESHOLDS[MarketRegime.RISK_OFF]
+
+        # Raw mapping (no hysteresis): score → regime
+        if score >= risk_on_t:
+            raw = MarketRegime.RISK_ON
+        elif score >= cautious_t:
+            raw = MarketRegime.CAUTIOUS
+        elif score >= risk_off_t:
+            raw = MarketRegime.RISK_OFF
         else:
-            return MarketRegime.CRISIS
+            raw = MarketRegime.CRISIS
+
+        # No previous regime (first refresh after restart) → use raw.
+        # Same-regime → no transition needed.
+        if previous is None or raw == previous:
+            return raw
+
+        # Transition required: enforce hysteresis on the boundary being crossed.
+        band = REGIME_HYSTERESIS_BAND
+
+        if previous == MarketRegime.RISK_ON:
+            # Falling: require score < risk_on_t - band
+            if score >= risk_on_t - band:
+                return previous
+
+        elif previous == MarketRegime.CAUTIOUS:
+            if raw == MarketRegime.RISK_ON:
+                # Rising: require score >= risk_on_t + band
+                if score < risk_on_t + band:
+                    return previous
+            else:
+                # Falling to RISK_OFF/CRISIS: require score < cautious_t - band
+                if score >= cautious_t - band:
+                    return previous
+
+        elif previous == MarketRegime.RISK_OFF:
+            if raw == MarketRegime.CRISIS:
+                # Falling: require score < risk_off_t - band
+                if score >= risk_off_t - band:
+                    return previous
+            else:
+                # Rising to CAUTIOUS/RISK_ON: require score >= cautious_t + band
+                if score < cautious_t + band:
+                    return previous
+
+        elif previous == MarketRegime.CRISIS:
+            # Rising out of CRISIS: require score >= risk_off_t + band
+            if score < risk_off_t + band:
+                return previous
+
+        return raw
 
     # -------------------------------------------------------------------------
     # SLEEVE ADJUSTMENTS
