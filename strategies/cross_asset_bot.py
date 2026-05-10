@@ -156,7 +156,9 @@ MAX_GROSS_EXPOSURE = 1.00         # no leverage — max 100% of sleeve
 
 REBALANCE_WEEKDAY = 2             # Wednesday (0=Mon, 2=Wed, 4=Fri)
 REBALANCE_TIME_ET = (10, 30)      # 10:30 AM ET (30 min post-open for clean fills)
-REBALANCE_DEADLINE_ET = (11, 0)   # 11:00 AM ET (30 min execution window)
+REBALANCE_DEADLINE_ET = (15, 0)   # 3:00 PM ET — wide window so one slow
+# engine-loop iteration can't make the adapter miss the entire weekly
+# rebalance opportunity. already_done_today still gates to once per Wed.
 
 
 # =============================================================================
@@ -313,6 +315,7 @@ class CrossAssetState:
     rebalance_in_progress: bool = False
     rebalance_started_at_iso: Optional[str] = None
     last_target_weights: Optional[Dict[str, float]] = None
+    last_missed_rebalance_alert_date_iso: Optional[str] = None  # Date we last alerted on missed Wed rebalance (one per Wed)
 
     # Signal state (persisted for drift checks between rebalances)
     last_signals: Optional[Dict[str, str]] = None      # symbol -> "LONG"|"SHORT"|"FLAT"

@@ -184,6 +184,38 @@ class CrossAssetAdapter(StrategyAdapter):
             elif xab.is_market_open(self._trading) and not self._state.rebalance_in_progress:
                 self._check_drift(xab)
 
+            # ---- Missed-rebalance alert ----
+            # Fires once per Wednesday if we're past the rebalance deadline
+            # and no rebalance was recorded for today. Catches silent failures
+            # like the engine loop being blocked through the entire window.
+            now_dt = xab.now_et()
+            today_iso = now_dt.date().isoformat()
+            if (now_dt.weekday() == xab.REBALANCE_WEEKDAY
+                    and not already_done
+                    and (now_dt.hour, now_dt.minute) > xab.REBALANCE_DEADLINE_ET
+                    and self._state.last_missed_rebalance_alert_date_iso != today_iso):
+                try:
+                    import trend_bot as tb  # alerter lives on trend_bot
+                    deadline_h, deadline_m = xab.REBALANCE_DEADLINE_ET
+                    tb.alerter.send_alert(
+                        level="CRITICAL",
+                        title="CROSSASSET missed weekly rebalance",
+                        message=(
+                            f"No rebalance recorded today and the window has closed. "
+                            f"Last rebalance: {self._state.last_rebalance_date_iso}."
+                        ),
+                        context={
+                            "today": today_iso,
+                            "last_rebalance": self._state.last_rebalance_date_iso,
+                            "deadline_et": f"{deadline_h:02d}:{deadline_m:02d}",
+                            "rebalance_in_progress": self._state.rebalance_in_progress,
+                        }
+                    )
+                    self._state.last_missed_rebalance_alert_date_iso = today_iso
+                    xab.save_state(xab.STATE_PATH, self._state)
+                except Exception as e:
+                    log.error(f"[XASSET] Missed-rebalance alert failed: {e}")
+
             self.record_success()
             return TickResult.OK
 

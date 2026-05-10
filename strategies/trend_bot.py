@@ -456,7 +456,11 @@ WEIGHT_CHANGE_MIN_THRESHOLD = 0.02    # Ignore weight changes < 2%
 # Key: Only trades positions that drifted significantly, not full rebalance.
 
 ENABLE_DRIFT_MINI_REBALANCE = True    # Enable drift-triggered mini-rebalance
-DRIFT_TRIGGER_THRESHOLD = 0.08        # Trigger mini-rebalance if any position drifts > 8%
+DRIFT_TRIGGER_THRESHOLD = 0.12        # Trigger mini-rebalance if any position drifts > 12%
+# Was 0.08 — too tight on small live portfolios; XLE alone fired 4 drift
+# minis in one day (8.1%, 9.2%, 9.6%, 11.7%) costing spread + commission
+# without changing target weights. 12% absorbs normal daily noise while
+# still catching genuinely outsized moves.
 DRIFT_MIN_DAYS_SINCE_REBAL = 2        # Wait at least 2 days after last rebalance
 DRIFT_MAX_TURNOVER = 0.10             # Cap mini-rebalance at 10% turnover
 DRIFT_CHECK_INTERVAL_MIN = 60         # Check for drift every 60 minutes during market hours
@@ -611,6 +615,16 @@ SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
 SMTP_USERNAME = os.getenv("SMTP_USERNAME", "").strip()
 SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "").strip()
 
+# Resend HTTPS transport (works on hosts that block port 587, e.g. Railway).
+# Set ENABLE_RESEND_ALERTS=1 + RESEND_API_KEY. RESEND_FROM defaults to
+# Resend's no-domain-verification sender; override to a verified-domain
+# sender if you have one configured on Resend. RESEND_TO defaults to
+# ALERT_EMAIL_TO so the same recipient is used across transports.
+ENABLE_RESEND_ALERTS = os.getenv("ENABLE_RESEND_ALERTS", "0") == "1"
+RESEND_API_KEY = os.getenv("RESEND_API_KEY", "").strip()
+RESEND_FROM = os.getenv("RESEND_FROM", "onboarding@resend.dev").strip()
+RESEND_TO = os.getenv("RESEND_TO", "").strip() or ALERT_EMAIL_TO
+
 # Circuit Breaker
 MAX_API_FAILURES_PER_MIN = 5
 API_FAILURE_WINDOW_SEC = 60
@@ -736,13 +750,16 @@ class Alerter:
     def __init__(self):
         self.slack_enabled = ENABLE_SLACK_ALERTS and SLACK_WEBHOOK_URL
         self.email_enabled = ENABLE_EMAIL_ALERTS and ALERT_EMAIL_TO
+        self.resend_enabled = ENABLE_RESEND_ALERTS and RESEND_API_KEY and RESEND_TO
 
         if self.slack_enabled:
             log.info(f"[ALERTER] Slack alerts ENABLED")
         if self.email_enabled:
             log.info(f"[ALERTER] Email alerts ENABLED | to={ALERT_EMAIL_TO}")
+        if self.resend_enabled:
+            log.info(f"[ALERTER] Resend alerts ENABLED | from={RESEND_FROM} to={RESEND_TO}")
 
-        if not (self.slack_enabled or self.email_enabled):
+        if not (self.slack_enabled or self.email_enabled or self.resend_enabled):
             log.warning("[ALERTER] NO ALERTS CONFIGURED - unattended operation not recommended")
 
     def send_alert(self, level: str, title: str, message: str, context: dict = None):
@@ -759,6 +776,8 @@ class Alerter:
             self._send_slack(level, title, full_message)
         if self.email_enabled:
             self._send_email(level, title, full_message)
+        if self.resend_enabled:
+            self._send_resend(level, title, full_message)
 
         # Always log locally
         if level == "CRITICAL":
@@ -822,6 +841,44 @@ class Alerter:
             log.error(f"[ALERTER] Failed to send email alert: {e}")
         finally:
             _socket.getaddrinfo = _real_getaddrinfo
+
+    def _send_resend(self, level: str, title: str, message: str):
+        """Send email alert via Resend HTTPS API (port 443, works behind hosts that block SMTP)."""
+        import json as _json
+        import urllib.request
+        import urllib.error
+
+        try:
+            payload = _json.dumps({
+                "from": RESEND_FROM,
+                "to": [RESEND_TO],
+                "subject": f"[{level}] Trend Bot: {title}",
+                "text": message,
+            }).encode("utf-8")
+
+            req = urllib.request.Request(
+                "https://api.resend.com/emails",
+                data=payload,
+                method="POST",
+                headers={
+                    "Authorization": f"Bearer {RESEND_API_KEY}",
+                    "Content-Type": "application/json",
+                },
+            )
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                body = resp.read().decode("utf-8", errors="replace")
+                if 200 <= resp.status < 300:
+                    log.debug(f"[ALERTER] Resend alert sent: {title}")
+                else:
+                    log.error(f"[ALERTER] Resend non-2xx ({resp.status}): {body[:200]}")
+        except urllib.error.HTTPError as e:
+            try:
+                err_body = e.read().decode("utf-8", errors="replace")
+            except Exception:
+                err_body = ""
+            log.error(f"[ALERTER] Failed to send Resend alert: HTTP {e.code} {err_body[:200]}")
+        except Exception as e:
+            log.error(f"[ALERTER] Failed to send Resend alert: {e}")
 
 
 class CircuitBreaker:
@@ -1352,6 +1409,21 @@ def log_equity_snapshot(
     cash = equity - positions_value
     num_positions = sum(1 for k in positions if k != CASH_TICKER)
     drawdown_pct = ((equity_peak - equity) / equity_peak * 100) if equity_peak > 0 else 0.0
+
+    # Sanity guard: in the unified engine, sleeve equity is computed from
+    # the ownership ledger, and during reconcile transitions positions can
+    # be momentarily orphaned — leading to positions_value > equity (deeply
+    # negative cash). Recording these snapshots produces phantom drawdowns
+    # like the 2026-05-07 -24% data point that wasn't real. If cash is
+    # implausibly negative, skip the row instead of corrupting the curve.
+    if equity_peak and equity_peak > 0 and cash < -0.10 * equity_peak:
+        log.warning(
+            f"[EQUITY_SNAPSHOT] Skipping {date_str}: cash=${cash:,.2f} "
+            f"vs equity_peak=${equity_peak:,.2f} suggests ownership-ledger "
+            f"transition (positions_value=${positions_value:,.2f}, equity=${equity:,.2f}). "
+            f"Snapshot will retry on next daily monitoring run."
+        )
+        return
 
     # Compact position weights
     weights = {}
