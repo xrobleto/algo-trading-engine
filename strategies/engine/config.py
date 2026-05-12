@@ -145,9 +145,16 @@ def build_default_config() -> EngineConfig:
         allocation_pct=0.20,
         order_prefix="ENG_SIMPLE_",
         legacy_prefixes=("dir_",),
-        max_positions=1,            # Probation: max 1 concurrent position
-        max_daily_loss_pct=0.02,    # 2% of sleeve (stricter than paper's 4%)
-        probation=True,
+        # Phase A: off probation after 16 trading days of zero positions
+        # under the 1-position/2%-loss/80%-size probation regime. Restores
+        # simple_bot defaults — MAX_POSITIONS=4, POSITION_SIZE_PCT=0.35,
+        # MAX_DAILY_LOSS_PCT=0.04 — so up to 4 concurrent positions at 35%
+        # of sleeve each. Worst-case daily loss is bounded by the 4% cap
+        # (~$60 on a $1.5k sleeve). auto_halt_on_anomaly stays on as a
+        # fill-quality safety belt.
+        max_positions=None,         # Bot manages internally (default 4)
+        max_daily_loss_pct=0.04,    # Match simple_bot default (no probation cap)
+        probation=False,
         auto_halt_on_anomaly=True,
         max_fill_deviation_pct=0.02,
     )
