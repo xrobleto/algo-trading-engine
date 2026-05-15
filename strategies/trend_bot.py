@@ -857,7 +857,13 @@ class Alerter:
             msg['Subject'] = f"[{level}] Trend Bot: {title}"
             msg.attach(MIMEText(message, 'plain'))
 
-            with smtplib.SMTP(SMTP_SERVER, SMTP_PORT) as server:
+            # timeout=10 caps the connect AND every blocking socket op. Without
+            # it, a host that blocks SMTP (e.g. Railway blocks port 587) hangs
+            # ~2 min on the TCP connect — and since _send_email runs
+            # synchronously inside send_alert, that stalls the caller (engine
+            # tick / rebalance). 10s fail-fast keeps a misconfig from ever
+            # blocking the engine loop.
+            with smtplib.SMTP(SMTP_SERVER, SMTP_PORT, timeout=10) as server:
                 server.starttls()
                 if SMTP_USERNAME and SMTP_PASSWORD:
                     server.login(SMTP_USERNAME, SMTP_PASSWORD)
