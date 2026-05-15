@@ -895,6 +895,10 @@ class Alerter:
                 headers={
                     "Authorization": f"Bearer {RESEND_API_KEY}",
                     "Content-Type": "application/json",
+                    # Resend sits behind Cloudflare, which blocks the default
+                    # "Python-urllib/x.y" User-Agent with a 403 / error 1010
+                    # ("banned browser signature"). An explicit UA is required.
+                    "User-Agent": "algo-trading-engine/1.0",
                 },
             )
             with urllib.request.urlopen(req, timeout=10) as resp:
