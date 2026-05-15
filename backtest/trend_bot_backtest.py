@@ -65,6 +65,30 @@ DEFAULT_TACTICAL_ETFS = ["RSP"]
 LEVERAGED_ETFS = ["TQQQ", "UPRO", "SOXL", "TECL", "FAS"]
 MOMENTUM_ETFS = ["ARKK", "XBI", "KWEB", "SOXX", "IGV", "CIBR", "SKYY"]
 
+# Leverage multiple per ticker — mirrors trend_bot.LEVERAGE_FACTORS. Used by
+# the leverage-aware profit-tilt to normalize SMA extension.
+LEVERAGE_FACTORS = {
+    "TQQQ": 3.0, "UPRO": 3.0, "SOXL": 3.0, "TECL": 3.0, "FAS": 3.0,
+}
+
+
+def get_leverage_factor(sym: str) -> float:
+    """Return the leverage multiple for a ticker (1.0 if unleveraged)."""
+    return LEVERAGE_FACTORS.get(sym, 1.0)
+
+
+def compute_profit_tilt(extension_pct: float, config: dict) -> float:
+    """
+    Profit-tilt multiplier for extended positions — mirrors
+    trend_bot.compute_profit_tilt(). Returns 1.0 (no tilt) below the
+    extension threshold, scaling linearly down to (1 - max_reduction).
+    """
+    threshold = config["profit_tilt_extension_threshold"]
+    if extension_pct < threshold:
+        return 1.0
+    tilt = 1.0 - config["profit_tilt_k"] * (extension_pct - threshold)
+    return max(tilt, 1.0 - config["profit_tilt_max_reduction"])
+
 # Default parameters (from trend_bot.py)
 DEFAULT_CONFIG = {
     # Core parameters
@@ -95,6 +119,18 @@ DEFAULT_CONFIG = {
 
     # v2: Use momentum-weighted allocation instead of inverse-vol
     "use_momentum_weighting": False,   # v3: Back to inverse-vol (momentum too volatile)
+
+    # Profit-tilt (mirrors trend_bot.py compute_profit_tilt). Reduces target
+    # weight for positions extended above their SMA; the tilted-away weight
+    # becomes cash (exposure reduction, not redistribution).
+    "enable_profit_tilt": True,            # model production behavior
+    "profit_tilt_extension_threshold": 0.20,
+    "profit_tilt_max_reduction": 0.40,
+    "profit_tilt_k": 1.5,
+    # Leverage-aware: divide extension by leverage factor before the tilt so
+    # a 3x ETF isn't pinned at the tilt floor by mechanically-amplified
+    # price distance from its SMA.
+    "enable_leverage_aware_tilt": False,
 
     # Dynamic capital
     "enable_dynamic_capital": True,
@@ -822,6 +858,23 @@ class BacktestEngine:
         total_weight = sum(weights.values())
         if total_weight > 0:
             weights = {s: w / total_weight for s, w in weights.items()}
+
+        # Profit-tilt: reduce weight for extended positions. Applied AFTER
+        # normalize so the tilted-away weight becomes cash (exposure
+        # reduction, not redistribution) — mirrors trend_bot.py, which does
+        # not re-normalize up after tilting.
+        if self.config.get("enable_profit_tilt", False):
+            ext_map = {
+                e["symbol"]: ((e["close"] - e["sma200"]) / e["sma200"]
+                              if e["sma200"] > 0 else 0.0)
+                for e in eligible
+            }
+            lev_aware = self.config.get("enable_leverage_aware_tilt", False)
+            for sym in list(weights.keys()):
+                extension = ext_map.get(sym, 0.0)
+                lev = get_leverage_factor(sym) if lev_aware else 1.0
+                tilt = compute_profit_tilt(extension / lev, self.config)
+                weights[sym] *= tilt
 
         # Apply regime-based capital deployment
         if self.config["enable_dynamic_capital"]:

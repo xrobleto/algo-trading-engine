@@ -222,6 +222,24 @@ CASH_TICKER = "SGOV"
 # v8: Leveraged ETFs (high-beta amplifiers for strong trends)
 LEVERAGED_ETFS = ["TQQQ", "UPRO", "SOXL", "TECL", "FAS"]
 
+# Leverage multiple per ticker. Used to normalize price extension above
+# SMA200 before the profit-tilt: a 3x ETF mechanically sits ~3x further
+# above its own SMA200 than the underlying, so without normalization
+# leveraged ETFs pin at the profit-tilt floor permanently (e.g. SOXL at
+# 107% raw extension when SOXX, the 1x equivalent, is only 33%).
+LEVERAGE_FACTORS = {
+    "TQQQ": 3.0,  # 3x Nasdaq-100
+    "UPRO": 3.0,  # 3x S&P 500
+    "SOXL": 3.0,  # 3x semiconductors
+    "TECL": 3.0,  # 3x technology
+    "FAS": 3.0,   # 3x financials
+}
+
+
+def get_leverage_factor(sym: str) -> float:
+    """Return the leverage multiple for a ticker (1.0 if unleveraged)."""
+    return LEVERAGE_FACTORS.get(sym, 1.0)
+
 # v8: Momentum/Thematic ETFs (high-momentum sectors)
 MOMENTUM_ETFS = ["ARKK", "XBI", "KWEB", "SOXX", "IGV", "CIBR", "SKYY"]
 
@@ -558,6 +576,14 @@ ENABLE_INTRADAY_GAP_EXIT = True       # Enable gap-down emergency exit
 PROFIT_TILT_EXTENSION_THRESHOLD = 0.20  # Start tilting target weight when >20% above SMA200
 PROFIT_TILT_MAX_REDUCTION = 0.40        # Max reduction = 40% of base weight (e.g., 20% -> 12%)
 PROFIT_TILT_K = 1.5                     # Tilt steepness: tilt = 1 - k*(extension - threshold)
+
+# Leverage-aware profit-tilt: divide a ticker's SMA200 extension by its
+# leverage factor (see LEVERAGE_FACTORS) before computing the tilt. Without
+# this, a 3x ETF's price sits mechanically ~3x further above its SMA200, so
+# leveraged ETFs pin at the tilt floor permanently and are double-penalized
+# (once by inverse-vol sizing, again by the floored tilt). Default OFF —
+# flip to True only after backtest validation vs the current behavior.
+ENABLE_LEVERAGE_AWARE_TILT = False
 
 # DEPRECATED: Mid-cycle profit-taking constants
 # These are no longer used - profit-taking is now handled via profit_tilt at rebalance time.
@@ -5064,12 +5090,19 @@ def compute_target_weights(
     for sym in basket:
         if target[sym] > 0 and sym in extensions:
             extension = extensions[sym]
-            tilt = compute_profit_tilt(extension)
+            # Leverage-aware: normalize extension by leverage factor so a 3x
+            # ETF is judged on the extension of the underlying trend, not its
+            # mechanically-amplified price distance from its own SMA200.
+            lev = get_leverage_factor(sym) if ENABLE_LEVERAGE_AWARE_TILT else 1.0
+            tilt_extension = extension / lev
+            tilt = compute_profit_tilt(tilt_extension)
             if tilt < 1.0:
                 old_weight = target[sym]
                 target[sym] = old_weight * tilt
                 diag[sym]["profit_tilt"] = float(tilt)
-                log.info(f"[PROFIT_TILT] {sym}: extension={extension:.1%}, "
+                lev_note = (f", lev={lev:.0f}x, effective_ext={tilt_extension:.1%}"
+                            if lev != 1.0 else "")
+                log.info(f"[PROFIT_TILT] {sym}: extension={extension:.1%}{lev_note}, "
                         f"tilt={tilt:.2f}, weight {old_weight:.2%} -> {target[sym]:.2%}")
 
     # Cap per-asset weights (non-cash) and apply minimum position size filter
