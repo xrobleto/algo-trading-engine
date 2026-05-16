@@ -318,10 +318,24 @@ def reconcile(
     # reconciles.
     existing_ledger.last_reconciled_at = result.timestamp
 
-    # Close active entries whose broker position has disappeared
+    # Close FILLED entries whose broker position has disappeared.
+    #
+    # Patch 25: this sweep must only touch entries that actually HELD a
+    # position (`filled` / `partially_filled`) — never `pending`. A freshly
+    # registered order is `pending` and has no broker position yet; its
+    # absence from broker_positions means "not filled yet", not "position
+    # exited". The old `entry.is_active` predicate (which also matches
+    # `pending`) wrongly closed pending entries: a periodic reconcile fires
+    # within the same engine tick as order submission (~100 ms later),
+    # before a marketable-limit order has filled, and clobbered the entry to
+    # status=closed with fill_price=None — silently losing the trade from
+    # the ledger (SIMPLE NVDL scalp, 2026-05-14). Pending resolution belongs
+    # to Step 3.5 above, which queries Alpaca order history. Once 3.5 has
+    # promoted an entry to `filled`, this sweep then correctly closes it if
+    # the position is gone, preserving the fill_price/fill_qty 3.5 recorded.
     broker_symbols = {p["symbol"] for p in result.broker_positions}
     for coid, entry in list(existing_ledger.entries.items()):
-        if entry.is_active and entry.symbol not in broker_symbols:
+        if entry.status in ("filled", "partially_filled") and entry.symbol not in broker_symbols:
             entry.status = "closed"
             entry.closed_at = result.timestamp
             log.info(f"[RECONCILE] {entry.symbol}: position gone at broker — marking closed")

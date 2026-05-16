@@ -292,6 +292,100 @@ shows correct numbers.
 
 ---
 
+## Patch 25 — Reconciler closes `pending` ledger entries before they fill
+
+**Status**: DRAFTED 2026-05-16 — code + test in working tree, pending pytest +
+Railway deploy. No ledger backfill required (see below).
+
+**Trigger event** — daily review follow-up, 2026-05-15/16
+
+The 2026-05-15 review reported the SIMPLE NVDL scalp (05-14) as "bracket timed
+out unfilled" because its `engine_ownership_live.json` entry was
+`status=closed`, `fill_price=null`, `fill_qty=null`, `closed_at` 104 ms after
+`registered_at`. The Alpaca Orders page showed the opposite: the buy limit
+filled (4 @ $128.41, 3 s after submission) and the stop sell filled (~$126.42)
+~2.5 h later — a real scalp stopped out for ~−$8. The ledger had silently lost
+the trade.
+
+**Symptom**
+
+```
+ENG_SIMPLE_NVDL_scalp_20260514_144926_87a3:
+  registered_at: 2026-05-14T14:49:26.594750+00:00
+  closed_at:     2026-05-14T14:49:26.698828+00:00   ← 104 ms later
+  status: closed   fill_price: null   fill_qty: null
+```
+
+**Root cause** — `strategies/engine/reconciler.py` Step 4, the "close active
+entries whose broker position has disappeared" sweep, used the predicate
+`entry.is_active`. `is_active` is True for `pending | filled |
+partially_filled`. A freshly registered order is `pending` and has no broker
+position yet. The periodic reconcile (`reconcile_interval_sec=60`) runs inside
+the *same engine tick* that submitted the order — ~100 ms after
+`register_order` — i.e. before a marketable-limit order has filled. The sweep
+saw the pending entry's symbol absent from `broker_positions` and concluded the
+position had exited, marking the entry `closed` with no fill data.
+
+SIMPLE scalps are the exposed case: they enter on marketable limit orders that
+take seconds to fill. TREND/CROSSASSET rebalance orders are market orders that
+fill near-instantly and were also caught by Step 3.5 / the synthetic-entry
+path, so they escaped. Step 3.5 (pending→filled resolution via Alpaca order
+history) already owns pending entries correctly — the Step 4 sweep had no
+business touching them.
+
+**Fix shipped to working tree**
+
+`strategies/engine/reconciler.py` — Step 4 predicate changed from
+`entry.is_active` to `entry.status in ("filled", "partially_filled")`. The
+sweep now only closes entries that actually *held* a position. Pending entries
+are left for Step 3.5, which queries Alpaca order history each cycle and
+promotes to `filled` / `partially_filled` / `cancelled`. Step 3.5 runs before
+Step 4, so within a single reconcile a pending entry whose order has since
+filled is promoted to `filled` (recording `fill_price`/`fill_qty`) and then, if
+its position is gone, correctly closed — the closed entry retains the fill
+data. One-line predicate change; no other logic touched.
+
+**No backfill needed.** The fix is forward-only. The one corrupt live entry
+(NVDL, status=closed) is terminal and will be removed by `prune_terminal`'s
+7-day retention (~2026-05-21). It does not affect live trading — only a
+historical count. Not worth a migration script.
+
+**Test plan**
+
+- New `strategies/engine/test_reconciler_patch25.py` (4 tests, all passing):
+  1. pending buy, order unfilled → entry stays `pending` (the NVDL bug).
+  2. pending buy, order-history API returns None, no position → stays
+     `pending` (harsher path the old `is_active` sweep also closed).
+  3. full NVDL lifecycle across 3 reconciles: pending → filled → closed, with
+     `fill_price`/`fill_qty` preserved on the final `closed` entry.
+  4. non-regression: a `filled` entry whose broker position disappeared is
+     still marked `closed`.
+- Smoke test post-deploy: after the next SIMPLE entry, confirm its
+  `engine_ownership_live.json` entry advances pending → filled (with a real
+  `fill_price`) rather than jumping straight to `closed`/null.
+
+**Blast radius** — ownership ledger fidelity only; no order/execution
+behavior changes. Affects all three sleeves but in practice only SIMPLE was
+corrupted. Worst case if the fix is wrong: a genuinely orphaned `pending`
+entry (order lost, never resolvable by Step 3.5) would no longer be
+auto-closed and could sit `pending` indefinitely — but the old behavior of
+closing it as if the position *exited* is the exact corruption being fixed.
+Honest-`pending` beats false-`closed`.
+
+**Known limitation / follow-up** — truly orphaned `pending` entries (Alpaca
+order-history API permanently returns None) are now never closed by the
+reconciler. This is the pre-existing "stuck in pending >1 trading day" issue
+the daily review already tracks; it deserves a dedicated stale-pending sweep
+(close as `cancelled` after N trading days with no broker order and no
+position) rather than being papered over by the position-disappeared logic.
+Separate patch — not folded in here to keep the change one line.
+
+**Files touched**
+- `strategies/engine/reconciler.py` (one-line predicate change + comment)
+- `strategies/engine/test_reconciler_patch25.py` (new)
+
+---
+
 ## Watch items (not yet a patch)
 
 - **Tradestie Reddit source 404** (since 2026-04-18 intermittent). If persistent
