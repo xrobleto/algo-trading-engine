@@ -74,6 +74,31 @@ class BrokerFacade:
         )
         return self._order_dict(self._client.submit_order(req))
 
+    def cancel_all_orders(self) -> int:
+        """Cancel every open order. Returns the count attempted."""
+        try:
+            resp = self._client.cancel_orders()
+            return len(resp) if resp else 0
+        except Exception:
+            count = 0
+            for order in self.get_open_orders():
+                try:
+                    self._client.cancel_order_by_id(order["id"])
+                    count += 1
+                except Exception:
+                    pass
+            return count
+
+    def close_all_positions(self) -> int:
+        """Liquidate every position at market and cancel open orders.
+
+        Used by the emergency-flatten command — returns the position count
+        that was open at the moment of liquidation.
+        """
+        n_positions = len(self.get_positions())
+        self._client.close_all_positions(cancel_orders=True)
+        return n_positions
+
     def is_market_open(self) -> bool:
         return bool(self._client.get_clock().is_open)
 

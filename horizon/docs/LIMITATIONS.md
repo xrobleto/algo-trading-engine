@@ -50,11 +50,13 @@ engine, not an optimistic one — so this document is deliberately unflattering.
 
 ## Live-engine limitations
 
-9. **The live order layer is v1.** It is coherent and runnable, but it has not
-   been hardened against the partial-fill / race-condition edge cases that the
-   existing Unified Engine needed ~25 patches to handle. Orders are tagged
-   `ENGINE` rather than per-sleeve (the live book is managed holistically;
-   per-sleeve accounting is approximate). Test on small stakes first.
+9. **The live order layer is v1.** It now has email alerting (failures,
+   kill-switch trips, daily heartbeat), an emergency `--flatten` command,
+   orphaned-position recovery in the reconciler, and Railway deployment config
+   (Dockerfile + railway.json). What remains v1: partial-fill handling is
+   minimal — fine for liquid-ETF market orders but unproven under stress — and
+   orders are tagged holistically rather than per-sleeve (per-sleeve accounting
+   is approximate). Still: test on small stakes first.
 
 10. **Withdrawals are not reliably monthly.** The high-water-mark mechanism
     pays out only on genuine new highs; on a volatile growth account those

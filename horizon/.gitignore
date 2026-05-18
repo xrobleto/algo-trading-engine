@@ -13,3 +13,10 @@ results/*
 __pycache__/
 *.pyc
 .pytest_cache/
+
+# Runtime state (ledger, engine_state) — never commit.
+state/
+
+# The repo-root .gitignore blanket-ignores *.json; re-include the Railway
+# deploy config (this is the only .json Horizon needs in version control).
+!railway.json

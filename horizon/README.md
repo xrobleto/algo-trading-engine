@@ -47,13 +47,23 @@ python -m horizon.backtest.run_validation        # -> horizon/docs/VALIDATION.md
 Run the live engine in dry-run (logs the orders it *would* place, submits nothing):
 
 ```bash
-python -m horizon.engine.main --once             # one cycle
-python -m horizon.engine.main --interval 900     # loop every 15 minutes
+python -m horizon.engine.main --once             # one dry-run cycle
+python -m horizon.engine.main --daily            # one cycle per weekday, 09:00 ET
+python -m horizon.engine.main --interval 900     # dry-run loop (testing)
+python -m horizon.engine.main --flatten          # EMERGENCY: cancel + liquidate all
 ```
 
 Live trading is the user's explicit decision and requires `LIVE_TRADING=1` plus
-`I_UNDERSTAND_LIVE_TRADING=YES` in `.env`. **Horizon is delivered for testing,
-not deployment** — see [docs/TEST_PLAN.md](docs/TEST_PLAN.md).
+`I_UNDERSTAND_LIVE_TRADING=YES` in `.env` (add `--live` to the command).
+The engine emails alerts on failures, kill-switch trips, and a daily heartbeat
+when SMTP is configured (see `.env.example`).
+
+**Deployment:** a `Dockerfile` and `railway.json` are included. Create a Railway
+service whose root directory is `horizon/`, mount a volume at `/data`, and set
+secrets as Railway environment variables — see the `Dockerfile` header.
+
+**Horizon is delivered for testing, not deployment** — see
+[docs/TEST_PLAN.md](docs/TEST_PLAN.md).
 
 ## Repository layout
 

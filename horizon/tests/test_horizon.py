@@ -96,10 +96,67 @@ def test_harness_smoke():
     assert res.trades, "no trades executed"
 
 
+class _StubBroker:
+    """Minimal broker stub for reconciler tests — no network."""
+
+    def __init__(self, positions):
+        self._positions = positions
+
+    def get_positions(self):
+        return self._positions
+
+    def get_order_by_client_id(self, client_order_id):
+        return None
+
+
+def test_reconciler_orphan_recovery():
+    """An unrecognized broker position is adopted as a tracked UNMANAGED entry."""
+    from ..engine.reconciler import UNMANAGED, reconcile
+    led = OwnershipLedger()
+    broker = _StubBroker({"NVDA": {"symbol": "NVDA", "qty": 5.0,
+                                   "market_value": 900.0,
+                                   "avg_entry_price": 180.0}})
+    res = reconcile(broker, led)
+    assert "NVDA" in res.orphan_symbols, "orphan not detected"
+    assert led.get_owner("NVDA") == UNMANAGED, "orphan not adopted"
+    reconcile(broker, led)  # a second pass must not duplicate
+    active = [e for e in led.entries.values()
+              if e.symbol == "NVDA" and e.is_active]
+    assert len(active) == 1, "orphan recovery duplicated an entry"
+
+
+def test_alerter_never_raises():
+    """Alerting must never raise — a failed alert cannot crash the engine."""
+    from ..engine.alerts import Alerter
+    a = Alerter()
+    a.enabled = False  # force log-only regardless of local SMTP config
+    a.send("subject", "body", level="CRITICAL")
+    a.warning("w")
+    a.critical("c")
+    a.heartbeat({"regime": "RISK_ON", "equity": 7400})
+    a.heartbeat({"regime": "RISK_ON", "equity": 7400})  # once-per-day no-op
+
+
+def test_emergency_flatten_requires_broker():
+    """Emergency flatten must refuse cleanly when there is no broker."""
+    from ..engine.alerts import Alerter
+    from ..engine.killswitch import KillSwitch
+    from ..engine.main import emergency_flatten
+    alerter = Alerter()
+    alerter.enabled = False
+    try:
+        emergency_flatten(None, KillSwitch(), alerter)
+    except RuntimeError:
+        return
+    raise AssertionError("emergency_flatten should refuse without a broker")
+
+
 def main() -> int:
     tests = [test_no_lookahead, test_single_source_of_truth,
              test_strategies_decide_cleanly, test_risk_overlay_recovers,
-             test_ledger_roundtrip, test_harness_smoke]
+             test_ledger_roundtrip, test_harness_smoke,
+             test_reconciler_orphan_recovery, test_alerter_never_raises,
+             test_emergency_flatten_requires_broker]
     failed = 0
     for t in tests:
         try:
