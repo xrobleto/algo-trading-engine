@@ -2,7 +2,9 @@
 .env
 *.env
 
-# Data cache (regenerated from Polygon)
+# The repo-root .gitignore ignores every data/ directory. Re-include the
+# Horizon data-layer source code, but keep the regenerated price cache out.
+!data/
 data/cache/
 
 # Backtest outputs
