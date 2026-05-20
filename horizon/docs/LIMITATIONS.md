@@ -51,9 +51,11 @@ engine, not an optimistic one — so this document is deliberately unflattering.
 ## Live-engine limitations
 
 9. **The live order layer is v1.** It now has email alerting (failures,
-   kill-switch trips, daily heartbeat), an emergency `--flatten` command,
-   orphaned-position recovery in the reconciler, and Railway deployment config
-   (Dockerfile + railway.json). What remains v1: partial-fill handling is
+   kill-switch trips, daily heartbeat), a startup broker-auth probe (bad or
+   shadowed keys fail fast instead of silently dropping to dry-run), an
+   emergency `--flatten` command, orphaned-position recovery in the
+   reconciler, and Railway deployment config (Dockerfile + railway.json).
+   What remains v1: partial-fill handling is
    minimal — fine for liquid-ETF market orders but unproven under stress — and
    orders are tagged holistically rather than per-sleeve (per-sleeve accounting
    is approximate). Still: test on small stakes first.

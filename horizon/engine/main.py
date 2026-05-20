@@ -18,6 +18,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import time
 import traceback
 from datetime import datetime, timedelta, timezone
@@ -240,7 +241,41 @@ def main() -> None:
     if args.flatten or args.live:
         from .broker import create_broker_from_env
         broker = create_broker_from_env()
-        log.info("broker connected (paper=%s)", broker.paper)
+        # Startup auth probe: verify the keys actually authorize against
+        # Alpaca, not just that the client object constructed. Catches a
+        # stale ALPACA_API_KEY env var shadowing horizon/.env — instead of
+        # falling silently into dry-run on the first cycle hours later.
+        key_source = ("os.environ" if "ALPACA_API_KEY" in os.environ
+                      else "horizon/.env")
+        api_key = (os.environ.get("ALPACA_API_KEY")
+                   or "")  # for logging the prefix only
+        try:
+            account = broker.get_account()
+            log.info("broker AUTHORIZED: paper=%s, equity=$%.2f, status=%s",
+                     broker.paper, account["equity"], account["status"])
+            log.info("keys resolved from %s (prefix: %s...)",
+                     key_source, api_key[:6] if api_key else "(.env)")
+        except Exception as exc:
+            log.critical("broker AUTH FAILED at startup: %s", exc)
+            log.critical("keys resolved from %s (prefix: %s...)",
+                         key_source, api_key[:6] if api_key else "(.env)")
+            if key_source == "os.environ":
+                log.critical("A stale ALPACA_API_KEY env var is shadowing "
+                             "horizon/.env. Clear it and re-run:")
+                log.critical("  PowerShell: Remove-Item Env:\\ALPACA_API_KEY, "
+                             "Env:\\ALPACA_SECRET_KEY")
+            alerter.critical(
+                "Horizon startup: broker auth failed",
+                f"create_broker_from_env succeeded but get_account returned:\n"
+                f"  {exc}\n\n"
+                f"Resolved key source: {key_source} "
+                f"(prefix: {api_key[:6] if api_key else '(.env)'}...).\n\n"
+                f"If the source is os.environ, a stale ALPACA_API_KEY in your "
+                f"shell is shadowing horizon/.env — clear it and re-run. "
+                f"Otherwise verify the keys in horizon/.env.\n\n"
+                f"The engine REFUSED to start to avoid silently sitting in "
+                f"dry-run.")
+            raise SystemExit(2)
     else:
         try:
             from .broker import create_broker_from_env
