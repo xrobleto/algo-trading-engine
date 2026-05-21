@@ -151,12 +151,51 @@ def test_emergency_flatten_requires_broker():
     raise AssertionError("emergency_flatten should refuse without a broker")
 
 
+def test_pending_order_awareness():
+    """The order-diff must subtract pending exposure to avoid doubling.
+
+    Catches the day-1 regression: an after-hours --once --live submission
+    queued for the next open was not visible to the next --daily cycle
+    (positions=0, pending invisible), so the cycle re-submitted identical
+    orders and the book doubled.
+    """
+    from ..engine.main import _pending_notional
+
+    class _OrderBroker:
+        def get_open_orders(self):
+            return [
+                {"symbol": "QQQ", "side": "buy", "qty": 10.0, "filled_qty": 0.0},
+                {"symbol": "DBC", "side": "buy", "qty": 100.0, "filled_qty": 25.0},
+                {"symbol": "GLD", "side": "sell", "qty": 5.0, "filled_qty": 0.0},
+            ]
+
+    class _View:
+        def is_tradable(self, sym): return True
+        def close(self, sym):
+            return {"QQQ": 700.0, "DBC": 31.0, "GLD": 200.0}[sym]
+
+    pending = _pending_notional(_OrderBroker(), _View())
+    assert pending["QQQ"] == 7000.0, "buy 10 @ 700 should be +7000"
+    assert pending["DBC"] == 75.0 * 31.0, \
+        "partial fill should count only the unfilled remainder"
+    assert pending["GLD"] == -1000.0, "sell 5 @ 200 should be -1000"
+
+    # No broker / broker failure must degrade gracefully (return {}).
+    assert _pending_notional(None, _View()) == {}
+
+    class _Failing:
+        def get_open_orders(self): raise RuntimeError("broker down")
+
+    assert _pending_notional(_Failing(), _View()) == {}
+
+
 def main() -> int:
     tests = [test_no_lookahead, test_single_source_of_truth,
              test_strategies_decide_cleanly, test_risk_overlay_recovers,
              test_ledger_roundtrip, test_harness_smoke,
              test_reconciler_orphan_recovery, test_alerter_never_raises,
-             test_emergency_flatten_requires_broker]
+             test_emergency_flatten_requires_broker,
+             test_pending_order_awareness]
     failed = 0
     for t in tests:
         try:

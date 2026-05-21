@@ -113,6 +113,7 @@ class BrokerFacade:
             "status": str(o.status),
             "filled_avg_price": (float(o.filled_avg_price)
                                  if o.filled_avg_price else None),
+            "side": getattr(o.side, "value", str(o.side)).lower(),
         }
 
 

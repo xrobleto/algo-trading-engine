@@ -66,6 +66,43 @@ def _save_states(states: Dict[str, dict]) -> None:
         json.dumps(states, indent=2, default=str), encoding="utf-8")
 
 
+def _pending_notional(broker, view) -> Dict[str, float]:
+    """Signed pending notional per symbol from open orders (buys +, sells -).
+
+    Prevents the engine from double-submitting when the previous cycle's
+    orders have not yet filled — for example, an after-hours batch queued
+    for the next open. The cycle's order-diff uses
+    `effective = filled + pending` instead of `effective = filled`.
+
+    Degrades gracefully: returns {} on no broker or broker error.
+    """
+    pending: Dict[str, float] = {}
+    if broker is None:
+        return pending
+    try:
+        open_orders = broker.get_open_orders()
+    except Exception as exc:
+        log.warning("open-orders fetch failed (%s) — pending-aware diff disabled",
+                    exc)
+        return pending
+    for order in open_orders:
+        sym = order.get("symbol")
+        if not sym:
+            continue
+        qty_remaining = (float(order.get("qty", 0.0))
+                         - float(order.get("filled_qty", 0.0)))
+        if qty_remaining <= 0 or not view.is_tradable(sym):
+            continue
+        price = view.close(sym)
+        if not price or price <= 0:
+            continue
+        signed = qty_remaining * price
+        if "sell" in str(order.get("side", "")).lower():
+            signed = -signed
+        pending[sym] = pending.get(sym, 0.0) + signed
+    return pending
+
+
 def run_cycle(broker, strategies, cfg, ledger, kill_switch, alerter,
               dry_run: bool = True) -> dict:
     """Run one engine cycle: reconcile, decide, diff vs broker, submit (or log)."""
@@ -121,13 +158,20 @@ def run_cycle(broker, strategies, cfg, ledger, kill_switch, alerter,
                                    + weight * budgets[sid].sleeve_equity)
     _save_states(states)
 
+    # Pending-order awareness — open/unfilled orders count toward effective
+    # exposure, so the cycle cannot double-submit when a prior batch hasn't
+    # filled yet (the day-1 doubling bug: after-hours --once queued orders
+    # the next morning's --daily cycle did not see).
+    pending = _pending_notional(broker, view)
+
     orders = []
-    for sym in set(account_target) | set(positions):
+    for sym in set(account_target) | set(positions) | set(pending):
         if sym in orphan_symbols:
             continue  # unmanaged — never auto-traded
         target = account_target.get(sym, 0.0)
-        current = positions.get(sym, {}).get("market_value", 0.0)
-        delta = target - current
+        filled = positions.get(sym, {}).get("market_value", 0.0)
+        effective = filled + pending.get(sym, 0.0)
+        delta = target - effective
         if abs(delta) < MIN_ORDER_USD:
             continue
         side = "buy" if delta > 0 else "sell"
