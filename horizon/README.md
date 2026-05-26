@@ -48,7 +48,7 @@ Run the live engine in dry-run (logs the orders it *would* place, submits nothin
 
 ```bash
 python -m horizon.engine.main --once             # one dry-run cycle
-python -m horizon.engine.main --daily            # one cycle per weekday, 09:00 ET
+python -m horizon.engine.main --daily            # weekdays at 09:00 ET; immediate catch-up if today hasn't run
 python -m horizon.engine.main --interval 900     # dry-run loop (testing)
 python -m horizon.engine.main --flatten          # EMERGENCY: cancel + liquidate all
 ```

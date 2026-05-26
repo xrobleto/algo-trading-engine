@@ -47,6 +47,7 @@ DAILY_RUN_HOUR_ET = 9      # run once per weekday at 09:00 ET, before the open
 _STATE_FILE = "engine_state.json"
 _LEDGER_FILE = "ledger.json"
 _HALT_FILE = "HALT_ALL_TRADING"
+_LAST_CYCLE_FILE = "last_cycle.txt"   # records the ET date of the most recent cycle
 
 
 def _load_states(strategies) -> Dict[str, dict]:
@@ -64,6 +65,24 @@ def _load_states(strategies) -> Dict[str, dict]:
 def _save_states(states: Dict[str, dict]) -> None:
     (state_dir() / _STATE_FILE).write_text(
         json.dumps(states, indent=2, default=str), encoding="utf-8")
+
+
+def _last_cycle_date() -> str:
+    """ET-date of the most recent cycle attempt; '' if none. Drives the --daily
+    same-day catch-up."""
+    path = state_dir() / _LAST_CYCLE_FILE
+    if not path.exists():
+        return ""
+    try:
+        return path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+
+
+def _record_cycle_date() -> None:
+    now_et = datetime.now(ZoneInfo("America/New_York"))
+    (state_dir() / _LAST_CYCLE_FILE).write_text(
+        now_et.date().isoformat(), encoding="utf-8")
 
 
 def _pending_notional(broker, view) -> Dict[str, float]:
@@ -245,13 +264,17 @@ def _seconds_until_daily_run(hour_et: int = DAILY_RUN_HOUR_ET) -> float:
 
 def _safe_cycle(broker, strategies, cfg, ledger, kill_switch, alerter,
                 dry_run) -> None:
-    """Run a cycle, converting any exception into a CRITICAL alert."""
+    """Run a cycle, converting any exception into a CRITICAL alert. Marks the
+    ET-day as attempted on either success or failure so the --daily catch-up
+    cannot retry-loop on a persistent error."""
     try:
         run_cycle(broker, strategies, cfg, ledger, kill_switch, alerter, dry_run)
     except Exception:
         tb = traceback.format_exc()
         log.exception("cycle error")
         alerter.critical("engine cycle failed", tb)
+    finally:
+        _record_cycle_date()
 
 
 def main() -> None:
@@ -334,9 +357,22 @@ def main() -> None:
 
     dry_run = not args.live
     if args.daily:
-        log.info("daily mode — one cycle per weekday at %02d:00 ET",
+        log.info("daily mode — one cycle per weekday at %02d:00 ET "
+                 "(immediate catch-up if today hasn't run yet)",
                  DAILY_RUN_HOUR_ET)
+        et = ZoneInfo("America/New_York")
         while True:
+            now_et = datetime.now(et)
+            today_iso = now_et.date().isoformat()
+            is_weekday = now_et.weekday() < 5
+            # Catch-up: if today is a trading day and no cycle has run today
+            # yet, fire one immediately instead of sleeping to tomorrow.
+            if is_weekday and _last_cycle_date() != today_iso:
+                log.info("catch-up: today (%s) has not run yet — firing now",
+                         today_iso)
+                _safe_cycle(broker, strategies, cfg, ledger, kill_switch,
+                            alerter, dry_run)
+                continue   # loop back, then sleep to the next scheduled slot
             wait = _seconds_until_daily_run()
             log.info("next cycle in %.1f hours", wait / 3600.0)
             time.sleep(wait)
