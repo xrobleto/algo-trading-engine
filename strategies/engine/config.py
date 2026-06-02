@@ -130,7 +130,7 @@ def build_default_config() -> EngineConfig:
 
     trend_sleeve = SleeveConfig(
         strategy_id="TREND",
-        allocation_pct=0.65,        # Reduced from 0.75 to fund CROSSASSET sleeve
+        allocation_pct=0.75,        # 2026-06-02: raised 0.65->0.75, absorbing SIMPLE's cut while SIMPLE is debugged
         order_prefix="ENG_TREND_",
         legacy_prefixes=("TBOT_",),
         known_symbols=trend_known_symbols,
@@ -142,7 +142,7 @@ def build_default_config() -> EngineConfig:
 
     simple_sleeve = SleeveConfig(
         strategy_id="SIMPLE",
-        allocation_pct=0.20,
+        allocation_pct=0.10,        # 2026-06-02: cut 0.20->0.10 — zero fills since 05-18 (scanner timing out >10s + breadth gate blocking entries). Halved pending root-cause fix.
         order_prefix="ENG_SIMPLE_",
         legacy_prefixes=("dir_",),
         # Phase A: off probation after 16 trading days of zero positions
@@ -171,7 +171,7 @@ def build_default_config() -> EngineConfig:
         auto_halt_on_anomaly=False,
     )
 
-    # Allocation check: 0.65 + 0.20 + 0.12 + 0.03 = 1.00
+    # Allocation check: 0.75 + 0.10 + 0.12 + 0.03 = 1.00
     config = EngineConfig(
         sleeves={
             "TREND": trend_sleeve,
