@@ -202,6 +202,11 @@ CHOP_DAMPENER_ENABLED = os.getenv("INTEL_CHOP_DAMPENER", "0") == "1"
 SIMPLE_BREADTH_THRESHOLD_SCORE = 0.75   # narrowness_score threshold
 SIMPLE_BREADTH_SUSTAIN_DAYS = 10        # must be sustained N days
 SIMPLE_BREADTH_WINDOW = 63              # gap lookback window
+# Patch 28: sustained-narrow breadth is a SIMPLE size dampener, not an entry
+# block. In a narrow regime SIMPLE keeps scalping but at this fraction of its
+# allocation (applied outside the ±ALLOCATION_SWING_PCT clamp so it genuinely
+# bites). Was a hard entry gate (sleeve went fully dark) until 2026-06-02.
+SIMPLE_BREADTH_ALLOC_MULT = 0.5
 
 # WS4 tunables
 CHOP_RAMP_LO = 0.40           # below this, no dampening
@@ -497,22 +502,7 @@ class MarketIntelligenceLayer:
             ).get(strategy_id, 1.0)
             reasons.append(f"regime:{regime.value}:x{alloc_mult:.2f}")
 
-            # WS3: SIMPLE breadth gate modifier (alloc haircut in addition to entry gate)
-            if (MARKET_STRUCTURE_GATE_ENABLED
-                    and strategy_id == "SIMPLE"
-                    and ms is not None
-                    and ms.get("available")
-                    and ms.get("narrowness_sustained")
-                    and regime in (MarketRegime.RISK_ON, MarketRegime.CAUTIOUS)):
-                # Alloc haircut alongside entry gate — reinforces reduction
-                gate_mod = 0.5
-                alloc_mult *= gate_mod
-                reasons.append(
-                    f"breadth_gate:x{gate_mod:.2f} (narrow_score="
-                    f"{ms.get('narrowness_score', 0.0):.2f})"
-                )
-
-            # WS4: TREND chop dampener
+            # WS4: TREND chop dampener (applied within the swing clamp)
             if (CHOP_DAMPENER_ENABLED
                     and strategy_id == "TREND"
                     and ms is not None
@@ -527,6 +517,23 @@ class MarketIntelligenceLayer:
 
             # Bound allocation within ±ALLOCATION_SWING_PCT of base
             adjusted = self._bound_allocation(base, alloc_mult, ALLOCATION_SWING_PCT)
+
+            # WS3: SIMPLE breadth dampener (Patch 28). Applied OUTSIDE the swing
+            # clamp so a sustained-narrow regime genuinely halves SIMPLE's
+            # exposure — the ±10% swing bound would otherwise cap the cut at
+            # ~base*0.9. This replaces the old hard entry block: SIMPLE keeps
+            # trading in narrow markets (its hunting ground) but at reduced size.
+            if (MARKET_STRUCTURE_GATE_ENABLED
+                    and strategy_id == "SIMPLE"
+                    and ms is not None
+                    and ms.get("available")
+                    and ms.get("narrowness_sustained")
+                    and regime in (MarketRegime.RISK_ON, MarketRegime.CAUTIOUS)):
+                adjusted *= SIMPLE_BREADTH_ALLOC_MULT
+                reasons.append(
+                    f"breadth_dampener:x{SIMPLE_BREADTH_ALLOC_MULT:.2f} (narrow_score="
+                    f"{ms.get('narrowness_score', 0.0):.2f})"
+                )
 
             # Velocity limit: max 2% absolute change per refresh
             prev = self._previous_allocations.get(strategy_id, base)
@@ -604,22 +611,13 @@ class MarketIntelligenceLayer:
         strategy_id: str,
         microstructure: Optional[Dict[str, Any]] = None,
     ) -> Tuple[bool, str]:
-        # Existing CRISIS gate
+        # Existing CRISIS gate — hard block SIMPLE intraday entries in a crisis.
         if regime == MarketRegime.CRISIS and strategy_id == "SIMPLE":
             return False, "CRISIS regime: intraday entries blocked"
-        # WS3: sustained-narrow breadth gate for SIMPLE in "looks calm but isn't" regimes
-        if (MARKET_STRUCTURE_GATE_ENABLED
-                and strategy_id == "SIMPLE"
-                and microstructure is not None
-                and microstructure.get("available")
-                and microstructure.get("narrowness_sustained")
-                and regime in (MarketRegime.RISK_ON, MarketRegime.CAUTIOUS)):
-            nscore = microstructure.get("narrowness_score", 0.0)
-            return (
-                False,
-                f"breadth_narrow: sustained narrow leadership detected "
-                f"(score={nscore:.2f}, regime={regime.value})",
-            )
+        # Patch 28: sustained-narrow breadth (WS3) no longer hard-blocks SIMPLE.
+        # It is now a size dampener only (see _compute_sleeve_adjustments /
+        # SIMPLE_BREADTH_ALLOC_MULT) — momentum scalping stays active in narrow
+        # markets but at reduced exposure rather than going fully dark.
         return True, "ok"
 
     @staticmethod

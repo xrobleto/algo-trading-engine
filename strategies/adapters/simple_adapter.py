@@ -246,14 +246,16 @@ class SimpleAdapter(StrategyAdapter):
             if (sb.ENABLE_DYNAMIC_UNIVERSE
                     and (time.time() - self._bot.last_dynamic_scan_time > sb.DYNAMIC_SCAN_INTERVAL_SEC)):
                 if self._bot.market_scanner:
-                    # Wrap the blocking Polygon call in a 10s timeout so a slow
+                    # Wrap the blocking Polygon call in a timeout so a slow
                     # scanner cannot stall the whole engine loop (which processes
-                    # all adapters sequentially).
+                    # all adapters sequentially). Patch 27 moved synchronous news
+                    # fetches off this path, so the scan is normally <2s; the 20s
+                    # budget clears the 15s single-call API timeout with margin.
                     from concurrent.futures import ThreadPoolExecutor, TimeoutError as _FuturesTimeout
                     try:
                         with ThreadPoolExecutor(max_workers=1) as _pool:
                             _fut = _pool.submit(self._bot.market_scanner.scan)
-                            watchlist = _fut.result(timeout=10)
+                            watchlist = _fut.result(timeout=20)
                         new_symbols = set(self._bot.market_scanner.get_symbols())
                         dynamic_additions = new_symbols - set(sb.CORE_SYMBOLS)
                         added = dynamic_additions - self._bot.dynamic_universe
@@ -264,7 +266,7 @@ class SimpleAdapter(StrategyAdapter):
                                 log.info(f"[SIMPLE][SCANNER+] {w.symbol}: score={w.quality_score:.0f} | "
                                          f"chg={w.change_pct:+.1f}% RVOL={w.rvol:.1f}x")
                     except _FuturesTimeout:
-                        log.warning("[SIMPLE] Scanner timed out (>10s) — skipping this cycle")
+                        log.warning("[SIMPLE] Scanner timed out (>20s) — skipping this cycle")
                     except Exception as e:
                         log.warning(f"[SIMPLE] Scanner failed: {e}")
                         self._bot.discover_dynamic_universe()

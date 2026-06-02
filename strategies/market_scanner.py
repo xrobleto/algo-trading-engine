@@ -27,6 +27,7 @@ import os
 import sys
 import time
 import logging
+import threading
 import requests
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, time as dt_time, date
@@ -380,6 +381,10 @@ class MarketScanner:
         self._premarket_gappers: List[WatchlistEntry] = []
         self._news_cache: Dict[str, Tuple[float, bool, str]] = {}
         self._scan_date: Optional[date] = None
+        # Patch 27: news enrichment runs OFF the timed scan path. The hot path
+        # reads cache only; cache misses are warmed by a single background thread.
+        self._news_warm_lock = threading.Lock()
+        self._news_warming = False
 
         logger.info(f"[SCANNER] Initialized | excluded={len(self.excluded_symbols)} | "
                     f"core={len(self.core_symbols)}")
@@ -731,9 +736,17 @@ class MarketScanner:
     # ─── Private: Scoring & News ───────────────────────────────
 
     def _score_candidates(self, candidates: List[ScanCandidate]) -> List[WatchlistEntry]:
-        """Score a batch of candidates, checking news for top N."""
+        """Score a batch of candidates, reading cached news for top N.
+
+        Patch 27: news is read cache-only here (no network, no sleep) so this
+        method — which runs inside the adapter's scan timeout — never blocks on
+        Polygon. Symbols whose news is missing/stale are warmed by a background
+        thread for the next cycle. A momentum scalper ranks on RVOL/gainers;
+        the news catalyst is a score bonus, not worth stalling every scan for.
+        """
         now_str = datetime.now(ET).strftime("%H:%M:%S")
         watchlist = []
+        news_misses: List[str] = []
 
         for i, candidate in enumerate(candidates):
             vol_accel = self.vol_tracker.get_acceleration(candidate.symbol)
@@ -741,7 +754,9 @@ class MarketScanner:
             has_news = False
             headline = ""
             if i < NEWS_CHECK_TOP_N:
-                has_news, headline = self._check_catalyst(candidate.symbol)
+                has_news, headline = self._check_catalyst(candidate.symbol, allow_fetch=False)
+                if not self._news_is_fresh(candidate.symbol):
+                    news_misses.append(candidate.symbol)
 
             score = self.scorer.score(candidate, vol_accel, has_news)
 
@@ -760,16 +775,64 @@ class MarketScanner:
                 discovered_at=now_str,
             ))
 
+        if news_misses:
+            self._warm_news_async(news_misses)
+
         return watchlist
 
-    def _check_catalyst(self, symbol: str) -> Tuple[bool, str]:
-        """Check if symbol has news today. Uses 30-min cache to reduce API calls."""
+    def _news_is_fresh(self, symbol: str) -> bool:
+        """True if we hold a non-stale cached news result for `symbol`."""
+        cached = self._news_cache.get(symbol)
+        if cached is None:
+            return False
+        return (time.time() - cached[0]) < NEWS_CACHE_MINUTES * 60
+
+    def _warm_news_async(self, symbols: List[str]) -> None:
+        """Pre-warm the news cache for `symbols` off the timed scan path.
+
+        At most one warmer thread runs at a time; if one is already in flight
+        we skip (the next scan will re-enqueue any still-missing symbols). The
+        warmer does the per-symbol sleeps + network calls, but off the hot path
+        so it cannot trip the scan timeout.
+        """
+        with self._news_warm_lock:
+            if self._news_warming:
+                return
+            self._news_warming = True
+
+        to_warm = list(symbols)
+
+        def _worker() -> None:
+            try:
+                for sym in to_warm:
+                    if self._news_is_fresh(sym):
+                        continue
+                    self._check_catalyst(sym, allow_fetch=True)
+            except Exception as e:  # never let the warmer crash the process
+                logger.debug(f"[SCANNER] news warmer error: {e}")
+            finally:
+                with self._news_warm_lock:
+                    self._news_warming = False
+
+        threading.Thread(target=_worker, name="news-warmer", daemon=True).start()
+
+    def _check_catalyst(self, symbol: str, allow_fetch: bool = True) -> Tuple[bool, str]:
+        """Check if symbol has news today. Uses 30-min cache to reduce API calls.
+
+        When `allow_fetch` is False (the timed scan hot path), this returns the
+        cached result if fresh and otherwise (False, "") immediately — it never
+        sleeps or hits the network. The background warmer calls it with
+        allow_fetch=True to populate the cache.
+        """
         now_ts = time.time()
 
         if symbol in self._news_cache:
             cached_ts, has_news, headline = self._news_cache[symbol]
             if (now_ts - cached_ts) < NEWS_CACHE_MINUTES * 60:
                 return has_news, headline
+
+        if not allow_fetch:
+            return False, ""
 
         time.sleep(API_RATE_LIMIT_DELAY)
 
