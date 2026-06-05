@@ -1,7 +1,7 @@
 # Directional Bot - Project Notes
 
 > **Purpose**: Track progress and changes for the directional_bot.py script.
-> **Location**: `C:\Users\xrobl\Documents\GitHub\Algo_Trading\strategies\directional_bot.py`
+> **Location**: `~/Projects/algo-trading-engine/strategies/directional_bot.py`
 
 ---
 

@@ -151,7 +151,7 @@ Run `python utilities/daily_metrics.py` at end of each day.
 ### Kill Switch
 ```bash
 # Create kill switch file to halt immediately
-echo "HALT" > C:\Users\xrobl\Documents\Algo_Trading\data\state\HALT_TRADING
+echo "HALT" > ~/Projects/algo-trading-engine/data/state/HALT_TRADING
 ```
 
 ### Manual Flatten All

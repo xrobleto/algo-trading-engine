@@ -7,7 +7,7 @@ Real-time web interface for the smallcap momentum scanner with user authenticati
 ### 1. Install Dependencies
 
 ```bash
-cd C:\Users\xrobl\Documents\Algo_Trading\dashboard
+cd ~/Projects/algo-trading-engine/dashboard
 pip install -r requirements.txt
 pip install python-dotenv
 ```
@@ -44,7 +44,7 @@ Double-click: launchers\Start Dashboard.bat
 
 **Option B:** Run directly:
 ```bash
-cd C:\Users\xrobl\Documents\Algo_Trading\dashboard
+cd ~/Projects/algo-trading-engine/dashboard
 streamlit run app.py
 ```
 

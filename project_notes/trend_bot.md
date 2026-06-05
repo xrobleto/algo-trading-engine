@@ -1,7 +1,7 @@
 # Trend Bot - Project Notes
 
 > **Purpose**: Track progress and changes for the trend_bot.py script.
-> **Location**: `C:\Users\xrobl\Documents\Algo_Trading\strategies\trend_bot.py`
+> **Location**: `~/Projects/algo-trading-engine/strategies/trend_bot.py`
 
 ---
 

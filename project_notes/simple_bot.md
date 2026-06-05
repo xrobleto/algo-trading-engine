@@ -1,7 +1,7 @@
 # Simple Bot - Project Notes
 
 > **Purpose**: Track progress and changes for the simple_bot.py script.
-> **Location**: `C:\Users\xrobl\Documents\Algo_Trading\strategies\simple_bot.py`
+> **Location**: `~/Projects/algo-trading-engine/strategies/simple_bot.py`
 
 ---
 

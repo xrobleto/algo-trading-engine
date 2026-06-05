@@ -1,7 +1,7 @@
 # Small Cap Scanner - Project Notes
 
 > **Purpose**: Track progress and changes for the smallcap_scanner.py script.
-> **Location**: `C:\Users\xrobl\Documents\Algo_Trading\scanners\smallcap_scanner.py`
+> **Location**: `~/Projects/algo-trading-engine/scanners/smallcap_scanner.py`
 
 ---
 

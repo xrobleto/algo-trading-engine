@@ -33,7 +33,7 @@ free_newsletter.py → Beehiiv → Email subscribers
 ### 1. Install dependencies
 
 ```bash
-cd C:\Users\xrobl\Documents\Algo_Trading\content
+cd ~/Projects/algo-trading-engine/content
 pip install -r requirements.txt
 ```
 
@@ -112,31 +112,31 @@ Create scheduled tasks for automated operation:
 ### Task 1: Morning Content (8:15 AM ET)
 ```
 Program: python
-Arguments: C:\Users\xrobl\Documents\Algo_Trading\content\signal_to_content.py morning
+Arguments: ~/Projects/algo-trading-engine/content/signal_to_content.py morning
 ```
 
 ### Task 2: Midday Content (11:45 AM ET)
 ```
 Program: python
-Arguments: C:\Users\xrobl\Documents\Algo_Trading\content\signal_to_content.py midday
+Arguments: ~/Projects/algo-trading-engine/content/signal_to_content.py midday
 ```
 
 ### Task 3: Afternoon Content (4:15 PM ET)
 ```
 Program: python
-Arguments: C:\Users\xrobl\Documents\Algo_Trading\content\signal_to_content.py afternoon
+Arguments: ~/Projects/algo-trading-engine/content/signal_to_content.py afternoon
 ```
 
 ### Task 4: Evening Content (6:45 PM ET)
 ```
 Program: python
-Arguments: C:\Users\xrobl\Documents\Algo_Trading\content\signal_to_content.py evening
+Arguments: ~/Projects/algo-trading-engine/content/signal_to_content.py evening
 ```
 
 ### Task 5: Free Newsletter (6:00 PM ET)
 ```
 Program: python
-Arguments: C:\Users\xrobl\Documents\Algo_Trading\alerts\free_newsletter.py
+Arguments: ~/Projects/algo-trading-engine/alerts/free_newsletter.py
 ```
 
 ## File Structure

@@ -1,8 +1,8 @@
 # Small Cap Pre-Market Executor - Project Notes
 
 > **Purpose**: Track progress and changes for the smallcap_premarket_executor.py script.
-> **Location**: `C:\Users\xrobl\Documents\Algo_Trading\scanners\smallcap_premarket_executor.py`
-> **Launcher**: `C:\Users\xrobl\Documents\Algo_Trading\launchers\Premarket Execute.bat`
+> **Location**: `~/Projects/algo-trading-engine/scanners/smallcap_premarket_executor.py`
+> **Launcher**: `~/Projects/algo-trading-engine/launchers/Premarket Execute.bat`
 
 ---
 

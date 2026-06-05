@@ -1,7 +1,7 @@
 # Sell Alerts - Project Notes
 
 > **Purpose**: Track progress and changes for the sell_alerts.py script.
-> **Location**: `C:\Users\xrobl\Documents\Algo_Trading\alerts\sell_alerts.py`
+> **Location**: `~/Projects/algo-trading-engine/alerts/sell_alerts.py`
 
 ---
 

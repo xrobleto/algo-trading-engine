@@ -1,7 +1,7 @@
 # Buy Alerts - Project Notes
 
 > **Purpose**: Track progress and changes for the buy_alerts.py script.
-> **Location**: `C:\Users\xrobl\Documents\Algo_Trading\alerts\buy_alerts.py`
+> **Location**: `~/Projects/algo-trading-engine/alerts/buy_alerts.py`
 
 ---
 
