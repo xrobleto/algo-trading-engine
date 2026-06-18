@@ -51,10 +51,16 @@ def _narrow_ms():
     }
 
 
-def _make_layer(ms):
-    """Minimal layer instance without running the full constructor."""
+def _make_layer(ms, simple_alloc=None):
+    """Minimal layer instance without running the full constructor.
+
+    `simple_alloc` overrides SIMPLE's base allocation so the dampener-MATH tests
+    don't depend on the production default (SIMPLE is parked at 0.0 in prod as of
+    2026-06-16; the 0.5x dampener math must still be testable on a non-zero base)."""
     layer = MarketIntelligenceLayer.__new__(MarketIntelligenceLayer)
     layer._config = build_default_config()
+    if simple_alloc is not None:
+        layer._config.sleeves["SIMPLE"].allocation_pct = simple_alloc
     layer._ms_cache = ms
     layer._previous_allocations = {}
     return layer
@@ -85,15 +91,16 @@ def test_breadth_dampener_halves_simple_allocation():
         # Remove velocity clamping so we measure the steady-state target directly.
         intel.MAX_ALLOCATION_VELOCITY = 1.0
 
-        # Baseline: gate OFF → no breadth dampener.
+        # Baseline: gate OFF → no breadth dampener. Use an explicit non-zero SIMPLE
+        # base so the halving math is exercised regardless of the parked prod default.
         intel.MARKET_STRUCTURE_GATE_ENABLED = False
-        base_layer = _make_layer(_narrow_ms())
+        base_layer = _make_layer(_narrow_ms(), simple_alloc=0.10)
         base_adj = base_layer._compute_sleeve_adjustments(MarketRegime.CAUTIOUS)
         simple_base = base_adj["SIMPLE"].adjusted_allocation
 
         # Dampened: gate ON + sustained narrow.
         intel.MARKET_STRUCTURE_GATE_ENABLED = True
-        damp_layer = _make_layer(_narrow_ms())
+        damp_layer = _make_layer(_narrow_ms(), simple_alloc=0.10)
         damp_adj = damp_layer._compute_sleeve_adjustments(MarketRegime.CAUTIOUS)
         simple_damp = damp_adj["SIMPLE"].adjusted_allocation
 

@@ -350,8 +350,10 @@ def test_backfill_is_idempotent() -> None:
 def main() -> int:
     tests = [
         test_update_status_writes_notional,
-        test_update_status_notional_omitted_preserves_value,
-        test_update_status_notional_none_is_noop,
+        test_update_status_notional_omitted_recomputes_from_fill,
+        test_update_status_notional_none_recomputes_from_fill,
+        test_update_status_explicit_notional_wins,
+        test_update_status_recompute_skipped_when_fill_data_absent,
         test_mark_closed_does_not_touch_notional,
         test_regression_qty100_fallback_corrected_post_fill,
         test_regression_qty100_fallback_overestimates_small_priced,
