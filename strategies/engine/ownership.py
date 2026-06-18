@@ -192,6 +192,20 @@ class OwnershipLedger:
             results = [e for e in results if e.strategy_id == strategy_id]
         return results
 
+    def active_positions(self, strategy_id: Optional[str] = None) -> List[tuple]:
+        """Cross-sleeve open book: [(symbol, signed_notional, strategy_id)] for filled
+        entries (buy +, sell -). Used by the cross-sleeve correlation guard. Mirrors
+        get_deployed_notional's filled-exposure semantics."""
+        out = []
+        for e in self.entries.values():
+            if e.status not in ("filled", "partially_filled"):
+                continue
+            if strategy_id and e.strategy_id != strategy_id:
+                continue
+            signed = e.notional_at_entry if e.side.lower() == "buy" else -e.notional_at_entry
+            out.append((e.symbol, signed, e.strategy_id))
+        return out
+
     def count_active_positions(self, strategy_id: str) -> int:
         """Count distinct symbols with filled entries for a strategy."""
         return len({e.symbol for e in self.get_filled_entries(strategy_id)})

@@ -154,6 +154,19 @@ class SleeveManager:
                 f"(used ${ctx.sleeve_used:,.2f} of ${ctx.sleeve_equity:,.2f})"
             )
 
+        # Check 4: cross-sleeve correlated-exposure cap. Symbol-level conflicts (Check 1)
+        # don't catch DIFFERENT-but-correlated positions stacking the same beta across
+        # sleeves. Blocks only risk-INCREASING entries past the cap; never forces exits
+        # or blocks hedges, so it cannot create a death-spiral.
+        if getattr(self.config, "correlation_guard_enabled", False) and symbol and self._total_equity > 0:
+            from engine.correlation_guard import Position, would_breach
+            book = [Position(s, n) for (s, n, _) in ledger.active_positions()]
+            breach, why = would_breach(
+                symbol, notional, "buy", book, self._total_equity, self.config.correlation_cap
+            )
+            if breach:
+                return False, why
+
         return True, "ok"
 
     @property

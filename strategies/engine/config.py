@@ -59,6 +59,10 @@ class EngineConfig:
     kill_switch_file: str = "HALT_ALL_TRADING"
     reconcile_on_startup: bool = True
 
+    # Cross-sleeve correlated-exposure guard (prevents hidden beta stacking across sleeves)
+    correlation_guard_enabled: bool = True
+    correlation_cap: float = 1.25       # max net risk-on exposure (× total equity) across ALL sleeves
+
     # Engine loop timing
     tick_interval_sec: float = 5.0       # main loop sleep
     reconcile_interval_sec: float = 60.0   # periodic reconciliation cadence (1 min) — drives pending→filled ledger freshness (see Patch 9)
@@ -130,7 +134,7 @@ def build_default_config() -> EngineConfig:
 
     trend_sleeve = SleeveConfig(
         strategy_id="TREND",
-        allocation_pct=0.75,        # 2026-06-02: raised 0.65->0.75, absorbing SIMPLE's cut while SIMPLE is debugged
+        allocation_pct=0.80,        # 2026-06-16: +0.05 from parked SIMPLE (proven live: PF 1.44, +$127). Was 0.75 (raised 0.65->0.75 on 06-02).
         order_prefix="ENG_TREND_",
         legacy_prefixes=("TBOT_",),
         known_symbols=trend_known_symbols,
@@ -142,7 +146,7 @@ def build_default_config() -> EngineConfig:
 
     simple_sleeve = SleeveConfig(
         strategy_id="SIMPLE",
-        allocation_pct=0.10,        # 2026-06-02: cut 0.20->0.10 — zero fills since 05-18 (scanner timing out >10s + breadth gate blocking entries). Halved pending root-cause fix.
+        allocation_pct=0.00,        # 2026-06-16: PARKED. Faithful redesign (parabolic-continuation ORB) failed the pre-registered bar — 0/7 regime windows positive on a single-source-of-truth harness; live PF 0.19, −$53. Allocation redeployed to TREND/CROSSASSET. Registered at $0 so it flattens any residual position but opens nothing (can_deploy blocks on zero sleeve_available). Flip back to 0.10 to revive. See project_notes/simple_v2_validation_2026-06-15.md.
         order_prefix="ENG_SIMPLE_",
         legacy_prefixes=("dir_",),
         # Phase A: off probation after 16 trading days of zero positions
@@ -161,7 +165,7 @@ def build_default_config() -> EngineConfig:
 
     crossasset_sleeve = SleeveConfig(
         strategy_id="CROSSASSET",
-        allocation_pct=0.12,
+        allocation_pct=0.17,        # 2026-06-16: +0.05 from parked SIMPLE (best diversifier, live PF 4.20). Was 0.12.
         order_prefix="ENG_XASSET_",
         legacy_prefixes=("XABOT_",),
         known_symbols=crossasset_known_symbols,
@@ -171,7 +175,7 @@ def build_default_config() -> EngineConfig:
         auto_halt_on_anomaly=False,
     )
 
-    # Allocation check: 0.75 + 0.10 + 0.12 + 0.03 = 1.00
+    # Allocation check: 0.80 (TREND) + 0.00 (SIMPLE parked) + 0.17 (CROSSASSET) + 0.03 (cash) = 1.00
     config = EngineConfig(
         sleeves={
             "TREND": trend_sleeve,
