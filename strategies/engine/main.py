@@ -306,8 +306,17 @@ def engine_main(trend_only: bool = False) -> None:
     trend_adapter.initialize(trend_ctx)
     adapters["TREND"] = trend_adapter
 
-    # Simple adapter (unless trend-only mode)
-    if not trend_only:
+    # Simple adapter (unless trend-only mode). Skip entirely when the sleeve is PARKED
+    # (allocation 0) and holds no positions — otherwise a parked sleeve keeps running its
+    # scanner/WebSocket/Polygon calls on the live box for no benefit. If it ever holds a
+    # residual position, the adapter still loads so it can manage/flatten it.
+    _simple_cfg = config.sleeves.get("SIMPLE")
+    _simple_parked = (
+        _simple_cfg is not None
+        and _simple_cfg.allocation_pct <= 0.0
+        and ledger.count_active_positions("SIMPLE") == 0
+    )
+    if not trend_only and not _simple_parked:
         try:
             from adapters.simple_adapter import SimpleAdapter
             simple_adapter = SimpleAdapter(
@@ -325,6 +334,8 @@ def engine_main(trend_only: bool = False) -> None:
             log.error(f"[STARTUP] Failed to initialize Simple adapter: {e}")
             log.warning("[STARTUP] Continuing with trend-only")
             traceback.print_exc()
+    elif _simple_parked:
+        log.info("[STARTUP] SIMPLE parked (allocation 0, no open positions) — adapter skipped")
 
     # Cross-Asset adapter (unless trend-only mode)
     if not trend_only:
