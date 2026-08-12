@@ -30,6 +30,19 @@ risk tolerance high, profitability-first; scale-up at 1.4–1.8× book leverage 
   with validated ROTATION) and raise book leverage toward 1.4–1.8× per the user's risk preference.
 - **Fail → report plainly** and fix or stand down; no scale-up on a failed gate.
 
+## Staged capital migration (user-approved 2026-08-12)
+Faster than the strict 30-day wait, on evidence checkpoints — any dirty checkpoint stops the ramp.
+User reviews evidence at each step (quick yes/no). Freed capital parks in SGOV between steps.
+| checkpoint | condition | action |
+|---|---|---|
+| **CP1 ~Aug 19** | 5 clean trading days: fills ≈ modeled costs, ledgers reconcile, no cross-engine issues | Retire CROSSASSET (live PF 0.41; redundant with ROTATION) → **HORIZON 0.40 / TREND 0.40** |
+| **CP2 ~Aug 26–Sep 2** | still clean | **HORIZON 0.60 / TREND 0.20** |
+| **CP3 ~Sep 25** | full G1–G4 pass | **HORIZON 0.75–0.80 core at 1.4× book leverage** (1.8× per user risk preference), TREND minimal/retired |
+- Raise HORIZON_CAPITAL_CAP in lockstep with the reserve at each step.
+- Capital injection (user's) lands after CP1+, directly into the Horizon core.
+- In parallel: TREND faithful validation (harness imports production trend_bot code, walk-forward).
+  Fails → retire at CP2/CP3; passes → retains a sized allocation with known parameters.
+
 ## Notes
 - ROTATION's first live pick differed slightly on the equivalents basis (PDBC+QQQM vs QQQ-only on the
   originals) — equivalent ETFs have near- but not perfectly-identical momentum ranks. This is exactly
