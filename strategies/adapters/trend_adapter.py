@@ -12,11 +12,12 @@ ZERO edits to trend_bot.py — all injection via monkey-patching.
 """
 
 import logging
+import os
 import time
 import traceback
 import uuid
 from datetime import datetime, timezone
-from typing import Optional, Set
+from typing import Dict, Optional, Set
 
 from adapters.base import StrategyAdapter, TickResult
 from engine.config import SleeveConfig
@@ -32,6 +33,13 @@ log = logging.getLogger("Engine")
 
 # Minimum seconds between trend ticks (trend bot internally sleeps 60s)
 TREND_TICK_INTERVAL_SEC = 55
+
+# --- Aug-2026 audit policy knobs (env-overridable, safe defaults ON) ---
+# Exclude 3x leveraged ETFs from TREND's tradable universe. TECL/SOXL produced
+# -$275 of pure churn/vol-decay bleed (TECL: 30 round-trips, median 1-day hold).
+TREND_EXCLUDE_LEVERAGED = os.getenv("TREND_EXCLUDE_LEVERAGED", "1") == "1"
+# Days a symbol must rest after TREND sells it before TREND may re-buy it.
+REENTRY_COOLDOWN_DAYS = float(os.getenv("TREND_REENTRY_COOLDOWN_DAYS", "5"))
 
 
 class TrendAdapter(StrategyAdapter):
@@ -69,6 +77,9 @@ class TrendAdapter(StrategyAdapter):
 
         # Rate limiting
         self._last_tick_time: float = 0.0
+
+        # Churn guard: symbol -> UTC datetime of last SELL (re-entry cooldown)
+        self._recent_sells: Dict[str, datetime] = {}
 
         # Current sleeve context (updated each tick)
         self._current_ctx: Optional[SleeveContext] = None
@@ -357,18 +368,35 @@ class TrendAdapter(StrategyAdapter):
                 order_request.client_order_id = client_oid
                 log.info(f"[TREND] Generated synthetic order ID: {client_oid}")
 
-            # Estimate notional
-            notional = 0.0
-            try:
-                pos = self._trading.get_open_position(symbol)
-                price = float(pos.current_price)
-                notional = qty * price
-            except Exception:
-                # No position — use a rough estimate
-                notional = qty * 100  # conservative fallback
+            # Estimate notional (real price lookup — the old qty*100 fallback caused
+            # false sleeve rejections on sub-$100 symbols and let >$100 symbols
+            # through under-checked; see adapters.base.estimate_order_notional)
+            from adapters.base import estimate_order_notional
+            notional = estimate_order_notional(self._trading, symbol, qty, order_request)
 
             # Validate (exits always allowed)
             if "buy" in side.lower():
+                # Leveraged-ETF policy (covers the drift-mini path too — stale
+                # leveraged targets in last_target_weights must not re-buy)
+                if TREND_EXCLUDE_LEVERAGED and symbol in set(getattr(tb, "LEVERAGED_ETFS", []) or []):
+                    msg = f"leveraged-ETF policy: {symbol} buys disabled (sells unaffected)"
+                    log.warning(f"[TREND] Order REJECTED: BUY {qty:.4f} {symbol} | {msg}")
+                    raise RuntimeError(f"Sleeve rejected order: {msg}")
+
+                # Churn control (Aug-2026 audit): 45/80 TREND round-trips were held
+                # <=2 days (TECL alone: 30 rt, median 1-day hold) — sell->rebuy
+                # whipsaw, net -$157. Block RE-BUYS of a symbol we sold within the
+                # cooldown. Sells are never blocked (risk exits stay free); only the
+                # re-entry is throttled. In-memory (resets on restart) — acceptable.
+                last_sell = self._recent_sells.get(symbol)
+                if last_sell is not None:
+                    days_since = (datetime.now(timezone.utc) - last_sell).total_seconds() / 86400.0
+                    if days_since < REENTRY_COOLDOWN_DAYS:
+                        msg = (f"re-entry cooldown: {symbol} sold {days_since:.1f}d ago "
+                               f"(<{REENTRY_COOLDOWN_DAYS}d) — churn guard")
+                        log.warning(f"[TREND] Order REJECTED: BUY {qty:.4f} {symbol} | {msg}")
+                        raise RuntimeError(f"Sleeve rejected order: {msg}")
+
                 allowed, reason = self.validate_order(symbol, side, qty, notional)
                 if not allowed:
                     log.warning(
@@ -398,6 +426,8 @@ class TrendAdapter(StrategyAdapter):
             broker_order_id = str(result.id) if result and hasattr(result, 'id') else None
 
             if "sell" in side.lower():
+                # Record for the re-entry cooldown (churn guard)
+                self._recent_sells[symbol] = datetime.now(timezone.utc)
                 # SELL = closing a position → mark existing entries as closed
                 for entry in self.ledger.get_active_entries("TREND"):
                     if entry.symbol == symbol:
@@ -694,6 +724,19 @@ class TrendAdapter(StrategyAdapter):
                     log.info(
                         f"[TREND] Patch 15: filtered {len(removed)} cross-sleeve-owned "
                         f"ticker(s) from rank universe: {removed}"
+                    )
+                symbols = filtered
+            # Aug-2026 audit: exclude 3x leveraged ETFs from the rank universe.
+            # Weights normalize over the remaining (1x) tickers, so the sleeve
+            # keeps its deployment — just without the churn/decay vehicles.
+            # Existing leveraged positions can still be SOLD (exits unaffected).
+            if TREND_EXCLUDE_LEVERAGED and symbols:
+                lev = set(getattr(tb, "LEVERAGED_ETFS", []) or [])
+                filtered = [s for s in symbols if s not in lev]
+                if len(filtered) != len(symbols):
+                    log.info(
+                        f"[TREND] Leveraged-ETF policy: excluded "
+                        f"{sorted(set(symbols) - set(filtered))} from rank universe"
                     )
                 symbols = filtered
             return self._original_rank_by_momentum(

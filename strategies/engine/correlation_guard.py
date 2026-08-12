@@ -64,6 +64,60 @@ SYMBOL_BETA: Dict[str, Tuple[str, float]] = {
 
 DEFAULT_EQUITY_BETA = 1.2   # unknown single-name equity: assume high-beta long-only candidate
 
+# ---------------------------------------------------------------------------
+# Correlated clusters — symbols that are effectively THE SAME TRADE.
+# Aug-2026 audit: TREND lost $590 concentrated in the semis cluster (SOXX/TECL/
+# SMH/SOXL) while staying UNDER the aggregate-beta cap — net beta measures how
+# much total market risk the book carries, not whether it is all one bet.
+# Cluster exposure = sum(|beta_i| * |notional_i|) / equity per cluster, capped.
+# ---------------------------------------------------------------------------
+CLUSTERS: Dict[str, str] = {
+    # semiconductors (incl. leveraged and single names)
+    "SMH": "SEMIS", "SOXX": "SEMIS", "SOXL": "SEMIS", "SOXS": "SEMIS",
+    "NVDA": "SEMIS", "AMD": "SEMIS", "AVGO": "SEMIS", "MU": "SEMIS",
+    "SMCI": "SEMIS", "TSM": "SEMIS", "ARM": "SEMIS", "ON": "SEMIS",
+    "QCOM": "SEMIS", "TXN": "SEMIS", "INTC": "SEMIS", "TECL": "SEMIS",
+    "TECS": "SEMIS",  # TECL/TECS are tech-3x but trade as the semis/tech beta cluster
+    # big tech / growth
+    "QQQ": "BIGTECH", "TQQQ": "BIGTECH", "SQQQ": "BIGTECH", "XLK": "BIGTECH",
+    "IGV": "BIGTECH", "SKYY": "BIGTECH", "ARKK": "BIGTECH",
+    "AAPL": "BIGTECH", "MSFT": "BIGTECH", "GOOGL": "BIGTECH", "AMZN": "BIGTECH",
+    "META": "BIGTECH", "TSLA": "BIGTECH", "NFLX": "BIGTECH", "CRM": "BIGTECH",
+    # crypto-linked
+    "MSTR": "CRYPTO", "COIN": "CRYPTO", "MARA": "CRYPTO", "RIOT": "CRYPTO",
+    "CLSK": "CRYPTO", "WULF": "CRYPTO", "BTC": "CRYPTO", "BTCUSD": "CRYPTO",
+    # biotech
+    "XBI": "BIOTECH", "IBB": "BIOTECH", "LABU": "BIOTECH", "LABD": "BIOTECH",
+    # financials
+    "XLF": "FINANCIALS", "FAS": "FINANCIALS", "FAZ": "FINANCIALS",
+    "JPM": "FINANCIALS", "GS": "FINANCIALS", "BAC": "FINANCIALS", "MS": "FINANCIALS",
+    # energy/commodity
+    "XLE": "ENERGY", "USO": "ENERGY", "UNG": "ENERGY", "XOM": "ENERGY", "CVX": "ENERGY",
+}
+DEFAULT_CLUSTER_CAP = 0.50   # max gross beta-weighted exposure per cluster (x equity)
+
+
+def cluster_of(symbol: str) -> str:
+    s = symbol.upper()
+    if s in CLUSTERS:
+        return CLUSTERS[s]
+    factor, _ = classify(s)
+    return factor  # fall back to the broad factor as its own cluster
+
+
+def cluster_exposures(positions: List["Position"], total_equity: float) -> Dict[str, float]:
+    """Gross beta-weighted exposure per correlated cluster, as a fraction of equity.
+    Uses |beta| * |notional| — a 3x ETF counts at 3x, shorts count toward the same
+    cluster's gross (they are still concentration in one theme)."""
+    out: Dict[str, float] = {}
+    for p in positions:
+        _, beta = classify(p.symbol)
+        c = cluster_of(p.symbol)
+        out[c] = out.get(c, 0.0) + abs(beta) * abs(p.notional)
+    if total_equity > 0:
+        out = {k: v / total_equity for k, v in out.items()}
+    return out
+
 
 @dataclass
 class Position:
@@ -100,20 +154,32 @@ def factor_breakdown(positions: List[Position], total_equity: float) -> Dict[str
 def would_breach(
     new_symbol: str, new_notional: float, side: str,
     open_positions: List[Position], total_equity: float, cap: float = 1.25,
+    cluster_cap: float = DEFAULT_CLUSTER_CAP,
 ) -> Tuple[bool, str]:
-    """Would adding this order push NET risk-on exposure beyond `cap` x equity?
+    """Would adding this order breach either exposure limit?
 
-    Only blocks risk-INCREASING orders: if the new position would move net risk-on
-    further from zero past the cap. Risk-reducing orders (e.g. a short that hedges a
-    long-heavy book, or any exit) are always allowed."""
+    Check A — NET risk-on beta cap (`cap` x equity): blocks only risk-INCREASING
+    orders; hedges/exits always pass.
+    Check B — CLUSTER concentration cap (`cluster_cap` x equity, gross beta-weighted):
+    blocks any new BUY that would push one correlated cluster (e.g. SEMIS) past the
+    cap. This is the Aug-2026 lesson: the semis loss happened entirely UNDER the net
+    beta cap because four tickers were one trade."""
     factor, beta = classify(new_symbol)
     signed = new_notional if side.lower() == "buy" else -new_notional
     current = net_risk_on(open_positions, total_equity)
     proposed = current + (beta * signed) / max(total_equity, 1e-9)
-    # only block if we're increasing magnitude AND exceeding the cap
+    # A: only block if we're increasing magnitude AND exceeding the cap
     if abs(proposed) > cap and abs(proposed) > abs(current):
         return True, (f"cross-sleeve risk-on cap: net beta {current:+.2f}x -> {proposed:+.2f}x "
                       f"would exceed {cap:.2f}x (adding {beta:+.1f}-beta {new_symbol})")
+    # B: cluster concentration (buys only — sells reduce cluster gross)
+    if side.lower() == "buy" and cluster_cap > 0:
+        c = cluster_of(new_symbol)
+        cur_cl = cluster_exposures(open_positions, total_equity).get(c, 0.0)
+        prop_cl = cur_cl + abs(beta) * abs(new_notional) / max(total_equity, 1e-9)
+        if prop_cl > cluster_cap and prop_cl > cur_cl:
+            return True, (f"cluster concentration cap: {c} {cur_cl:.2f}x -> {prop_cl:.2f}x "
+                          f"would exceed {cluster_cap:.2f}x equity (adding {new_symbol})")
     return False, f"ok (net risk-on {current:+.2f}x -> {proposed:+.2f}x, cap {cap:.2f}x)"
 
 
@@ -128,6 +194,22 @@ def _selftest():
     b2, why2 = would_breach("TLT", 2000, "buy", book, eq, cap=1.25)
     print("add TLT (hedge) ->", b2, "|", why2)
     assert b is True and b2 is False
+
+    # Cluster cap — reproduce the Aug-2026 semis concentration under the beta cap.
+    # $7.8k account, SMH $2.1k + SOXX $1.7k (1.4-beta) => SEMIS gross ~0.68x. Net
+    # beta is only ~0.68x (well under 1.25), but adding TECL (3.5-beta) $550 pushes
+    # SEMIS to ~0.93x gross — past the 0.50 cluster cap -> must BLOCK.
+    eq2 = 7_800.0
+    book2 = [Position("SMH", 2100, "TREND"), Position("SOXX", 1700, "TREND")]
+    print("clusters:", {k: round(v, 2) for k, v in cluster_exposures(book2, eq2).items()})
+    b3, why3 = would_breach("TECL", 550, "buy", book2, eq2, cap=1.25, cluster_cap=0.50)
+    print("add TECL (semis stack) ->", b3, "|", why3)
+    b4, why4 = would_breach("XBI", 1500, "buy", book2, eq2, cap=1.25, cluster_cap=0.50)
+    print("add XBI (diversifier) ->", b4, "|", why4)
+    assert b3 is True and "cluster" in why3 and b4 is False
+    # sells never trip the cluster cap
+    b5, _ = would_breach("SMH", 1000, "sell", book2, eq2, cap=1.25, cluster_cap=0.50)
+    assert b5 is False
     print("OK")
 
 

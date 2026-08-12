@@ -8,16 +8,68 @@ Each adapter wraps an existing strategy's logic and provides:
 """
 
 import logging
+import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from enum import Enum
 from typing import Optional, Set
+
+import requests
 
 from engine.config import SleeveConfig
 from engine.ownership import OwnershipLedger
 from engine.sleeves import SleeveContext, SleeveManager
 
 log = logging.getLogger("Engine")
+
+
+def estimate_order_notional(trading_client, symbol: str, qty: float,
+                            order_request=None) -> float:
+    """Best-effort PRE-TRADE notional estimate for sleeve validation.
+
+    Replaces the old `qty * 100` fallback, which caused the Aug-2026 CROSSASSET
+    DBA loop: a ~$28 ETF was estimated at $100/share, so a legitimate ~$290 buy
+    was 'rejected: need $1,039' every 5 minutes forever. (It also UNDER-estimates
+    anything above $100/share, letting oversized orders slip past the check.)
+
+    Order of preference:
+      1. limit price on the order request (exact for limit orders)
+      2. current_price of an existing open position (adds to position)
+      3. Alpaca latest-trade quote (new positions — the DBA case)
+      4. qty * 100 last resort, with a loud warning
+    """
+    # 1. limit price on the request
+    lp = getattr(order_request, "limit_price", None) if order_request is not None else None
+    try:
+        if lp:
+            return qty * float(lp)
+    except (TypeError, ValueError):
+        pass
+    # 2. existing position
+    try:
+        pos = trading_client.get_open_position(symbol)
+        return qty * float(pos.current_price)
+    except Exception:
+        pass
+    # 3. latest trade from Alpaca market data (works for symbols we don't hold)
+    try:
+        key = os.getenv("ALPACA_API_KEY", ""); sec = os.getenv("ALPACA_SECRET_KEY", "")
+        if key and sec:
+            r = requests.get(
+                f"https://data.alpaca.markets/v2/stocks/{symbol}/trades/latest",
+                headers={"APCA-API-KEY-ID": key, "APCA-API-SECRET-KEY": sec},
+                timeout=5,
+            )
+            if r.status_code == 200:
+                px = float(r.json()["trade"]["p"])
+                if px > 0:
+                    return qty * px
+    except Exception:
+        pass
+    # 4. last resort
+    log.warning(f"[NOTIONAL] No price source for {symbol}; falling back to qty*100 "
+                f"(estimate may be badly wrong)")
+    return qty * 100.0
 
 
 class TickResult(Enum):

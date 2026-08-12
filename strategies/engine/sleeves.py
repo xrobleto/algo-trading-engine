@@ -162,7 +162,8 @@ class SleeveManager:
             from engine.correlation_guard import Position, would_breach
             book = [Position(s, n) for (s, n, _) in ledger.active_positions()]
             breach, why = would_breach(
-                symbol, notional, "buy", book, self._total_equity, self.config.correlation_cap
+                symbol, notional, "buy", book, self._total_equity, self.config.correlation_cap,
+                cluster_cap=getattr(self.config, "cluster_cap", 0.50),
             )
             if breach:
                 return False, why

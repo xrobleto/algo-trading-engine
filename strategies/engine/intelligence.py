@@ -196,7 +196,11 @@ STALE_CONTEXT_SEC = 1800
 # for the decision trail behind these modifiers.
 
 MARKET_STRUCTURE_GATE_ENABLED = os.getenv("INTEL_MARKET_STRUCTURE_GATE", "0") == "1"
-CHOP_DAMPENER_ENABLED = os.getenv("INTEL_CHOP_DAMPENER", "0") == "1"
+# Default ON since 2026-08-12 (was opt-in): the Aug-2026 audit found TREND churning
+# through a choppy semis tape (43 fills in one week, median 1-day holds) with this
+# dampener — built for exactly that — sitting disabled. Set INTEL_CHOP_DAMPENER=0
+# to revert to the old behavior.
+CHOP_DAMPENER_ENABLED = os.getenv("INTEL_CHOP_DAMPENER", "1") == "1"
 
 # WS3 tunables (replay-validated thresholds, see replay_summary §WS3+WS4 tuning)
 SIMPLE_BREADTH_THRESHOLD_SCORE = 0.75   # narrowness_score threshold

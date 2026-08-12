@@ -313,14 +313,13 @@ class CrossAssetAdapter(StrategyAdapter):
                 order_request.client_order_id = client_oid
                 log.info(f"[XASSET] Generated synthetic order ID: {client_oid}")
 
-            # Estimate notional
-            notional = 0.0
-            try:
-                pos = self._trading.get_open_position(symbol)
-                price = float(pos.current_price)
-                notional = qty * price
-            except Exception:
-                notional = qty * 100  # conservative fallback
+            # Estimate notional via real price lookup. The old qty*100 fallback
+            # caused the Aug-2026 DBA loop: a new-position BUY of ~$290 of DBA
+            # (~$28/share) was estimated at $1,039, falsely rejected against the
+            # sleeve every 5 minutes, cycling the circuit breaker indefinitely
+            # and freezing CROSSASSET rebalancing.
+            from adapters.base import estimate_order_notional
+            notional = estimate_order_notional(self._trading, symbol, qty, order_request)
 
             # Validate entry orders (exits always allowed)
             if "buy" in side.lower():

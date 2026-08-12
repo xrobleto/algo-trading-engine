@@ -62,6 +62,9 @@ class EngineConfig:
     # Cross-sleeve correlated-exposure guard (prevents hidden beta stacking across sleeves)
     correlation_guard_enabled: bool = True
     correlation_cap: float = 1.25       # max net risk-on exposure (× total equity) across ALL sleeves
+    cluster_cap: float = 0.50           # max gross beta-weighted exposure per correlated CLUSTER
+                                        # (× equity). Aug-2026 audit: −$590 semis loss occurred entirely
+                                        # under the net-beta cap; concentration must be capped per-cluster.
 
     # Engine loop timing
     tick_interval_sec: float = 5.0       # main loop sleep
