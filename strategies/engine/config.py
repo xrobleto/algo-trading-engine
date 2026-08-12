@@ -135,9 +135,28 @@ def build_default_config() -> EngineConfig:
         "UUP", "FXE", "FXY",
     }
 
+    # HORIZON reserve sleeve (2026-08-12): capital carved out for the Horizon
+    # engine's 30-day live validation (PULSE+ROTATION — the only strategies to
+    # pass a pre-registered faithful walk-forward bar). Horizon runs as a
+    # SEPARATE Railway service on THIS account, capped by HORIZON_CAPITAL_CAP.
+    # This sleeve has NO adapter — it exists so (a) the reconciler classifies
+    # Horizon's HZN_* orders/positions instead of kill-switching on them, and
+    # (b) the allocation is reserved away from TREND/CROSSASSET sizing.
+    # Horizon trades index-equivalent ETFs the unified sleeves never touch.
+    horizon_sleeve = SleeveConfig(
+        strategy_id="HORIZON",
+        allocation_pct=0.20,
+        order_prefix="HZN_",
+        known_symbols={"QQQM", "IEFA", "VGLT", "IAU", "PDBC", "SHV"},
+        max_positions=None,
+        max_daily_loss_pct=1.0,     # not engine-enforced; Horizon has its own risk layer
+        probation=False,
+        auto_halt_on_anomaly=False,
+    )
+
     trend_sleeve = SleeveConfig(
         strategy_id="TREND",
-        allocation_pct=0.80,        # 2026-06-16: +0.05 from parked SIMPLE (proven live: PF 1.44, +$127). Was 0.75 (raised 0.65->0.75 on 06-02).
+        allocation_pct=0.60,        # 2026-08-12: 0.80->0.60, funding the HORIZON live-validation reserve. (History: 0.75->0.80 on 06-16; cumulative live PF 0.56 — see engine_audit_2026-08-12.md.)
         order_prefix="ENG_TREND_",
         legacy_prefixes=("TBOT_",),
         known_symbols=trend_known_symbols,
@@ -178,12 +197,14 @@ def build_default_config() -> EngineConfig:
         auto_halt_on_anomaly=False,
     )
 
-    # Allocation check: 0.80 (TREND) + 0.00 (SIMPLE parked) + 0.17 (CROSSASSET) + 0.03 (cash) = 1.00
+    # Allocation check: 0.60 (TREND) + 0.00 (SIMPLE parked) + 0.17 (CROSSASSET)
+    #                   + 0.20 (HORIZON reserve) + 0.03 (cash) = 1.00
     config = EngineConfig(
         sleeves={
             "TREND": trend_sleeve,
             "SIMPLE": simple_sleeve,
             "CROSSASSET": crossasset_sleeve,
+            "HORIZON": horizon_sleeve,
         },
         cash_reserve_pct=0.03,      # Reduced from 0.05 to fund CROSSASSET
         live_trading=os.getenv("LIVE_TRADING", "0") == "1",

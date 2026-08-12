@@ -147,6 +147,15 @@ def run_cycle(broker, strategies, cfg, ledger, kill_switch, alerter,
             log.warning("broker unavailable (%s) — modeled equity, dry-run", exc)
             broker, dry_run = None, True
 
+    # Shared-account carve-out: when Horizon coexists with the Unified Engine on
+    # ONE live account, HORIZON_CAPITAL_CAP bounds the equity Horizon sizes
+    # against (the Unified Engine reserves the same amount via its HORIZON
+    # sleeve). Without this, both engines would deploy against the full account.
+    _cap = float(os.getenv("HORIZON_CAPITAL_CAP", "0") or 0)
+    if _cap > 0 and equity > _cap:
+        log.info("capital cap: account equity $%.0f -> capped at $%.0f", equity, _cap)
+        equity = _cap
+
     # Reconcile the ledger against broker truth (read-only-safe; runs in
     # dry-run too so orphans surface during testing).
     orphan_symbols: set = set()

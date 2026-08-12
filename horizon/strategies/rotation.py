@@ -15,9 +15,12 @@ from __future__ import annotations
 from typing import List, Optional, Sequence
 
 from .base import NEXT_OPEN, Decision, MarketView, Strategy
+from ..data import universe as _universe
 
-RISK_ASSETS = ["QQQ", "EFA", "TLT", "GLD", "DBC"]
-CASH_ASSET = "BIL"
+# Sourced from data.universe (single symbol registry) so live symbol-equivalents
+# mode propagates (see universe.py). Defaults unchanged for backtests.
+RISK_ASSETS = list(_universe.ROTATION_ASSETS)
+CASH_ASSET = _universe.ROTATION_CASH_ASSET
 
 DEFAULT_LOOKBACKS = (63, 126, 252)   # ~3, 6, 12 months
 DEFAULT_TOP_N = 2

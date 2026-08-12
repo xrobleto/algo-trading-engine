@@ -43,8 +43,30 @@ BENCHMARK = "QQQ"
 
 # Sector ETFs (used for the broad/sector slippage split).
 SECTOR_ETFS = {"XLK", "XLF", "XLV", "XLY", "XLE", "XLI", "SMH", "DBC", "GLD",
-               "EFA", "TLT", "HYG", "LQD", "RSP"}
-BROAD_ETFS = {"SPY", "QQQ", "IWM", "DIA", "IEF", "BIL"}
+               "EFA", "TLT", "HYG", "LQD", "RSP",
+               # live-equivalents (see below)
+               "IEFA", "VGLT", "IAU", "PDBC"}
+BROAD_ETFS = {"SPY", "QQQ", "IWM", "DIA", "IEF", "BIL", "QQQM", "SHV"}
+
+# --- Live symbol equivalents (HORIZON_SYMBOL_EQUIVALENTS=1) ------------------
+# When Horizon trades the SAME live account as the Unified Engine, the two
+# engines must never trade the same tickers — broker positions merge at the
+# account level and one engine would sell the other's shares. Deployed live,
+# Horizon therefore trades index-equivalent ETFs the Unified Engine never
+# touches (same underlying index/exposure, so the validation transfers):
+#   QQQ -> QQQM (same Nasdaq-100 index)   EFA -> IEFA (same developed-intl)
+#   TLT -> VGLT (long treasuries)          GLD -> IAU  (gold)
+#   DBC -> PDBC (broad commodities)        BIL -> SHV  (T-bill cash leg;
+#                                                TREND already uses SGOV/BIL)
+# Reference/regime symbols (SPY, RSP, HYG, ...) are read-only market data —
+# never traded — and stay unchanged. Backtests run with the flag OFF and keep
+# the deep-history originals.
+import os as _os
+if _os.getenv("HORIZON_SYMBOL_EQUIVALENTS", "0") == "1":
+    PULSE_RISK_ASSET = "QQQM"
+    PULSE_CASH_ASSET = "SHV"
+    ROTATION_ASSETS = ["QQQM", "IEFA", "VGLT", "IAU", "PDBC"]
+    ROTATION_CASH_ASSET = "SHV"
 
 
 def all_symbols() -> List[str]:

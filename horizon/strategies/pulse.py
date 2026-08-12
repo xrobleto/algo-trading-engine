@@ -23,9 +23,13 @@ from typing import List
 
 from . import indicators as ind
 from .base import NEXT_OPEN, Decision, MarketView, Strategy
+from ..data import universe as _universe
 
-RISK_ASSET = "QQQ"
-CASH_ASSET = "BIL"
+# Sourced from data.universe — the single symbol registry — so the live
+# symbol-equivalents mode (HORIZON_SYMBOL_EQUIVALENTS=1: QQQ->QQQM, BIL->SHV
+# for shared-account coexistence) propagates. Defaults are unchanged.
+RISK_ASSET = _universe.PULSE_RISK_ASSET
+CASH_ASSET = _universe.PULSE_CASH_ASSET
 
 # Documented default parameters (round numbers, not curve-fitted).
 DEFAULT_TREND_EMA = 105        # faster than the pre-2015 200-day norm
