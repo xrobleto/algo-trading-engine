@@ -337,8 +337,18 @@ def engine_main(trend_only: bool = False) -> None:
     elif _simple_parked:
         log.info("[STARTUP] SIMPLE parked (allocation 0, no open positions) — adapter skipped")
 
-    # Cross-Asset adapter (unless trend-only mode)
-    if not trend_only:
+    # Cross-Asset adapter (unless trend-only mode). Same parked-skip as SIMPLE:
+    # a sleeve at 0 allocation with no open positions gets no adapter (CP1: the
+    # CROSSASSET book is flattened before its allocation is zeroed).
+    _xasset_cfg = config.sleeves.get("CROSSASSET")
+    _xasset_parked = (
+        _xasset_cfg is not None
+        and _xasset_cfg.allocation_pct <= 0.0
+        and ledger.count_active_positions("CROSSASSET") == 0
+    )
+    if not trend_only and _xasset_parked:
+        log.info("[STARTUP] CROSSASSET parked (allocation 0, no open positions) — adapter skipped")
+    if not trend_only and not _xasset_parked:
         try:
             from adapters.cross_asset_adapter import CrossAssetAdapter
             crossasset_adapter = CrossAssetAdapter(
