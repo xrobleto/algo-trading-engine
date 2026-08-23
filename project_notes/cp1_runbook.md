@@ -81,3 +81,36 @@ cash → failed orders or unintended margin. Correct sequence:
   2. TREND sells down 0.60→0.20 at its next weekly rebalance (Friday) → frees ≈ $2,700
   3. THEN set `HORIZON_CAPITAL_CAP=2600` and redeploy horizon-live
 Until then Horizon stays at the $1,290 cap and simply holds — no harm, no failed orders.
+
+---
+
+## CP2 EXECUTION LOG — 2026-08-23
+
+**Evidence: CLEAN.** Scorecard 5/5 — 14 HZN orders all terminal, fill quality **−28.8 bps** avg
+(better than prior close), universe contained, no cross-engine contamination, gross $1,257 ≤ cap.
+Horizon: 0 tracebacks/CRITICAL/kill/conflict across ~9 weekday cycles. Engine: 0 unclassified,
+0 conflicts.
+
+**Deployed (commit d0e097b):** `Sleeves: TREND=0%, SIMPLE=0%, CROSSASSET=0%, HORIZON=60%, cash=40%`
+— startup line now reads `Strategies: HORIZON`. TREND RETIRED. main.py parked-skip generalized to
+TREND; startup 'Strategies:' line derives from nonzero sleeves.
+
+**HORIZON_CAPITAL_CAP raised 1290 -> 3850** (~95% of the 0.60 sleeve; 5% buffer for regime tilts).
+Funded by the $3,666 cash TREND's sell-down freed — verified fundable BEFORE setting
+(needs +$2,593, cash $3,666). horizon-live restarted; **takes effect at the next weekday
+09:00 ET cycle**, scaling Horizon $1,257 -> ~$3,850.
+
+**Consolidation note:** the user asked for "raise the cap" and "run CP2" together. Raising to the
+CP1-era $2,600 and then immediately to $3,850 would have caused two rebalances / double turnover,
+so the cap was set once directly to its CP2 level.
+
+**STILL REQUIRES THE USER — residual books to liquidate (trade execution; assistant does not
+place orders).** Both sleeves are at $0 allocation so **neither can buy**; only sells remain:
+- **TREND: CIBR ~$401, IBB ~$56, XBI ~$512 (SGOV ~$0)  ≈ $969**
+- **CROSSASSET: DBA ~$295, DBC ~$197, TBT ~$289, USO ~$99  ≈ $881**
+Do NOT sell QQQM / PDBC (Horizon). Until these are flat, both adapters still load (parked-skip
+requires 0 positions) and run harmlessly on $0 sleeves. Once flat, the next restart skips both and
+`Active strategies` becomes empty — the engine becomes a pure capital-reservation layer for Horizon.
+
+**CP3 (~Sep 25, full G1–G4):** HORIZON 0.75–0.80 + book_leverage 1.4–1.8x (`horizon/config.py`),
+cap raised to match. Needs a user yes/no.
