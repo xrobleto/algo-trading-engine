@@ -175,7 +175,8 @@ def engine_main(trend_only: bool = False) -> None:
     validate_config(config)
 
     mode = "LIVE" if config.live_trading else "PAPER"
-    strategies = "TREND only" if trend_only else "TREND + SIMPLE + CROSSASSET"
+    _active = [sid for sid, sc in config.sleeves.items() if sc.allocation_pct > 0]
+    strategies = "TREND only" if trend_only else (" + ".join(_active) if _active else "none (all sleeves retired)")
     log.info(f"Mode: {mode} | Strategies: {strategies}")
     log.info(f"Sleeves: " + ", ".join(
         f"{sid}={sc.allocation_pct:.0%}" for sid, sc in config.sleeves.items()
@@ -295,16 +296,28 @@ def engine_main(trend_only: bool = False) -> None:
     # -------------------------------------------------------------------------
     adapters = {}
 
-    # Trend adapter (always active)
-    from adapters.trend_adapter import TrendAdapter
-    trend_adapter = TrendAdapter(
-        config=config.sleeves["TREND"],
-        ledger=ledger,
-        sleeve_manager=sleeves,
+    # Trend adapter. Same parked-skip as SIMPLE/CROSSASSET: TREND was retired at
+    # CP2 (allocation 0) after failing faithful validation. While it still holds a
+    # residual book the adapter loads so those positions can be managed/flattened;
+    # once flat, it is skipped entirely.
+    _trend_cfg = config.sleeves.get("TREND")
+    _trend_parked = (
+        _trend_cfg is not None
+        and _trend_cfg.allocation_pct <= 0.0
+        and ledger.count_active_positions("TREND") == 0
     )
-    trend_ctx = sleeves.get_context("TREND", ledger)
-    trend_adapter.initialize(trend_ctx)
-    adapters["TREND"] = trend_adapter
+    if _trend_parked:
+        log.info("[STARTUP] TREND parked (allocation 0, no open positions) — adapter skipped")
+    else:
+        from adapters.trend_adapter import TrendAdapter
+        trend_adapter = TrendAdapter(
+            config=config.sleeves["TREND"],
+            ledger=ledger,
+            sleeve_manager=sleeves,
+        )
+        trend_ctx = sleeves.get_context("TREND", ledger)
+        trend_adapter.initialize(trend_ctx)
+        adapters["TREND"] = trend_adapter
 
     # Simple adapter (unless trend-only mode). Skip entirely when the sleeve is PARKED
     # (allocation 0) and holds no positions — otherwise a parked sleeve keeps running its

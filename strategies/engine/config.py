@@ -145,7 +145,7 @@ def build_default_config() -> EngineConfig:
     # Horizon trades index-equivalent ETFs the unified sleeves never touch.
     horizon_sleeve = SleeveConfig(
         strategy_id="HORIZON",
-        allocation_pct=0.40,        # CP1 (~2026-08-19, pre-approved): 0.20 -> 0.40 on clean first-week evidence. Raise HORIZON_CAPITAL_CAP to ~$2,600 in lockstep.
+        allocation_pct=0.60,        # CP2 (2026-08-23): 0.40 -> 0.60 on a clean second checkpoint (14 HZN fills, 0 conflicts). HORIZON_CAPITAL_CAP raised to $3,850 (~95% of sleeve) in lockstep. (CP1 had taken 0.20 -> 0.40.)
         order_prefix="HZN_",
         known_symbols={"QQQM", "IEFA", "VGLT", "IAU", "PDBC", "SHV"},
         max_positions=None,
@@ -156,7 +156,7 @@ def build_default_config() -> EngineConfig:
 
     trend_sleeve = SleeveConfig(
         strategy_id="TREND",
-        allocation_pct=0.20,        # CP1 (pre-approved): 0.60 -> 0.20. TREND FAILED faithful validation (trend_faithful_verdict_2026-08-12.md: ~-1.6% chained 2019-2026 vs SPY +140%, 4/5 criteria failed). Full retirement at CP2.
+        allocation_pct=0.00,        # CP2 (2026-08-23): RETIRED. Failed faithful validation (trend_faithful_verdict_2026-08-12.md: ~-1.6% chained 2019-2026 vs SPY +140%; 4/5 criteria failed) and cumulative live PF 0.56. Registered at $0 so a residual book can still be flattened; adapter skips once flat. Flip back to a nonzero value only with new validated evidence.
         order_prefix="ENG_TREND_",
         legacy_prefixes=("TBOT_",),
         known_symbols=trend_known_symbols,
@@ -197,9 +197,9 @@ def build_default_config() -> EngineConfig:
         auto_halt_on_anomaly=False,
     )
 
-    # CP1 allocation check: 0.20 (TREND, retiring) + 0.00 (SIMPLE parked)
-    #   + 0.00 (CROSSASSET retired) + 0.40 (HORIZON) + 0.40 (cash: 0.03 base
-    #   + 0.37 parked pending CP2/CP3 scale-up into Horizon) = 1.00
+    # CP2 allocation check: 0.00 (TREND retired) + 0.00 (SIMPLE parked)
+    #   + 0.00 (CROSSASSET retired) + 0.60 (HORIZON — the only validated
+    #   strategies) + 0.40 (cash, rolls into HORIZON at CP3) = 1.00
     config = EngineConfig(
         sleeves={
             "TREND": trend_sleeve,
@@ -207,7 +207,7 @@ def build_default_config() -> EngineConfig:
             "CROSSASSET": crossasset_sleeve,
             "HORIZON": horizon_sleeve,
         },
-        cash_reserve_pct=0.40,      # 0.03 base + 0.37 parked (CP1; rolls into HORIZON at CP2/CP3)
+        cash_reserve_pct=0.40,      # parked; rolls into HORIZON at CP3 (0.75-0.80 core + book leverage)
         live_trading=os.getenv("LIVE_TRADING", "0") == "1",
         live_confirmation=os.getenv("I_UNDERSTAND_LIVE_TRADING", ""),
     )
