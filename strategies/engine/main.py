@@ -148,6 +148,24 @@ def log_heartbeat(
 # MAIN ENGINE
 # =============================================================================
 
+# A retired sleeve is "parked" when its allocation is 0 AND it holds nothing of
+# consequence. Liquidations routinely leave sub-dollar dust (fractional-share
+# residue, e.g. SGOV $0.09 / XLK $0.01 after the CP1/CP2 retirements), which
+# would otherwise keep a dead adapter loading forever.
+PARKED_DUST_USD = 5.0
+
+
+def _sleeve_parked(config, ledger, strategy_id: str) -> bool:
+    sc = config.sleeves.get(strategy_id)
+    if sc is None or sc.allocation_pct > 0.0:
+        return False
+    try:
+        gross = sum(abs(n) for (_s, n, _sid) in ledger.active_positions(strategy_id))
+    except Exception:
+        gross = 0.0 if ledger.count_active_positions(strategy_id) == 0 else float("inf")
+    return gross <= PARKED_DUST_USD
+
+
 def engine_main(trend_only: bool = False) -> None:
     """
     Main engine loop.
@@ -300,14 +318,9 @@ def engine_main(trend_only: bool = False) -> None:
     # CP2 (allocation 0) after failing faithful validation. While it still holds a
     # residual book the adapter loads so those positions can be managed/flattened;
     # once flat, it is skipped entirely.
-    _trend_cfg = config.sleeves.get("TREND")
-    _trend_parked = (
-        _trend_cfg is not None
-        and _trend_cfg.allocation_pct <= 0.0
-        and ledger.count_active_positions("TREND") == 0
-    )
+    _trend_parked = _sleeve_parked(config, ledger, "TREND")
     if _trend_parked:
-        log.info("[STARTUP] TREND parked (allocation 0, no open positions) — adapter skipped")
+        log.info("[STARTUP] TREND parked (allocation 0, no material positions) — adapter skipped")
     else:
         from adapters.trend_adapter import TrendAdapter
         trend_adapter = TrendAdapter(
@@ -323,12 +336,7 @@ def engine_main(trend_only: bool = False) -> None:
     # (allocation 0) and holds no positions — otherwise a parked sleeve keeps running its
     # scanner/WebSocket/Polygon calls on the live box for no benefit. If it ever holds a
     # residual position, the adapter still loads so it can manage/flatten it.
-    _simple_cfg = config.sleeves.get("SIMPLE")
-    _simple_parked = (
-        _simple_cfg is not None
-        and _simple_cfg.allocation_pct <= 0.0
-        and ledger.count_active_positions("SIMPLE") == 0
-    )
+    _simple_parked = _sleeve_parked(config, ledger, "SIMPLE")
     if not trend_only and not _simple_parked:
         try:
             from adapters.simple_adapter import SimpleAdapter
@@ -348,19 +356,14 @@ def engine_main(trend_only: bool = False) -> None:
             log.warning("[STARTUP] Continuing with trend-only")
             traceback.print_exc()
     elif _simple_parked:
-        log.info("[STARTUP] SIMPLE parked (allocation 0, no open positions) — adapter skipped")
+        log.info("[STARTUP] SIMPLE parked (allocation 0, no material positions) — adapter skipped")
 
     # Cross-Asset adapter (unless trend-only mode). Same parked-skip as SIMPLE:
     # a sleeve at 0 allocation with no open positions gets no adapter (CP1: the
     # CROSSASSET book is flattened before its allocation is zeroed).
-    _xasset_cfg = config.sleeves.get("CROSSASSET")
-    _xasset_parked = (
-        _xasset_cfg is not None
-        and _xasset_cfg.allocation_pct <= 0.0
-        and ledger.count_active_positions("CROSSASSET") == 0
-    )
+    _xasset_parked = _sleeve_parked(config, ledger, "CROSSASSET")
     if not trend_only and _xasset_parked:
-        log.info("[STARTUP] CROSSASSET parked (allocation 0, no open positions) — adapter skipped")
+        log.info("[STARTUP] CROSSASSET parked (allocation 0, no material positions) — adapter skipped")
     if not trend_only and not _xasset_parked:
         try:
             from adapters.cross_asset_adapter import CrossAssetAdapter
