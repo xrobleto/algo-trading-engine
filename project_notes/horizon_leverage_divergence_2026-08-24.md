@@ -59,3 +59,26 @@ sleeves that can actually trade, so this cannot silently recur if the admitted s
 Earlier gate notes stated "book leverage 1.0× during the gate." That was an unverified
 assumption — the value has been 1.5× (diluted to ~1.03× effective) since Horizon went live
 on 2026-08-12. Corrected here.
+
+---
+
+## RESOLVED 2026-08-24 (commit 0b420ad, deployed)
+User approved the fix. Applied exactly as proposed:
+- `horizon/config.py`: REVERT + DRIFT `enabled=False`, `base_allocation=0.0`;
+  PULSE 0.642857 / ROTATION 0.357143 (0.45:0.25 ratio preserved). Pre-gate values kept
+  in comments.
+- `horizon/engine/main.py`: `ADMITTED_SLEEVES` now DERIVED from the config `enabled`
+  flags — config is the single source of truth for both trading set and weighting, so
+  this class of drift cannot recur silently.
+- `utilities/horizon_checkpoint.py`: C5 made leverage-aware (gross vs
+  `cap x book_leverage x 1.05`); otherwise every checkpoint above 1.0x would have
+  false-alarmed DIRTY.
+
+Verified: horizon tests 10/10; target book at the $3,850 cap moved
+$3,961 (1.03x) -> **$5,692 (1.48x)**; needs +$1,687 of $2,705 cash (no margin —
+account-level exposure ~85%, ~$1,018 cash left). Scorecard re-run after deploy: 5/5 CLEAN
+(C5 now reads `gross $4,003 <= $6,064 (cap $3,850 x 1.50x)`).
+
+**The scale-up executes at the next weekday 09:00 ET cycle** (today's had already run;
+the engine records the cycle date to avoid double-running). Expect QQQM ~$4,776 and
+PDBC ~$916 after it converges — watch the first cycle for order count and fill quality.
