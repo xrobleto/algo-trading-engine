@@ -79,15 +79,30 @@ def build_default_config() -> EngineConfig:
     and DRIFT are diversifiers. After validation, only sleeves that clear the
     gating bar receive capital and the weights renormalize across them.
     """
+    # 2026-08-24: REVERT and DRIFT were REJECTED by validation, but were left
+    # `enabled` with 30% of the base allocation between them. Because
+    # engine/sleeves.py:budgets() normalizes weights across every ENABLED sleeve
+    # while only the admitted sleeves actually trade, that 30% was computed and
+    # then never deployed — silently diluting book_leverage 1.5 to ~1.03x
+    # effective and leaving ~$1,773 idle (see
+    # project_notes/horizon_leverage_divergence_2026-08-24.md).
+    #
+    # The fix mirrors what the validation itself did (run_validation.py composes
+    # the frontier from admitted sleeves only, renormalized): disable the rejected
+    # sleeves and renormalize the admitted pair, preserving their 0.45:0.25 ratio.
+    #   PULSE    0.45 / 0.70 = 0.642857
+    #   ROTATION 0.25 / 0.70 = 0.357143
+    # Their post-rejection base allocations are kept in comments so the original
+    # risk-budget reasoning is not lost if either is ever revalidated.
     sleeves = {
-        "PULSE": SleeveConfig("PULSE", "HZN_PULSE_", base_allocation=0.45,
-                              max_positions=1),
-        "ROTATION": SleeveConfig("ROTATION", "HZN_ROT_", base_allocation=0.25,
-                                 max_positions=2),
-        "REVERT": SleeveConfig("REVERT", "HZN_REV_", base_allocation=0.20,
-                               max_positions=4),
-        "DRIFT": SleeveConfig("DRIFT", "HZN_DRIFT_", base_allocation=0.10,
-                              max_positions=1),
+        "PULSE": SleeveConfig("PULSE", "HZN_PULSE_", base_allocation=0.642857,
+                              max_positions=1),                      # pre-gate: 0.45
+        "ROTATION": SleeveConfig("ROTATION", "HZN_ROT_", base_allocation=0.357143,
+                                 max_positions=2),                   # pre-gate: 0.25
+        "REVERT": SleeveConfig("REVERT", "HZN_REV_", base_allocation=0.0,
+                               max_positions=4, enabled=False),      # REJECTED (A2: Sharpe 0.06); pre-gate 0.20
+        "DRIFT": SleeveConfig("DRIFT", "HZN_DRIFT_", base_allocation=0.0,
+                              max_positions=1, enabled=False),       # REJECTED (A1/A2/A3); pre-gate 0.10
     }
     cfg = EngineConfig(sleeves=sleeves)
     _validate(cfg)

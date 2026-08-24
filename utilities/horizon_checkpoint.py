@@ -129,8 +129,23 @@ def main():
         not (set(hzn_pos) & UNIFIED_SYMBOLS) and
         not any(o["symbol"] in UNIFIED_SYMBOLS for o in hzn),
         "HZN book and orders disjoint from unified universe")
-    checks["C5 capital cap respected"] = (gross <= cap * 1.05,
-                                          f"gross ${gross:,.0f} <= cap*1.05 ${cap*1.05:,.0f}")
+    # C5 must account for book leverage: HORIZON_CAPITAL_CAP bounds the EQUITY
+    # BASIS Horizon sizes against, and book_leverage multiplies gross exposure on
+    # top of it. Comparing gross to the raw cap would false-alarm at any leverage
+    # above 1.0 (it did, after the 2026-08-24 dilution fix took effective leverage
+    # from ~1.03x to ~1.48x).
+    try:
+        import sys as _sys
+        _sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+        from horizon.config import build_default_config as _hcfg
+        book_lev = float(_hcfg().book_leverage)
+    except Exception:
+        book_lev = 1.0
+    lev_cap = cap * book_lev
+    checks["C5 capital cap respected"] = (
+        gross <= lev_cap * 1.05,
+        f"gross ${gross:,.0f} <= cap*book_leverage*1.05 ${lev_cap*1.05:,.0f} "
+        f"(cap ${cap:,.0f} x {book_lev:.2f}x)")
 
     print("\n=== CHECKPOINT SCORECARD ===")
     all_ok = True

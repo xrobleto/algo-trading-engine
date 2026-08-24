@@ -40,7 +40,13 @@ from .sleeves import SleeveManager
 log = logging.getLogger("horizon.engine")
 
 # Only the sleeves that cleared the validation gating bar trade live.
-ADMITTED_SLEEVES = ["PULSE", "ROTATION"]
+# DERIVED from the config's `enabled` flags so the trading set and the capital
+# weighting can never drift apart. They did drift once (2026-08-24): REVERT and
+# DRIFT stayed `enabled` after being rejected, so budgets() normalized 30% of the
+# book onto sleeves that never trade, quietly diluting book_leverage 1.5 to ~1.03x
+# effective. Deriving it makes config the single source of truth for BOTH.
+ADMITTED_SLEEVES = [sid for sid, sc in build_default_config().sleeves.items()
+                    if sc.enabled]
 
 MIN_ORDER_USD = 1.0
 DAILY_RUN_HOUR_ET = 9      # run once per weekday at 09:00 ET, before the open
