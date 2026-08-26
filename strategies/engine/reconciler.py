@@ -99,6 +99,56 @@ def classify_position_by_orders(
     return None
 
 
+# Re-marks below this move too little to be worth a ledger write or a log line.
+REMARK_TOLERANCE_USD = 1.0
+
+
+def _remark_to_broker(entries, symbol: str, strategy_id: str, pos: dict) -> None:
+    """Re-mark a tracked position's ledger entries to the broker's market value.
+
+    Ledger entries were create-only: once a symbol was registered, later
+    reconciles saw it in `get_active_symbols()` and skipped it, so its recorded
+    dollars stayed frozen at whatever they were when the entry was born. That is
+    survivable for a sleeve that trades its own book — its adapter registers a
+    fresh entry per order — but wrong for one whose positions are grown by a
+    SEPARATE service. HORIZON is exactly that: horizon-live scaled QQQM+PDBC
+    from ~$1.2k to ~$5.7k across the 2026-08-24/25 cycles while this engine went
+    on reporting the adoption-time $1,272, understating deployment by ~$4.5k and
+    correspondingly overstating free sleeve capital.
+
+    Harmless while every homegrown sleeve is parked at 0% and nothing consumes
+    the number, but it is the input to `SleeveManager.can_open()` — a sleeve
+    revived against these figures would size against capital that is already
+    spent. So: keep the ledger marked, whoever did the trading.
+
+    The broker reports one position per symbol; the ledger may hold several
+    entries for it (one per scale-in order). Split the mark across them in
+    proportion to their current exposure so the sum matches the broker and no
+    entry's relative weight changes. `notional_at_entry` and `fill_price` are
+    left alone — they are cost basis, and callers read them as such.
+    """
+    broker_mv = abs(float(pos.get("market_value", 0)))
+    current = sum(e.exposure for e in entries)
+    if abs(current - broker_mv) <= REMARK_TOLERANCE_USD:
+        return
+
+    weights = [e.exposure for e in entries]
+    total = sum(weights)
+    if total <= 0:
+        # No basis to split on (zero-notional entries) — divide evenly.
+        weights = [1.0] * len(entries)
+        total = float(len(entries))
+
+    for entry, w in zip(entries, weights):
+        entry.market_value = broker_mv * (w / total)
+
+    log.info(
+        f"[RECONCILE] {symbol}: re-marked {strategy_id} exposure "
+        f"${current:,.2f} -> ${broker_mv:,.2f} across {len(entries)} entr"
+        f"{'y' if len(entries) == 1 else 'ies'}"
+    )
+
+
 # =============================================================================
 # MAIN RECONCILIATION
 # =============================================================================
@@ -340,16 +390,29 @@ def reconcile(
             entry.closed_at = result.timestamp
             log.info(f"[RECONCILE] {entry.symbol}: position gone at broker — marking closed")
 
-    # Add classified positions that aren't in the existing ledger yet
+    # Sync classified broker positions into the ledger. Two cases: a position we
+    # already track gets re-marked to broker truth, one we don't gets a synthetic
+    # entry. The re-mark is the point — see _remark_to_broker.
     for pos in result.broker_positions:
         symbol = pos["symbol"]
         strategy_id = result.classified_positions.get(symbol)
         if not strategy_id:
             continue  # unclassified — don't add to ledger
 
-        existing_symbols = existing_ledger.get_active_symbols(strategy_id)
-        if symbol in existing_symbols:
-            continue  # already tracked
+        held = [
+            e for e in existing_ledger.entries.values()
+            if e.symbol == symbol
+            and e.strategy_id == strategy_id
+            and e.status in ("filled", "partially_filled")
+        ]
+        if held:
+            _remark_to_broker(held, symbol, strategy_id, pos)
+            continue
+
+        if symbol in existing_ledger.get_active_symbols(strategy_id):
+            # Only a pending order so far — Step 3.5 owns promoting it. Adding a
+            # synthetic here would double-count the same position.
+            continue
 
         synthetic_coid = f"RECONCILE_{strategy_id}_{symbol}_{result.timestamp}"
         existing_ledger.register_order(
@@ -362,9 +425,12 @@ def reconcile(
         )
         existing_ledger.update_status(synthetic_coid, "filled",
                                       fill_price=float(pos.get("avg_entry_price", 0)))
+        existing_ledger.entries[synthetic_coid].market_value = abs(
+            float(pos.get("market_value", 0))
+        )
         log.info(
             f"[RECONCILE] {symbol}: added synthetic ownership entry -> {strategy_id} "
-            f"(qty={pos['qty']}, mv=${pos.get('market_value', 0):,.2f})"
+            f"(qty={pos['qty']}, mv=${float(pos.get('market_value', 0) or 0):,.2f})"
         )
 
     result.ownership_snapshot = existing_ledger

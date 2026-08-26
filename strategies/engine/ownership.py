@@ -37,6 +37,12 @@ class OwnershipEntry:
     fill_price: Optional[float] = None
     fill_qty: Optional[float] = None
     closed_at: Optional[str] = None
+    # Last broker-observed market value of this entry's share of the position,
+    # refreshed by every reconcile. Deliberately NOT folded into
+    # `notional_at_entry`: that field is COST BASIS and callers depend on it as
+    # such (trend_adapter.py recovers an entry price via notional/qty), so live
+    # exposure needs a field of its own. None until a reconcile has seen it.
+    market_value: Optional[float] = None
 
     def __post_init__(self):
         if not self.registered_at:
@@ -49,6 +55,22 @@ class OwnershipEntry:
     @property
     def is_active(self) -> bool:
         return self.status in ("pending", "filled", "partially_filled")
+
+    @property
+    def exposure(self) -> float:
+        """Dollars currently deployed by this entry.
+
+        Broker-observed market value when a reconcile has supplied one,
+        otherwise the cost basis recorded at entry. Entry cost is only a
+        proxy for exposure: it is correct the moment an order fills and
+        drifts thereafter, and it never moves at all for a position that a
+        SEPARATE service keeps adding to (the engine's own reconcile is the
+        only thing that would notice). Sleeve accounting wants what is at
+        risk now, so prefer the mark.
+        """
+        if self.market_value is not None:
+            return self.market_value
+        return self.notional_at_entry
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -202,7 +224,7 @@ class OwnershipLedger:
                 continue
             if strategy_id and e.strategy_id != strategy_id:
                 continue
-            signed = e.notional_at_entry if e.side.lower() == "buy" else -e.notional_at_entry
+            signed = e.exposure if e.side.lower() == "buy" else -e.exposure
             out.append((e.symbol, signed, e.strategy_id))
         return out
 
@@ -211,8 +233,9 @@ class OwnershipLedger:
         return len({e.symbol for e in self.get_filled_entries(strategy_id)})
 
     def get_deployed_notional(self, strategy_id: str) -> float:
-        """Calculate total deployed notional for a strategy from filled entries."""
-        return sum(e.notional_at_entry for e in self.get_filled_entries(strategy_id))
+        """Total dollars a strategy currently has deployed, marked to broker
+        truth where a reconcile has provided it (see `OwnershipEntry.exposure`)."""
+        return sum(e.exposure for e in self.get_filled_entries(strategy_id))
 
     def is_symbol_owned_by_other(self, symbol: str, strategy_id: str) -> bool:
         """Check if symbol has active entries under a DIFFERENT strategy."""
