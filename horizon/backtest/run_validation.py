@@ -41,9 +41,14 @@ IS = ("2008-01-02", "2017-12-29")
 OOS = ("2018-01-02", END)
 EQ = 100_000.0
 
-# Per-strategy constructor kwargs. BASELINE is the validated 2026-05 engine;
-# CANDIDATE is the 2026-09-05 audit proposal. Selected by --candidate.
-BASELINE: Dict[str, dict] = {"PULSE": {}, "ROTATION": {}, "REVERT": {}, "DRIFT": {}}
+# Per-strategy constructor kwargs. BASELINE is whatever config.py says trades
+# live (single source of truth); LEGACY is the original 2026-05 margin
+# configuration kept for comparison; CANDIDATE is the 2026-09-05 audit
+# proposal (its tv0.22 sub-variant became BASELINE at CP3).
+BASELINE: Dict[str, dict] = {
+    sid: dict(build_default_config().strategy_params.get(sid, {}))
+    for sid in ("PULSE", "ROTATION", "REVERT", "DRIFT")}
+LEGACY: Dict[str, dict] = {"PULSE": {}, "ROTATION": {}, "REVERT": {}, "DRIFT": {}}
 CANDIDATE: Dict[str, dict] = {
     "PULSE": {"target_vol": 0.30, "leverage_via": "levered_etf"},
     "ROTATION": {"lookbacks": (47, 95, 189)},
@@ -147,20 +152,25 @@ def main() -> None:
     ap = argparse.ArgumentParser(description="Horizon validation")
     ap.add_argument("--candidate", action="store_true",
                     help="validate the 2026-09-05 candidate parameters instead")
+    ap.add_argument("--legacy", action="store_true",
+                    help="validate the original 2026-05 margin configuration")
     ap.add_argument("--pulse-target-vol", type=float, default=None,
                     help="override PULSE target_vol (candidate sub-variant)")
     args = ap.parse_args()
+    cfg = build_default_config()
     PARAMS.clear()
-    PARAMS.update({k: dict(v) for k, v in (CANDIDATE if args.candidate else BASELINE).items()})
+    chosen = CANDIDATE if args.candidate else (LEGACY if args.legacy else BASELINE)
+    PARAMS.update({k: dict(v) for k, v in chosen.items()})
     if args.pulse_target_vol is not None:
         PARAMS["PULSE"]["target_vol"] = args.pulse_target_vol
     out_name = "VALIDATION.md"
+    if args.legacy:
+        out_name = "VALIDATION_LEGACY_margin.md"
     if args.candidate:
         out_name = "VALIDATION_CANDIDATE.md"
         if args.pulse_target_vol is not None:
             out_name = f"VALIDATION_CANDIDATE_tv{args.pulse_target_vol:.2f}.md"
 
-    cfg = build_default_config()
     print("Loading dataset...")
     dataset = cache.load_dataset()
     md: List[str] = []
@@ -169,8 +179,14 @@ def main() -> None:
         md.append(s)
 
     line("# Horizon Engine — Validation Results"
-         + (" — CANDIDATE (2026-09-05 audit)" if args.candidate else ""))
+         + (" — CANDIDATE (2026-09-05 audit)" if args.candidate else "")
+         + (" — LEGACY 2026-05 margin configuration" if args.legacy else ""))
     line()
+    if not args.candidate and not args.legacy:
+        line("**Live parameters (config.py strategy_params):** "
+             + "; ".join(f"{k} {v}" for k, v in PARAMS.items() if v)
+             + f". book_leverage {cfg.book_leverage}.")
+        line()
     if args.candidate:
         line("**Candidate parameters (proposed after the 2026-09-05 audit, so this "
              "is a post-hoc selection judged against the unchanged pre-registered "

@@ -28,6 +28,14 @@ levered), or **QQQ + ~3-4pp** at a still-shallower drawdown (levered) — and
 +6.3pp out-of-sample. Two of the four candidate strategies (REVERT, DRIFT)
 failed their gating bar and are excluded; that is reported plainly.
 
+**Update 2026-09-05 (CP3):** the live configuration is now the no-margin
+"Candidate B" — PULSE expresses leverage above 1.0x as a QQQ/QLD mix (weights
+sum to 1.0) and ROTATION uses lookbacks (47, 95, 189). It cleared the same
+pre-registered bar at **19.3% CAGR, Sharpe 0.84, MaxDD −24.8%** at book
+leverage 1.0 — the margin table above is kept as the historical frontier
+(`run_validation --legacy` regenerates it). Live parameters live in
+`config.py: strategy_params`; the validation reads the same dict.
+
 Full results: [docs/VALIDATION.md](docs/VALIDATION.md). The reasoning, the
 architecture and the *pre-registered* gating bar: [docs/DESIGN.md](docs/DESIGN.md).
 

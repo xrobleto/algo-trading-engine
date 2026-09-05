@@ -182,6 +182,56 @@ def apply_gross_ceiling(account_target: Dict[str, float], ceiling: float):
     return {s: v * scale for s, v in account_target.items()}, scale
 
 
+CASH_BUFFER = 0.01          # keep 1% of cash back on buys (fill-price drift)
+SELL_FILL_WAIT_SEC = 30 * 60   # how long to wait for queued sells to fill
+SELL_POLL_SEC = 20
+
+
+def size_buys_to_cash(buys, cash: float, buffer: float = CASH_BUFFER):
+    """Scale a list of buy orders proportionally so their total notional fits
+    within `cash` x (1 - buffer). Returns new order dicts (qty and notional
+    scaled); untouched if they already fit."""
+    usable = max(0.0, float(cash)) * (1.0 - buffer)
+    need = sum(o["notional"] for o in buys)
+    if need <= usable or need <= 0:
+        return [dict(o) for o in buys]
+    scale = usable / need
+    out = []
+    for o in buys:
+        out.append({**o, "qty": round(o["qty"] * scale, 4),
+                    "notional": o["notional"] * scale})
+    return out
+
+
+def _wait_for_cash(broker, need: float, sells, log, max_wait: int = SELL_FILL_WAIT_SEC,
+                   poll: int = SELL_POLL_SEC) -> float:
+    """Return the account's cash once it covers `need` or once the queued
+    sells have all left the open-order book (filled/cancelled) or max_wait
+    elapses. Buys are sized to whatever cash is available at that point."""
+    sell_syms = {o["symbol"] for o in sells}
+    deadline = time.time() + max_wait
+    cash = 0.0
+    while True:
+        try:
+            cash = float(broker.get_account()["cash"])
+            if cash * (1.0 - CASH_BUFFER) >= need:
+                return cash
+            if sell_syms:
+                open_syms = {o.get("symbol") for o in broker.get_open_orders()}
+                if not (sell_syms & open_syms):
+                    return cash          # sells done; this is all the cash there is
+            else:
+                return cash              # nothing pending that could add cash
+        except Exception as exc:
+            log.warning("cash poll failed (%s)", exc)
+        if time.time() >= deadline:
+            log.warning("waited %ds for sells to fill; sizing buys to cash $%.0f",
+                        max_wait, cash)
+            return cash
+        log.info("waiting for sells to fill: cash $%.0f < need $%.0f", cash, need)
+        time.sleep(poll)
+
+
 def run_cycle(broker, strategies, cfg, ledger, kill_switch, alerter,
               dry_run: bool = True) -> dict:
     """Run one engine cycle: reconcile, decide, diff vs broker, submit (or log)."""
@@ -317,19 +367,40 @@ def run_cycle(broker, strategies, cfg, ledger, kill_switch, alerter,
                         "qty": round(abs(delta) / price, 4),
                         "notional": abs(delta)})
 
+    # Sells first, buys second. On a cash account (multiplier 1) buying power
+    # is settled+unsettled cash; a sell queued at 09:00 frees nothing until it
+    # fills at the open, so buys funded by that sell would be rejected at
+    # submission. Submit the sells, wait for them to fill, then size the buys
+    # to the cash the account actually has.
+    sells = [o for o in orders if o["side"] == "sell"]
+    buys = [o for o in orders if o["side"] == "buy"]
     submitted = 0
-    for o in orders:
+
+    def _submit(o):
         coid = (f"{cfg.order_namespace}_{o['symbol']}_{o['side']}_"
                 f"{int(time.time() * 1000)}")
-        if dry_run or broker is None:
+        result = broker.submit_market_order(o["symbol"], o["side"],
+                                            o["qty"], coid)
+        ledger.register_order("ENGINE", o["symbol"], o["side"], o["qty"],
+                              coid, result.get("id"), o["notional"])
+
+    if dry_run or broker is None:
+        for o in sells + buys:
             log.info("[DRY-RUN] %-4s %-5s qty=%.4f (~$%.0f)",
                      o["side"], o["symbol"], o["qty"], o["notional"])
-        else:
-            result = broker.submit_market_order(o["symbol"], o["side"],
-                                                o["qty"], coid)
-            ledger.register_order("ENGINE", o["symbol"], o["side"], o["qty"],
-                                  coid, result.get("id"), o["notional"])
+    else:
+        for o in sells:
+            _submit(o)
             submitted += 1
+        if buys:
+            need = sum(o["notional"] for o in buys)
+            cash = _wait_for_cash(broker, need, sells, log)
+            buys = size_buys_to_cash(buys, cash)
+            for o in buys:
+                if o["qty"] <= 0 or o["notional"] < MIN_ORDER_USD:
+                    continue
+                _submit(o)
+                submitted += 1
 
     ledger.save(state_dir() / _LEDGER_FILE)
 

@@ -52,10 +52,12 @@ class WithdrawalConfig:
 class EngineConfig:
     starting_equity: float = 7400.0
     benchmark: str = "QQQ"
-    # Book-level leverage on the diversified sleeve blend — the engine's main
-    # risk/return dial. 1.0 = unlevered; capped at ~2.0 (Alpaca Reg-T). The
-    # validation reports the full frontier so the user picks the point.
-    book_leverage: float = 1.5
+    # Book-level leverage on the diversified sleeve blend. 2026-09-05 (CP3):
+    # 1.0 — the live account has no margin (Alpaca multiplier 1) and PULSE now
+    # expresses leverage through QLD with weights summing to 1.0, so a book
+    # multiplier above 1.0 would request dollars the account cannot borrow.
+    # Validated frontier: docs/VALIDATION.md.
+    book_leverage: float = 1.0
     # 2008-01 start: BIL (T-bills ETF, the cash leg) launched 2007-05, so by
     # 2008 it has the history PULSE/ROTATION need. The window still spans the
     # 2008 GFC, 2011, 2015-16, 2018, 2020 crash, 2022 bear and 2023-26.
@@ -64,6 +66,10 @@ class EngineConfig:
     risk_free_annual: float = 0.04           # for Sharpe; the harness also uses BIL
 
     sleeves: Dict[str, SleeveConfig] = field(default_factory=dict)
+    # Constructor kwargs per strategy — THE single source of truth for the
+    # parameters that trade live. strategies/registry.py applies them, and
+    # backtest/run_validation.py validates exactly these (BASELINE).
+    strategy_params: Dict[str, dict] = field(default_factory=dict)
     cost: CostModel = field(default_factory=CostModel)
     withdrawal: WithdrawalConfig = field(default_factory=WithdrawalConfig)
 
@@ -104,7 +110,18 @@ def build_default_config() -> EngineConfig:
         "DRIFT": SleeveConfig("DRIFT", "HZN_DRIFT_", base_allocation=0.0,
                               max_positions=1, enabled=False),       # REJECTED (A1/A2/A3); pre-gate 0.10
     }
-    cfg = EngineConfig(sleeves=sleeves)
+    # 2026-09-05 (CP3, "Candidate B" — docs/VALIDATION.md): PULSE expresses
+    # leverage above 1.0x as a QQQ/QLD mix instead of margin; ROTATION uses the
+    # faster lookbacks that its own A6 robustness test had flagged as superior
+    # in-sample AND out-of-sample. Both cleared the unchanged pre-registered
+    # bar: engine 19.3% CAGR / Sharpe 0.84 / MaxDD -24.8% at book 1.0, versus
+    # 19.3% / 0.65 / -34.2% for the margin config at 1.5x — same return, a
+    # third less drawdown, no borrowing.
+    strategy_params = {
+        "PULSE": {"target_vol": 0.22, "leverage_via": "levered_etf"},
+        "ROTATION": {"lookbacks": (47, 95, 189)},
+    }
+    cfg = EngineConfig(sleeves=sleeves, strategy_params=strategy_params)
     _validate(cfg)
     return cfg
 

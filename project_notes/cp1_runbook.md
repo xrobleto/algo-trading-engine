@@ -114,3 +114,25 @@ requires 0 positions) and run harmlessly on $0 sleeves. Once flat, the next rest
 
 **CP3 (~Sep 25, full G1–G4):** HORIZON 0.75–0.80 + book_leverage 1.4–1.8x (`horizon/config.py`),
 cap raised to match. Needs a user yes/no.
+
+---
+
+## CP3 EXECUTION LOG — 2026-09-05 (brought forward on validated evidence)
+
+**Trigger:** the 2026-09-05 deep audit (horizon_stale_data_2026-09-05.md) found (a) the live engine had
+run on a frozen Aug-24 cache since restart, and (b) the account has NO margin (Alpaca multiplier 1),
+so the planned "0.75–0.80 at 1.4–1.8x" was unfundable. Instead of margin, PULSE now expresses leverage
+above 1.0x as a QQQ/QLD mix (weights sum to 1.0) and ROTATION uses its A6-superior faster lookbacks.
+This "Candidate B" cleared the unchanged pre-registered bar (horizon/docs/VALIDATION.md):
+19.3% CAGR / Sharpe 0.84 / MaxDD −24.8% at book 1.0 vs 19.3% / 0.65 / −34.2% for the margin config.
+User approved ("Go.") after the recommendation.
+
+**Deployed:** `Sleeves: TREND=0%, SIMPLE=0%, CROSSASSET=0%, HORIZON=100%, cash=0%`; QLD added to
+HORIZON known_symbols. Horizon: `book_leverage 1.0`, `strategy_params` in config.py (single source of
+truth for live + validation), `HORIZON_CAPITAL_CAP` and `HORIZON_MAX_GROSS` removed, funding guard
+(3% buffer) bounds the book, sells-first / wait-for-fills so a cash account can fund the buys.
+Drawdown overlay: documented OFF (user agreed; LIMITATIONS #13).
+
+**Expected first rebalance (next weekday 09:00 ET cycle, preview on Sep-4 data, equity $6,830):**
+sell QQQM ≈ $3,745; buy QLD ≈ $3,424, IEFA ≈ $1,051, PDBC +≈ $130 → gross ≈ $6,625 (97% of equity).
+ROTATION's September pick is PDBC + IEFA. Verify: `cycle: as_of=<prior session> ... fund=x0.97`.

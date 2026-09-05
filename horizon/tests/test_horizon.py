@@ -258,6 +258,20 @@ def test_gross_ceiling():
     assert sc1 == 1.0
 
 
+def test_buys_sized_to_cash():
+    """Cash-account safety: buys that exceed available cash are scaled
+    proportionally (1% buffer); buys that fit are untouched."""
+    from ..engine.main import size_buys_to_cash
+    buys = [{"symbol": "QLD", "side": "buy", "qty": 40.0, "notional": 3424.0},
+            {"symbol": "IEFA", "side": "buy", "qty": 12.0, "notional": 1051.0}]
+    sized = size_buys_to_cash(buys, cash=1000.0)
+    assert abs(sum(o["notional"] for o in sized) - 990.0) < 1e-6
+    assert abs(sized[0]["notional"] / sized[1]["notional"] - 3424.0 / 1051.0) < 1e-6
+    assert sized[0]["qty"] < 40.0
+    same = size_buys_to_cash(buys, cash=10_000.0)
+    assert [o["notional"] for o in same] == [3424.0, 1051.0]
+
+
 def test_pulse_levered_etf_expression():
     """leverage_via='levered_etf' expresses L>1 as a QQQ/QLD mix summing to 1.0
     (no borrowing) and leaves L<=1 identical to the margin expression."""
@@ -279,6 +293,7 @@ def test_pulse_levered_etf_expression():
 def main() -> int:
     tests = [test_cache_freshness_is_evaluated_per_call, test_stale_cycle_is_refused,
              test_funding_guard_scales_to_account_capacity, test_gross_ceiling,
+             test_buys_sized_to_cash,
              test_pulse_levered_etf_expression,
              test_no_lookahead, test_single_source_of_truth,
              test_strategies_decide_cleanly, test_risk_overlay_recovers,

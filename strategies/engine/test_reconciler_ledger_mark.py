@@ -275,6 +275,9 @@ def test_sleeve_available_reflects_remarked_exposure() -> None:
     sleeve free while horizon-live had already spent it. can_open() sizes off
     exactly this, so a revived sleeve would have over-allocated."""
     config = build_default_config()
+    # Pin the CP2-era scenario this test documents (HORIZON 0.60); the live
+    # allocation moved to 1.00 at CP3 (2026-09-05).
+    config.sleeves["HORIZON"].allocation_pct = 0.60
     ledger = OwnershipLedger()
     _adopted(ledger, "QQQM", qty=3.5484, notional=1036.00, avg_price=291.96)
     _adopted(ledger, "PDBC", qty=11.5012, notional=214.00, avg_price=18.61)

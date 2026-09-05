@@ -145,9 +145,10 @@ def build_default_config() -> EngineConfig:
     # Horizon trades index-equivalent ETFs the unified sleeves never touch.
     horizon_sleeve = SleeveConfig(
         strategy_id="HORIZON",
-        allocation_pct=0.60,        # CP2 (2026-08-23): 0.40 -> 0.60 on a clean second checkpoint (14 HZN fills, 0 conflicts). HORIZON_CAPITAL_CAP raised to $3,850 (~95% of sleeve) in lockstep. (CP1 had taken 0.20 -> 0.40.)
+        allocation_pct=1.00,        # CP3 (2026-09-05): 0.60 -> 1.00 on validated evidence (Candidate B cleared the full pre-registered bar; horizon/docs/VALIDATION.md). HORIZON_CAPITAL_CAP removed; Horizon sizes against the whole account, bounded by its funding guard. History: CP1 0.20->0.40, CP2 0.40->0.60 with cap $3,850.
         order_prefix="HZN_",
-        known_symbols={"QQQM", "IEFA", "VGLT", "IAU", "PDBC", "SHV"},
+        known_symbols={"QQQM", "IEFA", "VGLT", "IAU", "PDBC", "SHV",
+                       "QLD"},      # CP3: PULSE expresses leverage via QLD
         max_positions=None,
         max_daily_loss_pct=1.0,     # not engine-enforced; Horizon has its own risk layer
         probation=False,
@@ -197,9 +198,10 @@ def build_default_config() -> EngineConfig:
         auto_halt_on_anomaly=False,
     )
 
-    # CP2 allocation check: 0.00 (TREND retired) + 0.00 (SIMPLE parked)
-    #   + 0.00 (CROSSASSET retired) + 0.60 (HORIZON — the only validated
-    #   strategies) + 0.40 (cash, rolls into HORIZON at CP3) = 1.00
+    # CP3 allocation check: 0.00 (TREND retired) + 0.00 (SIMPLE parked)
+    #   + 0.00 (CROSSASSET retired) + 1.00 (HORIZON, the only validated
+    #   strategies) + 0.00 cash = 1.00. Horizon keeps its own ~3% funding
+    #   buffer; the engine reserves nothing.
     config = EngineConfig(
         sleeves={
             "TREND": trend_sleeve,
@@ -207,7 +209,7 @@ def build_default_config() -> EngineConfig:
             "CROSSASSET": crossasset_sleeve,
             "HORIZON": horizon_sleeve,
         },
-        cash_reserve_pct=0.40,      # parked; rolls into HORIZON at CP3 (0.75-0.80 core + book leverage)
+        cash_reserve_pct=0.00,      # CP3 (2026-09-05): rolled into HORIZON
         live_trading=os.getenv("LIVE_TRADING", "0") == "1",
         live_confirmation=os.getenv("I_UNDERSTAND_LIVE_TRADING", ""),
     )
