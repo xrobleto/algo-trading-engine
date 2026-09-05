@@ -16,7 +16,9 @@ Pulls every HZN_* order since the gate start and scores the checkpoint criteria
   C5  capital cap respected: HZN gross exposure <= cap * 1.05
 
 Manual companions (not automatable here): unified engine logs show zero
-unclassified/conflict lines; horizon-live logs show one clean cycle per weekday.
+unclassified/conflict lines; horizon-live logs show one clean cycle per weekday
+AND (G0) every `cycle:` line's as_of equals the prior completed session —
+`railway logs -s horizon-live | grep "cycle:"`.
 """
 import os
 import sys
@@ -65,6 +67,9 @@ def prior_close(symbol: str, iso_day: str):
 
 
 def main():
+    if not os.getenv("HORIZON_CAPITAL_CAP"):
+        print("WARNING: HORIZON_CAPITAL_CAP not in env — run with "
+              "`railway run -s horizon-live ...` or C5 will false-fail.")
     cap = float(os.getenv("HORIZON_CAPITAL_CAP", "1290"))
     checks = {}
 

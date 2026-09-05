@@ -10,8 +10,9 @@ price-only backtest of those would be badly wrong.
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime, timedelta
 from typing import Dict, List, Optional
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 
@@ -20,10 +21,49 @@ from . import universe
 from .polygon_client import PolygonClient
 
 # Fetch window: a wide buffer before the backtest start gives strategies their
-# momentum/MA warmup. FETCH_END tracks "today" so the live engine always has
-# current data; the backtest simply windows to its own configured end date.
+# momentum/MA warmup. The fetch END is computed PER CALL (see fetch_end()) —
+# never at import time. 2026-08-24..09-04 incident: a module-level
+# `FETCH_END = date.today()` froze on the day the long-running live container
+# started, and the 7-day freshness tolerance below then accepted the same stale
+# cache on every subsequent cycle, so the engine decided on Aug-24 data for two
+# weeks (project_notes/horizon_stale_data_2026-09-05.md).
 FETCH_START = "2004-06-01"
-FETCH_END = date.today().isoformat()
+_ET = ZoneInfo("America/New_York")
+SESSION_CLOSE_ET = (16, 15)   # a daily bar is "complete" after 16:15 ET
+
+
+def completed_through(now: Optional[datetime] = None) -> pd.Timestamp:
+    """Last calendar date whose daily bar can be complete right now.
+
+    Today if it is a weekday and the session has closed; otherwise the previous
+    weekday. Holidays are NOT modeled here — on the day after a holiday the
+    cache simply looks one day older than this and is re-fetched (harmless).
+    Bars dated after this are partial (pre-/intra-session) and are dropped, so
+    a 09:00 ET cycle can never see a half-day bar as "yesterday's close".
+    """
+    now = now or datetime.now(_ET)
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=_ET)
+    now = now.astimezone(_ET)
+    d = now.date()
+    closed = (now.hour, now.minute) >= SESSION_CLOSE_ET
+    if now.weekday() >= 5 or not closed:
+        d -= timedelta(days=1)
+    while d.weekday() >= 5:
+        d -= timedelta(days=1)
+    return pd.Timestamp(d)
+
+
+def fetch_end() -> str:
+    """Polygon range end for a fetch — evaluated at call time, never cached."""
+    return date.today().isoformat()
+
+
+def is_fresh(frame: pd.DataFrame, now: Optional[datetime] = None) -> bool:
+    """True if `frame` already contains the last completed session's bar."""
+    if frame is None or frame.empty:
+        return False
+    return pd.Timestamp(frame.index.max()) >= completed_through(now)
 
 
 def _cache_path(symbol: str):
@@ -68,14 +108,12 @@ def fetch_symbol(symbol: str, client: Optional[PolygonClient] = None,
                  force: bool = False) -> pd.DataFrame:
     """Return a cached or freshly-fetched daily frame for one symbol."""
     path = _cache_path(symbol)
+    cutoff = completed_through()
     if path.exists() and not force:
         try:
             cached = pd.read_pickle(path)
-            if not cached.empty:
-                fresh_enough = (cached.index.max()
-                                >= pd.Timestamp(FETCH_END) - pd.Timedelta(days=7))
-                if fresh_enough:
-                    return cached
+            if is_fresh(cached):
+                return cached.loc[:cutoff]
         except Exception:
             pass  # corrupt cache — refetch
 
@@ -83,7 +121,7 @@ def fetch_symbol(symbol: str, client: Optional[PolygonClient] = None,
     tickers = _TICKER_ALIASES.get(symbol, [symbol])
     bar_frames, div_frames = [], []
     for ticker in tickers:
-        bars = client.daily_bars(ticker, FETCH_START, FETCH_END)
+        bars = client.daily_bars(ticker, FETCH_START, fetch_end())
         if not bars.empty:
             bar_frames.append(bars)
         divs = client.dividends(ticker)
@@ -99,6 +137,7 @@ def fetch_symbol(symbol: str, client: Optional[PolygonClient] = None,
         divs = divs.groupby(level=0)["dividend"].sum().to_frame()
     else:
         divs = pd.DataFrame(columns=["dividend"]).rename_axis("date")
+    bars = bars.loc[:cutoff]          # drop any partial (still-open) session bar
     bars = _attach_dividends(bars, divs)
     bars["tr_close"] = _total_return_close(bars)
     bars.to_pickle(path)

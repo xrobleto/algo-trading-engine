@@ -80,3 +80,30 @@ engine, not an optimistic one — so this document is deliberately unflattering.
     grinding bear (e.g. 2022) it stays invested at reduced leverage and rides
     the decline down. The portfolio risk overlay and ROTATION cushion this at
     the book level, but the engine is always at least partly long equities.
+
+## Live-engine gaps found in the 2026-09-05 audit
+
+13. **The rolling-drawdown risk overlay is NOT applied live.** `engine/risk.py`
+    is used by the backtest portfolio (`backtest/portfolio.py`) but the live
+    loop never calls it, so live behaves like the validation's `overlay=False`
+    row (2008-2026, 1.5x: 21.1% CAGR / -42.5% MaxDD instead of 19.3% /
+    -34.2%). Wiring it faithfully needs a Horizon-own NAV series: the
+    `HORIZON_CAPITAL_CAP` makes the engine's equity input a constant, and the
+    account's history is polluted by the retired sleeves' 2026-07/08 drawdown.
+    Decision pending with the user; the engine logs this at startup.
+
+14. **The live account has no margin (Alpaca multiplier 1).** `book_leverage`
+    1.5x and PULSE's vol-targeted leverage were only fundable because the cap
+    was ~56% of equity — the Unified Engine's 40% cash reserve was silently the
+    leverage headroom. The engine now applies a **funding guard**
+    (`engine/main.py: apply_funding_guard`): targets are scaled to
+    (cash + managed positions) x multiplier x 0.97, so buys are never rejected
+    for buying power. When the guard engages, the book is *less* levered than
+    validated; the alternative is enabling margin on the account or expressing
+    leverage through a 2x ETF (`PulseStrategy(leverage_via="levered_etf")`,
+    validated separately in VALIDATION_CANDIDATE.md).
+
+15. **Smaller divergences:** live re-pins every $1 of drift daily while the
+    harness uses a 5% rebalance band; the regime tilt is applied daily live and
+    monthly in the backtest (measured effect ~0.1pp); idle live cash earns 0
+    where the backtest credits BIL; the withdrawal engine is not wired live.

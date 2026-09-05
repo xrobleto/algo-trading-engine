@@ -189,8 +189,98 @@ def test_pending_order_awareness():
     assert _pending_notional(_Failing(), _View()) == {}
 
 
+def test_cache_freshness_is_evaluated_per_call():
+    """G0 (2026-09-05 incident): a cache that was current when the container
+    started must NOT be treated as fresh weeks later, and a frame ending on the
+    last completed session must be."""
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    et = ZoneInfo("America/New_York")
+    # Friday 2026-09-04 was the last session; Monday 09:00 ET -> Friday is current.
+    assert cache.completed_through(datetime(2026, 9, 7, 9, 0, tzinfo=et)) == pd.Timestamp("2026-09-04")
+    # Same Monday after the close -> Monday itself is complete.
+    assert cache.completed_through(datetime(2026, 9, 7, 16, 30, tzinfo=et)) == pd.Timestamp("2026-09-07")
+    # Saturday -> Friday.
+    assert cache.completed_through(datetime(2026, 9, 5, 12, 0, tzinfo=et)) == pd.Timestamp("2026-09-04")
+    idx_ok = pd.bdate_range("2026-08-01", "2026-09-04")
+    idx_stale = pd.bdate_range("2026-08-01", "2026-08-24")   # the frozen container's cache
+    now = datetime(2026, 9, 4, 9, 0, tzinfo=et)              # Sep-4 09:00 ET cycle
+    assert cache.is_fresh(pd.DataFrame({"close": 1.0}, index=idx_ok[:-1]), now)   # through Sep-3
+    assert not cache.is_fresh(pd.DataFrame({"close": 1.0}, index=idx_stale), now)
+    assert not cache.is_fresh(pd.DataFrame(), now)
+    # The old rule (within 7 days of a frozen end-date) would have passed the
+    # stale frame — make sure nobody reintroduces a module-level end date.
+    assert not hasattr(cache, "FETCH_END")
+
+
+def test_stale_cycle_is_refused():
+    """The engine refuses to trade when the dataset is older than the holiday
+    tolerance, and accepts a Friday bar on the Tuesday after a Monday holiday."""
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    from ..engine import main as engine_main
+    et = ZoneInfo("America/New_York")
+    tue = datetime(2026, 9, 8, 9, 0, tzinfo=et)      # Tuesday after Labor Day
+    assert engine_main.data_staleness_days(pd.Timestamp("2026-09-04"), tue) == 3   # Mon holiday not modeled -> Mon counts
+    assert engine_main.data_staleness_days(pd.Timestamp("2026-09-04"), tue) <= engine_main.MAX_STALE_DAYS
+    sep4 = datetime(2026, 9, 4, 9, 0, tzinfo=et)
+    assert engine_main.data_staleness_days(pd.Timestamp("2026-08-24"), sep4) > engine_main.MAX_STALE_DAYS
+
+
+def test_funding_guard_scales_to_account_capacity():
+    """A multiplier-1 account cannot hold a 1.76x vol-targeted book; the guard
+    scales targets to cash + managed positions, ignores orphans, and is a no-op
+    when the book is fundable or when margin (multiplier 2) covers it."""
+    from ..engine.main import apply_funding_guard
+    positions = {"QQQM": {"market_value": 4900.0}, "PDBC": {"market_value": 900.0},
+                 "XLK": {"market_value": 0.01}}
+    target = {"QQQM": 7844.0, "PDBC": 916.0}
+    scaled, scale, fundable = apply_funding_guard(target, positions, {"XLK"},
+                                                  cash=1000.0, multiplier=1.0, buffer=0.03)
+    assert abs(fundable - 6800.0 * 0.97) < 1e-6
+    assert abs(sum(scaled.values()) - fundable) < 1e-6 and 0 < scale < 1
+    assert abs(scaled["QQQM"] / scaled["PDBC"] - 7844.0 / 916.0) < 1e-6   # proportional
+    # Margin account: 2x capacity covers the book untouched.
+    same, scale2, _ = apply_funding_guard(target, positions, {"XLK"}, 1000.0, 2.0)
+    assert scale2 == 1.0 and same == target
+    # Already fundable: untouched.
+    same, scale3, _ = apply_funding_guard({"QQQM": 3000.0}, positions, set(), 1000.0, 1.0)
+    assert scale3 == 1.0
+
+
+def test_gross_ceiling():
+    from ..engine.main import apply_gross_ceiling
+    t, sc = apply_gross_ceiling({"QQQM": 7844.0, "PDBC": 916.0}, 5775.0)
+    assert abs(sum(t.values()) - 5775.0) < 1e-6 and abs(sc - 5775.0 / 8760.0) < 1e-9
+    same, sc0 = apply_gross_ceiling({"QQQM": 3000.0}, 5775.0)
+    assert sc0 == 1.0 and same == {"QQQM": 3000.0}
+    same, sc1 = apply_gross_ceiling({"QQQM": 9000.0}, 0.0)   # 0 = no ceiling
+    assert sc1 == 1.0
+
+
+def test_pulse_levered_etf_expression():
+    """leverage_via='levered_etf' expresses L>1 as a QQQ/QLD mix summing to 1.0
+    (no borrowing) and leaves L<=1 identical to the margin expression."""
+    from ..strategies.pulse import PulseStrategy, LEVERED_ASSET, RISK_ASSET
+    ds = cache.load_dataset([RISK_ASSET, LEVERED_ASSET, "BIL"])
+    view = MarketView(ds, list(ds[RISK_ASSET].index)[-1])
+    margin = PulseStrategy().decide(view, {})
+    etf = PulseStrategy(leverage_via="levered_etf").decide(view, {})
+    L = margin.target_weights[RISK_ASSET]
+    if L > 1.0:
+        assert abs(sum(etf.target_weights.values()) - 1.0) < 1e-6
+        assert abs(etf.target_weights[LEVERED_ASSET] - (L - 1.0)) < 1e-3
+    else:
+        assert etf.target_weights == margin.target_weights
+    assert LEVERED_ASSET in PulseStrategy(leverage_via="levered_etf").universe()
+    assert LEVERED_ASSET not in PulseStrategy().universe()
+
+
 def main() -> int:
-    tests = [test_no_lookahead, test_single_source_of_truth,
+    tests = [test_cache_freshness_is_evaluated_per_call, test_stale_cycle_is_refused,
+             test_funding_guard_scales_to_account_capacity, test_gross_ceiling,
+             test_pulse_levered_etf_expression,
+             test_no_lookahead, test_single_source_of_truth,
              test_strategies_decide_cleanly, test_risk_overlay_recovers,
              test_ledger_roundtrip, test_harness_smoke,
              test_reconciler_orphan_recovery, test_alerter_never_raises,

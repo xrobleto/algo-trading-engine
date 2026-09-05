@@ -18,6 +18,10 @@ risk tolerance high, profitability-first; scale-up at 1.4–1.8× book leverage 
   frontier (1.0×→16.7% CAGR / 1.4×→19.1% / 1.8×→20.8%, maxDD −37.6%).
 
 ## Pre-registered gate criteria (evaluate ~2026-09-25, ≈30 trading days)
+- **G0 Data freshness (added 2026-09-05)**: every live cycle's `as_of` equals the last completed
+  session (holiday tolerance 4 calendar days). The engine refuses to trade and alerts CRITICAL
+  otherwise. Evidence: `railway logs -s horizon-live | grep "cycle:"` — the line now carries
+  `as_of=`. Background: horizon_stale_data_2026-09-05.md (Aug 24-Sep 4 cycles ran on frozen data).
 - **G1 Decision equivalence**: each live cycle's targets match the faithful harness re-run on the same
   dates (allowing for the QQQM-vs-QQQ data basis; flag any divergence > a rebalance band).
 - **G2 Execution fidelity**: realized fills within modeled costs (slippage assumption ≤ 2× modeled;

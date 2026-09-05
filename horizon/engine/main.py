@@ -25,6 +25,8 @@ from datetime import datetime, timedelta, timezone
 from typing import Dict
 from zoneinfo import ZoneInfo
 
+import pandas as pd
+
 from ..config import build_default_config
 from ..data import cache, calendar
 from ..paths import log_dir, state_dir
@@ -50,6 +52,20 @@ ADMITTED_SLEEVES = [sid for sid, sc in build_default_config().sleeves.items()
 
 MIN_ORDER_USD = 1.0
 DAILY_RUN_HOUR_ET = 9      # run once per weekday at 09:00 ET, before the open
+# G0 — data freshness. A cycle may only trade on the last completed session.
+# 4 calendar days tolerates a Friday bar on the Tuesday after a Monday holiday;
+# anything older is refused with a CRITICAL alert (2026-08-24..09-04 incident:
+# the container decided on a frozen Aug-24 cache for two weeks).
+MAX_STALE_DAYS = 4
+# Funding guard — never submit buys the account cannot fund. Targets are scaled
+# to (cash + managed positions) x account multiplier, less a buffer for
+# overnight gaps between the 09:00 decision and the 09:30 fill.
+FUNDING_BUFFER = 0.03
+# Optional hard dollar ceiling on total long targets (env HORIZON_MAX_GROSS).
+# Used to hold the book at the capital-checkpoint boundary the user approved
+# (CP2: cap $3,850 x book_leverage 1.5 = $5,775) while the leverage path
+# (margin / levered ETF / lift the ceiling) is decided. 0 = no ceiling.
+MAX_GROSS_ENV = "HORIZON_MAX_GROSS"
 _STATE_FILE = "engine_state.json"
 _LEDGER_FILE = "ledger.json"
 _HALT_FILE = "HALT_ALL_TRADING"
@@ -128,6 +144,44 @@ def _pending_notional(broker, view) -> Dict[str, float]:
     return pending
 
 
+def data_staleness_days(as_of, now=None) -> int:
+    """Calendar days between the dataset's last bar and the last completed
+    session. 0 = current. > MAX_STALE_DAYS = refuse to trade (G0)."""
+    return int((cache.completed_through(now) - pd.Timestamp(as_of)).days)
+
+
+def apply_funding_guard(account_target: Dict[str, float], positions: Dict[str, dict],
+                        orphan_symbols: set, cash: float, multiplier: float,
+                        buffer: float = FUNDING_BUFFER):
+    """Scale long targets down to what the account can actually fund.
+
+    fundable = (cash + market value of the positions this engine manages)
+               x account multiplier x (1 - buffer)
+    Returns (targets, scale, fundable). scale == 1.0 means untouched. A
+    multiplier of 1 (no margin) makes this the hard ceiling that PULSE's
+    vol-targeted leverage and book_leverage would otherwise blow through —
+    without it Alpaca rejects the buys for insufficient buying power.
+    """
+    managed = (set(account_target) | set(positions)) - set(orphan_symbols)
+    managed_mv = sum(float(positions.get(s, {}).get("market_value", 0.0))
+                     for s in managed)
+    fundable = (float(cash) + managed_mv) * max(float(multiplier), 1.0) * (1.0 - buffer)
+    want = sum(v for v in account_target.values() if v > 0)
+    if want <= 0 or fundable <= 0 or want <= fundable:
+        return dict(account_target), 1.0, fundable
+    scale = fundable / want
+    return {s: v * scale for s, v in account_target.items()}, scale, fundable
+
+
+def apply_gross_ceiling(account_target: Dict[str, float], ceiling: float):
+    """Scale long targets so their sum does not exceed `ceiling` dollars."""
+    want = sum(v for v in account_target.values() if v > 0)
+    if ceiling <= 0 or want <= ceiling:
+        return dict(account_target), 1.0
+    scale = ceiling / want
+    return {s: v * scale for s, v in account_target.items()}, scale
+
+
 def run_cycle(broker, strategies, cfg, ledger, kill_switch, alerter,
               dry_run: bool = True) -> dict:
     """Run one engine cycle: reconcile, decide, diff vs broker, submit (or log)."""
@@ -138,6 +192,21 @@ def run_cycle(broker, strategies, cfg, ledger, kill_switch, alerter,
 
     dataset = cache.load_dataset()
     as_of = calendar.trading_days(dataset)[-1]
+
+    # G0: refuse to trade on stale data. Better an idle cycle than a decision
+    # made on a two-week-old picture of the market.
+    stale = data_staleness_days(as_of)
+    if stale > MAX_STALE_DAYS:
+        msg = (f"dataset as_of {as_of.date()} is {stale} days behind the last "
+               f"completed session {cache.completed_through().date()} "
+               f"(limit {MAX_STALE_DAYS}). No orders will be placed. Check "
+               f"Polygon access / cache freshness (horizon/data/cache.py).")
+        log.critical("STALE DATA — cycle refused: %s", msg)
+        alerter.critical("STALE DATA — Horizon cycle refused", msg)
+        return {"as_of": str(as_of.date()), "stale_days": stale,
+                "orders_planned": 0, "orders_submitted": 0,
+                "mode": "STALE-DATA (refused)"}
+
     view = MarketView(dataset, as_of)
     regime = compute_regime(view)
 
@@ -192,6 +261,36 @@ def run_cycle(broker, strategies, cfg, ledger, kill_switch, alerter,
                                    + weight * budgets[sid].sleeve_equity)
     _save_states(states)
 
+    # Gross ceiling (checkpoint boundary) — applied before the funding guard.
+    _ceiling = float(os.getenv(MAX_GROSS_ENV, "0") or 0)
+    account_target, ceiling_scale = apply_gross_ceiling(account_target, _ceiling)
+    if ceiling_scale < 1.0:
+        log.info("gross ceiling: %s=$%.0f — targets scaled x%.3f",
+                 MAX_GROSS_ENV, _ceiling, ceiling_scale)
+
+    # Funding guard — scale targets to what the account can fund.
+    funding_scale = 1.0
+    if broker is not None and account_target:
+        try:
+            acct = broker.get_account()
+            account_target, funding_scale, fundable = apply_funding_guard(
+                account_target, positions, orphan_symbols,
+                acct["cash"], acct.get("multiplier", 1.0))
+            if funding_scale < 1.0:
+                log.warning("funding guard: targets scaled x%.3f — wanted $%.0f, "
+                            "fundable $%.0f (cash $%.0f, multiplier %.0fx, "
+                            "buffer %.0f%%)", funding_scale,
+                            sum(v for v in account_target.values()) / funding_scale,
+                            fundable, acct["cash"], acct.get("multiplier", 1.0),
+                            FUNDING_BUFFER * 100)
+                alerter.warning("funding guard engaged",
+                                f"Targets scaled x{funding_scale:.3f}: the account "
+                                f"(multiplier {acct.get('multiplier', 1.0):.0f}x) "
+                                f"cannot fund the full vol-targeted book. Enable "
+                                f"margin, lower book_leverage, or accept the clamp.")
+        except Exception as exc:
+            log.warning("funding guard unavailable (%s) — unguarded", exc)
+
     # Pending-order awareness — open/unfilled orders count toward effective
     # exposure, so the cycle cannot double-submit when a prior batch hasn't
     # filled yet (the day-1 doubling bug: after-hours --once queued orders
@@ -234,14 +333,17 @@ def run_cycle(broker, strategies, cfg, ledger, kill_switch, alerter,
 
     ledger.save(state_dir() / _LEDGER_FILE)
 
-    summary = {"as_of": str(as_of.date()), "regime": regime.regime,
+    summary = {"as_of": str(as_of.date()), "stale_days": stale,
+               "regime": regime.regime,
                "regime_score": round(regime.score, 1),
                "equity": round(equity, 2), "orphans": len(orphan_symbols),
+               "funding_scale": round(funding_scale, 3),
+               "ceiling_scale": round(ceiling_scale, 3),
                "orders_planned": len(orders), "orders_submitted": submitted,
                "mode": "dry-run" if (dry_run or broker is None) else "LIVE"}
-    log.info("cycle: regime=%s score=%.0f equity=$%.0f orders=%d %s",
-             regime.regime, regime.score, equity, len(orders),
-             summary["mode"])
+    log.info("cycle: as_of=%s regime=%s score=%.0f equity=$%.0f ceil=x%.2f "
+             "fund=x%.2f orders=%d %s", as_of.date(), regime.regime, regime.score,
+             equity, ceiling_scale, funding_scale, len(orders), summary["mode"])
     alerter.heartbeat(summary)
     return summary
 
@@ -313,6 +415,9 @@ def main() -> None:
 
     cfg = build_default_config()
     strategies = build_all()
+    log.info("sleeves: %s | book_leverage %.2fx | risk overlay: NOT applied live "
+             "(docs/LIMITATIONS.md #13) | funding guard: on | G0 max stale %d days",
+             ADMITTED_SLEEVES, cfg.book_leverage, MAX_STALE_DAYS)
     ledger = OwnershipLedger.load(state_dir() / _LEDGER_FILE)
     ledger.prune_terminal(max_age_days=7)
     kill_switch = KillSwitch(flag_path=state_dir() / _HALT_FILE)

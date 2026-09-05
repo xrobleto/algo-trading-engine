@@ -29,6 +29,7 @@ class BrokerFacade:
             "equity": float(a.equity),
             "cash": float(a.cash),
             "buying_power": float(a.buying_power),
+            "multiplier": float(getattr(a, "multiplier", 1) or 1),
             "status": str(a.status),
             "pattern_day_trader": bool(getattr(a, "pattern_day_trader", False)),
         }

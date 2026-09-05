@@ -30,6 +30,18 @@ from ..data import universe as _universe
 # for shared-account coexistence) propagates. Defaults are unchanged.
 RISK_ASSET = _universe.PULSE_RISK_ASSET
 CASH_ASSET = _universe.PULSE_CASH_ASSET
+LEVERED_ASSET = _universe.PULSE_LEVERED_ASSET
+
+# How leverage above 1.0x is expressed:
+#   "margin"      — weight QQQ > 1.0; the account borrows (needs a margin
+#                   account; the validated 2026-05 configuration).
+#   "levered_etf" — QQQ/QLD mix with weights summing to 1.0: w_QLD = L - 1,
+#                   w_QQQ = 2 - L. No borrowing, no buying-power dependency;
+#                   QLD's own financing + 0.95% ER are embedded in its price.
+#                   CANDIDATE (2026-09-05 audit) — must clear the gating bar
+#                   before it carries capital.
+LEVERAGE_VIA_MARGIN = "margin"
+LEVERAGE_VIA_ETF = "levered_etf"
 
 # Documented default parameters (round numbers, not curve-fitted).
 DEFAULT_TREND_EMA = 105        # faster than the pre-2015 200-day norm
@@ -55,7 +67,8 @@ class PulseStrategy(Strategy):
                  target_vol: float = DEFAULT_TARGET_VOL,
                  max_leverage: float = DEFAULT_MAX_LEVERAGE,
                  min_leverage: float = DEFAULT_MIN_LEVERAGE,
-                 use_trend_filter: bool = False):
+                 use_trend_filter: bool = False,
+                 leverage_via: str = LEVERAGE_VIA_MARGIN):
         self.trend_ema = int(trend_ema)
         self.hysteresis = float(hysteresis)
         self.abs_mom_days = int(abs_mom_days)
@@ -64,9 +77,24 @@ class PulseStrategy(Strategy):
         self.max_leverage = float(max_leverage)
         self.min_leverage = float(min_leverage)
         self.use_trend_filter = bool(use_trend_filter)
+        if leverage_via not in (LEVERAGE_VIA_MARGIN, LEVERAGE_VIA_ETF):
+            raise ValueError(f"leverage_via must be margin|levered_etf, got {leverage_via}")
+        self.leverage_via = leverage_via
 
     def universe(self) -> List[str]:
+        if self.leverage_via == LEVERAGE_VIA_ETF:
+            return [RISK_ASSET, LEVERED_ASSET, CASH_ASSET]
         return [RISK_ASSET, CASH_ASSET]
+
+    def _express(self, view: MarketView, lev: float, note: str) -> Decision:
+        """Turn a leverage number into target weights per `leverage_via`."""
+        if (self.leverage_via == LEVERAGE_VIA_ETF and lev > 1.0
+                and view.is_tradable(LEVERED_ASSET)):
+            lev = min(lev, 2.0)
+            return Decision({RISK_ASSET: round(2.0 - lev, 3),
+                             LEVERED_ASSET: round(lev - 1.0, 3)},
+                            f"{note} via {LEVERED_ASSET}")
+        return Decision({RISK_ASSET: round(lev, 3)}, note)
 
     def warmup_days(self) -> int:
         return self.trend_ema + self.abs_mom_days
@@ -94,7 +122,7 @@ class PulseStrategy(Strategy):
 
         if not self.use_trend_filter:
             lev = self._leverage(closes)
-            return Decision({RISK_ASSET: round(lev, 3)}, f"always-on lev={lev:.2f}")
+            return self._express(view, lev, f"always-on lev={lev:.2f}")
 
         mom6 = (float(price / closes.iloc[-self.abs_mom_days] - 1.0)
                 if len(closes) > self.abs_mom_days else 0.0)
@@ -116,4 +144,4 @@ class PulseStrategy(Strategy):
             return Decision({}, "risk-off: cash")
 
         lev = self._leverage(closes)
-        return Decision({RISK_ASSET: round(lev, 3)}, f"trend-on lev={lev:.2f}")
+        return self._express(view, lev, f"trend-on lev={lev:.2f}")

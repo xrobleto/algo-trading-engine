@@ -14,6 +14,10 @@ from typing import List
 # PULSE: leveraged growth core. Cash leg is BIL (1-3mo T-bills).
 PULSE_RISK_ASSET = "QQQ"
 PULSE_CASH_ASSET = "BIL"
+# Optional (PulseStrategy(leverage_via="levered_etf")): leverage above 1.0x is
+# expressed as a QQQ/QLD mix whose weights sum to 1.0 — no margin borrowing.
+# QLD = ProShares Ultra QQQ (2x daily), inception 2006-06. Same live ticker.
+PULSE_LEVERED_ASSET = "QLD"
 
 # ROTATION: cross-asset dual momentum. BIL is the absolute-momentum cash floor.
 ROTATION_ASSETS = ["QQQ", "EFA", "TLT", "GLD", "DBC"]
@@ -74,6 +78,7 @@ def all_symbols() -> List[str]:
     syms = set()
     syms.add(PULSE_RISK_ASSET)
     syms.add(PULSE_CASH_ASSET)
+    syms.add(PULSE_LEVERED_ASSET)
     syms.update(ROTATION_ASSETS)
     syms.add(ROTATION_CASH_ASSET)
     syms.update(REVERT_UNIVERSE)
