@@ -103,6 +103,14 @@ class BrokerFacade:
     def is_market_open(self) -> bool:
         return bool(self._client.get_clock().is_open)
 
+    def is_trading_day(self, day) -> bool:
+        """True if the exchange calendar has a session on `day` (a date).
+        Holidays return False. Raises on broker error — callers decide the
+        fallback."""
+        from alpaca.trading.requests import GetCalendarRequest
+        cal = self._client.get_calendar(GetCalendarRequest(start=day, end=day))
+        return any(str(getattr(c, "date", "")) == day.isoformat() for c in cal)
+
     @staticmethod
     def _order_dict(o) -> dict:
         return {

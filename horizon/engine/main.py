@@ -438,6 +438,23 @@ def emergency_flatten(broker, kill_switch, alerter) -> dict:
     return {"orders_cancelled": n_orders, "positions_closed": n_positions}
 
 
+def is_session_day(day, broker, log=log) -> bool:
+    """Should the engine cycle on `day`? Weekends never. Weekday holidays are
+    skipped when the broker calendar says there is no session (a holiday
+    cycle just queues sells that cannot fill and burns the fill-wait — seen
+    on Labor Day 2026-09-07). If the calendar is unavailable, a weekday is
+    assumed to be a session so a broker hiccup can never suppress trading."""
+    if day.weekday() >= 5:
+        return False
+    if broker is None:
+        return True
+    try:
+        return bool(broker.is_trading_day(day))
+    except Exception as exc:
+        log.warning("calendar unavailable (%s) — assuming %s is a session", exc, day)
+        return True
+
+
 def _seconds_until_daily_run(hour_et: int = DAILY_RUN_HOUR_ET) -> float:
     """Seconds until the next weekday run time, in US/Eastern."""
     et = ZoneInfo("America/New_York")
@@ -555,20 +572,23 @@ def main() -> None:
         while True:
             now_et = datetime.now(et)
             today_iso = now_et.date().isoformat()
-            is_weekday = now_et.weekday() < 5
-            # Catch-up: if today is a trading day and no cycle has run today
-            # yet, fire one immediately instead of sleeping to tomorrow.
-            if is_weekday and _last_cycle_date() != today_iso:
-                log.info("catch-up: today (%s) has not run yet — firing now",
-                         today_iso)
-                _safe_cycle(broker, strategies, cfg, ledger, kill_switch,
-                            alerter, dry_run)
+            # Catch-up: if today is a session and no cycle has run today yet,
+            # fire one immediately instead of sleeping to tomorrow.
+            if _last_cycle_date() != today_iso:
+                if is_session_day(now_et.date(), broker):
+                    log.info("catch-up: today (%s) has not run yet — firing now",
+                             today_iso)
+                    _safe_cycle(broker, strategies, cfg, ledger, kill_switch,
+                                alerter, dry_run)
+                elif now_et.weekday() < 5:
+                    log.info("%s is a market holiday — no cycle", today_iso)
+                    _record_cycle_date()
                 continue   # loop back, then sleep to the next scheduled slot
             wait = _seconds_until_daily_run()
             log.info("next cycle in %.1f hours", wait / 3600.0)
             time.sleep(wait)
-            _safe_cycle(broker, strategies, cfg, ledger, kill_switch, alerter,
-                        dry_run)
+            # After the sleep the loop re-enters and the session check above
+            # decides whether to cycle — holidays are skipped there.
     elif args.interval > 0:
         log.info("interval mode — every %ds (Ctrl-C to stop)", args.interval)
         while True:

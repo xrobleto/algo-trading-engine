@@ -272,6 +272,29 @@ def test_buys_sized_to_cash():
     assert [o["notional"] for o in same] == [3424.0, 1051.0]
 
 
+def test_holiday_cycle_is_skipped():
+    """Weekends never cycle; a weekday the broker calendar marks as closed is
+    skipped; a calendar failure falls back to 'weekday = session'."""
+    from datetime import date
+    from ..engine.main import is_session_day
+
+    class Cal:
+        def __init__(self, open_days, fail=False):
+            self.open_days, self.fail = open_days, fail
+        def is_trading_day(self, d):
+            if self.fail:
+                raise RuntimeError("calendar down")
+            return d in self.open_days
+
+    labor_day, tue, sat = date(2026, 9, 7), date(2026, 9, 8), date(2026, 9, 5)
+    cal = Cal({tue})
+    assert not is_session_day(labor_day, cal)
+    assert is_session_day(tue, cal)
+    assert not is_session_day(sat, cal)
+    assert is_session_day(labor_day, Cal(set(), fail=True))   # fail-open on weekdays
+    assert is_session_day(tue, None)                          # no broker: weekday cycles
+
+
 def test_pulse_levered_etf_expression():
     """leverage_via='levered_etf' expresses L>1 as a QQQ/QLD mix summing to 1.0
     (no borrowing) and leaves L<=1 identical to the margin expression."""
@@ -293,7 +316,7 @@ def test_pulse_levered_etf_expression():
 def main() -> int:
     tests = [test_cache_freshness_is_evaluated_per_call, test_stale_cycle_is_refused,
              test_funding_guard_scales_to_account_capacity, test_gross_ceiling,
-             test_buys_sized_to_cash,
+             test_buys_sized_to_cash, test_holiday_cycle_is_skipped,
              test_pulse_levered_etf_expression,
              test_no_lookahead, test_single_source_of_truth,
              test_strategies_decide_cleanly, test_risk_overlay_recovers,
