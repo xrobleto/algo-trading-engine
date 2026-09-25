@@ -106,4 +106,17 @@ engine, not an optimistic one — so this document is deliberately unflattering.
 15. **Smaller divergences:** live re-pins every $1 of drift daily while the
     harness uses a 5% rebalance band; the regime tilt is applied daily live and
     monthly in the backtest (measured effect ~0.1pp); idle live cash earns 0
-    where the backtest credits BIL; the withdrawal engine is not wired live.
+    and so does the backtest's (CORRECTED 2026-09-25: an earlier version of this note said the backtest
+    credits BIL on idle cash; it does not — `CostModel.cash_is_bil` is unused); the withdrawal
+    engine is not wired live.
+
+16. **Live now trades with a 20% no-trade band (2026-09-25, docs/TAX_STUDY.md).** Live holdings may
+    sit up to 20% of equity away from the strategies' targets until drift, a large leverage change
+    or a strategy entry/exit of >= 10% of equity triggers a rebalance. Decision-equivalence checks
+    (live gate G1) must therefore compare live against `backtest/account_sim.py`, which runs the same
+    band, not against the per-strategy harness targets.
+
+17. **Taxes.** The live account is taxable. On the account simulator, 2008–2026, after-tax CAGR is
+    about 14.0% at ST 32% / LT 15% versus about 15.2% for buy-and-hold QQQ; ~93% of realized gains
+    are short-term. The engine's advantage in a taxable account is drawdown (−26% vs −49%), not
+    after-tax return, unless the short-term rate is near 24%.

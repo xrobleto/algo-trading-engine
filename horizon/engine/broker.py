@@ -103,6 +103,14 @@ class BrokerFacade:
     def is_market_open(self) -> bool:
         return bool(self._client.get_clock().is_open)
 
+    def seconds_until_open(self) -> float:
+        """Seconds until the next regular-session open; 0 if open now."""
+        from datetime import datetime, timezone
+        clock = self._client.get_clock()
+        if clock.is_open:
+            return 0.0
+        return max(0.0, (clock.next_open - datetime.now(timezone.utc)).total_seconds())
+
     def is_trading_day(self, day) -> bool:
         """True if the exchange calendar has a session on `day` (a date).
         Holidays return False. Raises on broker error — callers decide the

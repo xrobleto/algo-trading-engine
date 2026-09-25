@@ -31,9 +31,14 @@ class RotationStrategy(Strategy):
     execution = NEXT_OPEN
 
     def __init__(self, lookbacks: Sequence[int] = DEFAULT_LOOKBACKS,
-                 top_n: int = DEFAULT_TOP_N):
+                 top_n: int = DEFAULT_TOP_N, retain_rank: Optional[int] = None):
         self.lookbacks = tuple(int(x) for x in lookbacks)
         self.top_n = int(top_n)
+        # Hold buffer (tax study, 2026-09-25): a current holding is kept while
+        # it still ranks within the top `retain_rank` eligible assets, instead
+        # of being swapped the moment it drops to #3. Longer holds turn
+        # short-term gains into long-term ones. None = original rule.
+        self.retain_rank = int(retain_rank) if retain_rank else None
 
     def universe(self) -> List[str]:
         return RISK_ASSETS + [CASH_ASSET]
@@ -74,6 +79,10 @@ class RotationStrategy(Strategy):
         eligible = sorted((a for a, m in mom.items() if m > floor),
                           key=lambda a: mom[a], reverse=True)
         selected = eligible[:self.top_n]
+        if self.retain_rank and self.retain_rank > self.top_n:
+            prev = [a for a in state.get("holdings", {}) if a in RISK_ASSETS]
+            keep = [a for a in eligible[:self.retain_rank] if a in prev][:self.top_n]
+            selected = keep + [a for a in eligible if a not in keep][:self.top_n - len(keep)]
 
         weights = {}
         slot = 1.0 / self.top_n

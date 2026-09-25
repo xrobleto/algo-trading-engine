@@ -65,6 +65,19 @@ class EngineConfig:
     backtest_end: str = "2026-05-15"
     risk_free_annual: float = 0.04           # for Sharpe; the harness also uses BIL
 
+    # Account-level no-trade band (engine/main.py: plan_orders), chosen by the
+    # pre-registered after-tax study (docs/TAX_STUDY.md) — the live account is
+    # a taxable brokerage account, so every sale is a tax event. 2008-2026 on
+    # the account simulator: after-tax CAGR (ST 32%/LT 15%) 12.8% -> 14.0%,
+    # pre-tax unchanged (19.4% -> 19.6%), turnover 14.7x -> 7.2x.
+    # 0.0 restores the pre-2026-09-25 behavior (re-pin every $1 of drift).
+    rebalance_band: float = 0.20
+    rebalance_min_trade: float = 0.005   # once triggered, skip deltas below 0.5% of equity
+    # A full entry/exit of >= 10% of equity (a ROTATION slot swap) triggers the
+    # band immediately, so strategy signals never wait for drift (addendum A:
+    # the plain band deferred exits up to 71 trading days).
+    rebalance_signal_override: float = 0.10
+
     sleeves: Dict[str, SleeveConfig] = field(default_factory=dict)
     # Constructor kwargs per strategy — THE single source of truth for the
     # parameters that trade live. strategies/registry.py applies them, and

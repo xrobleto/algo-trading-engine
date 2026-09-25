@@ -47,6 +47,8 @@ class Alerter:
         self._last_heartbeat_date = None
         if not self.enabled:
             log.info("alerting is log-only (SMTP not configured or disabled)")
+        else:
+            log.info("alerting: EMAIL enabled via %s:%s", self.smtp_server, self.smtp_port)
 
     def send(self, subject: str, body: str, level: str = "INFO",
              dedup_minutes: int = 240) -> None:

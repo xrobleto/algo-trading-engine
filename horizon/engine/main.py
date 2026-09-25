@@ -173,6 +173,69 @@ def apply_funding_guard(account_target: Dict[str, float], positions: Dict[str, d
     return {s: v * scale for s, v in account_target.items()}, scale, fundable
 
 
+ORPHAN_ALERT_MIN_USD = 5.0      # dust below this is logged, never emailed
+FUNDING_ALERT_MARGIN = 0.02     # alert only when the clamp exceeds the buffer by this
+
+
+def plan_orders(account_target: Dict[str, float], holdings_mv: Dict[str, float],
+                pending: Dict[str, float], prices: Dict[str, float],
+                orphan_symbols: set, equity: float, band: float = 0.0,
+                min_trade_frac: float = 0.0, block_buys: bool = False,
+                signal_override: float = 0.0):
+    """Turn dollar targets into orders — the ONE function both the live cycle
+    and the account simulator (backtest/account_sim.py) call.
+
+    band: account-level no-trade band. If every managed symbol's target weight
+      (target / equity) is within `band` of its current weight (filled +
+      pending, / equity), no orders are placed. band=0 reproduces the pre-
+      2026-09-25 behavior: re-pin any drift of MIN_ORDER_USD or more.
+    min_trade_frac: once the band triggers, symbols whose delta is below this
+      fraction of equity are left alone (no dust trades). 0 -> MIN_ORDER_USD.
+    signal_override: a full entry (held ~0, target > 0) or full exit (target
+      0, held > 0) whose delta is at least this fraction of equity triggers the
+      band regardless of the largest gap — a strategy SIGNAL change (e.g. a
+      ROTATION slot swap, ~17% of equity) must not wait for drift to exceed
+      the band (tax study addendum A). 0 disables.
+
+    Returns (orders, band_triggered, max_weight_gap).
+    """
+    managed = (set(account_target) | set(holdings_mv) | set(pending)) - set(orphan_symbols)
+    eff = {s: holdings_mv.get(s, 0.0) + pending.get(s, 0.0) for s in managed}
+    gap = 0.0
+    if equity > 0:
+        gap = max((abs(account_target.get(s, 0.0) - eff[s]) / equity for s in managed),
+                  default=0.0)
+    if band > 0 and gap <= band:
+        signal = False
+        if signal_override > 0 and equity > 0:
+            for s in managed:
+                tgt, held = account_target.get(s, 0.0), eff[s]
+                crossing = (tgt <= 0.0 < held) or (held <= 0.001 * equity and tgt > 0.0)
+                if crossing and abs(tgt - held) / equity >= signal_override:
+                    signal = True
+                    break
+        if not signal:
+            return [], False, gap
+    min_usd = max(MIN_ORDER_USD, min_trade_frac * equity if equity > 0 else 0.0)
+    orders = []
+    for sym in sorted(managed):
+        delta = account_target.get(sym, 0.0) - eff[sym]
+        full_exit = account_target.get(sym, 0.0) <= 0.0 and eff[sym] > 0.0
+        # A full exit trades down to MIN_ORDER_USD so no sliver is stranded;
+        # every other adjustment must clear the min-trade size.
+        if abs(delta) < (MIN_ORDER_USD if full_exit else min_usd):
+            continue
+        side = "buy" if delta > 0 else "sell"
+        if side == "buy" and block_buys:
+            continue  # kill switch blocks new exposure, never exits
+        price = prices.get(sym)
+        if not price or price <= 0:
+            continue
+        orders.append({"symbol": sym, "side": side,
+                       "qty": round(abs(delta) / price, 4), "notional": abs(delta)})
+    return orders, True, gap
+
+
 def apply_gross_ceiling(account_target: Dict[str, float], ceiling: float):
     """Scale long targets so their sum does not exceed `ceiling` dollars."""
     want = sum(v for v in account_target.values() if v > 0)
@@ -209,6 +272,17 @@ def _wait_for_cash(broker, need: float, sells, log, max_wait: int = SELL_FILL_WA
     sells have all left the open-order book (filled/cancelled) or max_wait
     elapses. Buys are sized to whatever cash is available at that point."""
     sell_syms = {o["symbol"] for o in sells}
+    # A 09:00 cycle's sells fill at the 09:30 open. A fixed 30-minute wait left
+    # ~10 seconds of margin (sells filled 13:30:06 UTC against a 13:30:17
+    # deadline on 2026-09-08): a slow open would have sized the buys to
+    # pre-sale cash and left the book under-invested for a day. Anchor the
+    # deadline to the actual open + 5 minutes when the open is near.
+    try:
+        until_open = float(broker.seconds_until_open())
+        if 0 < until_open <= 3600:
+            max_wait = max(max_wait, int(until_open) + 300)
+    except Exception as exc:
+        log.warning("clock unavailable (%s) — fixed %ds sell wait", exc, max_wait)
     deadline = time.time() + max_wait
     cash = 0.0
     while True:
@@ -290,10 +364,15 @@ def run_cycle(broker, strategies, cfg, ledger, kill_switch, alerter,
         if rec.orphan_symbols:
             log.warning("orphaned positions (engine will NOT trade them): %s",
                         rec.orphan_symbols)
-            alerter.warning("orphaned positions detected",
-                            f"Positions with no engine record: "
-                            f"{rec.orphan_symbols}. The engine will not trade "
-                            f"these — review and resolve manually.")
+            material = {s: positions.get(s, {}).get("market_value", 0.0)
+                        for s in rec.orphan_symbols
+                        if abs(positions.get(s, {}).get("market_value", 0.0))
+                        >= ORPHAN_ALERT_MIN_USD}
+            if material:   # dust (e.g. SGOV $0.09, XLK $0.01) is logged, not emailed
+                alerter.warning("orphaned positions detected",
+                                f"Positions with no engine record: {material}. "
+                                f"The engine will not trade these — review and "
+                                f"resolve manually.")
         if rec.conflicts:
             kill_switch.trigger(f"ownership conflict: {rec.conflicts}")
             alerter.critical("ownership conflict — kill switch tripped",
@@ -327,12 +406,15 @@ def run_cycle(broker, strategies, cfg, ledger, kill_switch, alerter,
                 account_target, positions, orphan_symbols,
                 acct["cash"], acct.get("multiplier", 1.0))
             if funding_scale < 1.0:
-                log.warning("funding guard: targets scaled x%.3f — wanted $%.0f, "
-                            "fundable $%.0f (cash $%.0f, multiplier %.0fx, "
-                            "buffer %.0f%%)", funding_scale,
-                            sum(v for v in account_target.values()) / funding_scale,
-                            fundable, acct["cash"], acct.get("multiplier", 1.0),
-                            FUNDING_BUFFER * 100)
+                log.info("funding guard: targets scaled x%.3f — wanted $%.0f, "
+                         "fundable $%.0f (cash $%.0f, multiplier %.0fx, "
+                         "buffer %.0f%%)", funding_scale,
+                         sum(v for v in account_target.values()) / funding_scale,
+                         fundable, acct["cash"], acct.get("multiplier", 1.0),
+                         FUNDING_BUFFER * 100)
+            # x0.97 is the designed steady state on a cash account (the 3%
+            # buffer). Only a clamp materially beyond it is worth an email.
+            if funding_scale < 1.0 - FUNDING_BUFFER - FUNDING_ALERT_MARGIN:
                 alerter.warning("funding guard engaged",
                                 f"Targets scaled x{funding_scale:.3f}: the account "
                                 f"(multiplier {acct.get('multiplier', 1.0):.0f}x) "
@@ -347,25 +429,16 @@ def run_cycle(broker, strategies, cfg, ledger, kill_switch, alerter,
     # the next morning's --daily cycle did not see).
     pending = _pending_notional(broker, view)
 
-    orders = []
-    for sym in set(account_target) | set(positions) | set(pending):
-        if sym in orphan_symbols:
-            continue  # unmanaged — never auto-traded
-        target = account_target.get(sym, 0.0)
-        filled = positions.get(sym, {}).get("market_value", 0.0)
-        effective = filled + pending.get(sym, 0.0)
-        delta = target - effective
-        if abs(delta) < MIN_ORDER_USD:
-            continue
-        side = "buy" if delta > 0 else "sell"
-        if side == "buy" and tripped:
-            continue  # kill switch blocks new exposure, never exits
-        price = view.close(sym) if view.is_tradable(sym) else None
-        if not price or price <= 0:
-            continue
-        orders.append({"symbol": sym, "side": side,
-                        "qty": round(abs(delta) / price, 4),
-                        "notional": abs(delta)})
+    holdings_mv = {s: p.get("market_value", 0.0) for s, p in positions.items()}
+    prices = {s: view.close(s) for s in set(account_target) | set(holdings_mv) | set(pending)
+              if view.is_tradable(s)}
+    orders, band_hit, weight_gap = plan_orders(
+        account_target, holdings_mv, pending, prices, orphan_symbols, equity,
+        band=cfg.rebalance_band, min_trade_frac=cfg.rebalance_min_trade,
+        block_buys=tripped, signal_override=cfg.rebalance_signal_override)
+    if cfg.rebalance_band > 0 and not band_hit:
+        log.info("rebalance band: largest weight gap %.2f%% <= band %.2f%% — holding",
+                 weight_gap * 100, cfg.rebalance_band * 100)
 
     # Sells first, buys second. On a cash account (multiplier 1) buying power
     # is settled+unsettled cash; a sell queued at 09:00 frees nothing until it
@@ -410,11 +483,13 @@ def run_cycle(broker, strategies, cfg, ledger, kill_switch, alerter,
                "equity": round(equity, 2), "orphans": len(orphan_symbols),
                "funding_scale": round(funding_scale, 3),
                "ceiling_scale": round(ceiling_scale, 3),
+               "weight_gap": round(weight_gap, 4), "band": cfg.rebalance_band,
                "orders_planned": len(orders), "orders_submitted": submitted,
                "mode": "dry-run" if (dry_run or broker is None) else "LIVE"}
     log.info("cycle: as_of=%s regime=%s score=%.0f equity=$%.0f ceil=x%.2f "
-             "fund=x%.2f orders=%d %s", as_of.date(), regime.regime, regime.score,
-             equity, ceiling_scale, funding_scale, len(orders), summary["mode"])
+             "fund=x%.2f gap=%.1f%% band=%.1f%% orders=%d %s", as_of.date(),
+             regime.regime, regime.score, equity, ceiling_scale, funding_scale,
+             weight_gap * 100, cfg.rebalance_band * 100, len(orders), summary["mode"])
     alerter.heartbeat(summary)
     return summary
 
@@ -453,6 +528,16 @@ def is_session_day(day, broker, log=log) -> bool:
     except Exception as exc:
         log.warning("calendar unavailable (%s) — assuming %s is a session", exc, day)
         return True
+
+
+def daily_action(now_et, last_cycle_iso: str, session_today: bool) -> str:
+    """What the --daily loop should do right now: 'cycle', 'record' (mark a
+    non-session day as handled), or 'sleep'. Pure, so it is unit-tested."""
+    if last_cycle_iso == now_et.date().isoformat():
+        return "sleep"
+    if now_et.hour < DAILY_RUN_HOUR_ET:
+        return "sleep"     # never fire before 09:00 ET: sells could not fill for hours
+    return "cycle" if session_today else "record"
 
 
 def _seconds_until_daily_run(hour_et: int = DAILY_RUN_HOUR_ET) -> float:
@@ -573,15 +658,27 @@ def main() -> None:
             now_et = datetime.now(et)
             today_iso = now_et.date().isoformat()
             # Catch-up: if today is a session and no cycle has run today yet,
-            # fire one immediately instead of sleeping to tomorrow.
-            if _last_cycle_date() != today_iso:
-                if is_session_day(now_et.date(), broker):
+            # fire one immediately instead of sleeping to tomorrow — but only
+            # at/after the scheduled hour. A restart at 00:06 ET used to fire
+            # the day's cycle immediately: its sells could not fill for 9
+            # hours, so the buys were sized to the cash on hand and the book
+            # sat under-invested until the next cycle.
+            last = _last_cycle_date()
+            pre = daily_action(now_et, last, True)
+            if pre != "sleep":
+                action = daily_action(now_et, last,
+                                      is_session_day(now_et.date(), broker))
+                if action == "cycle":
                     log.info("catch-up: today (%s) has not run yet — firing now",
                              today_iso)
                     _safe_cycle(broker, strategies, cfg, ledger, kill_switch,
                                 alerter, dry_run)
-                elif now_et.weekday() < 5:
-                    log.info("%s is a market holiday — no cycle", today_iso)
+                else:
+                    if now_et.weekday() < 5:
+                        log.info("%s is a market holiday — no cycle", today_iso)
+                    # Record EVERY non-session day (weekends included). The
+                    # 2026-09-10 version only recorded holidays, so a weekend
+                    # restart spun this loop with no sleep until Monday.
                     _record_cycle_date()
                 continue   # loop back, then sleep to the next scheduled slot
             wait = _seconds_until_daily_run()

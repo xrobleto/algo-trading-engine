@@ -272,6 +272,103 @@ def test_buys_sized_to_cash():
     assert [o["notional"] for o in same] == [3424.0, 1051.0]
 
 
+def test_plan_orders_band_and_override():
+    """The no-trade band holds small drift, triggers on a large gap, lets a
+    material signal change (full exit >= override) through, and still sells a
+    small full exit completely once triggered."""
+    from ..engine.main import plan_orders
+    px = {"QQQM": 300.0, "QLD": 90.0, "IEFA": 100.0, "PDBC": 19.0}
+    eq = 10_000.0
+    held = {"QQQM": 3000.0, "QLD": 3000.0, "IEFA": 1700.0, "PDBC": 1700.0}
+    # 1) drift of 5% of equity, band 20% -> hold
+    tgt = {"QQQM": 3500.0, "QLD": 2500.0, "IEFA": 1700.0, "PDBC": 1700.0}
+    o, hit, gap = plan_orders(tgt, held, {}, px, set(), eq, band=0.20, min_trade_frac=0.005)
+    assert o == [] and not hit and abs(gap - 0.05) < 1e-9
+    # 2) band 0 re-pins the same drift (pre-2026-09-25 behavior)
+    o, hit, _ = plan_orders(tgt, held, {}, px, set(), eq, band=0.0)
+    assert hit and {x["symbol"] for x in o} == {"QQQM", "QLD"}
+    # 3) a ROTATION swap (17% exit, 17% entry) is below the band ...
+    swap = {"QQQM": 3000.0, "QLD": 3000.0, "IEFA": 1700.0, "VGLT": 1700.0}
+    o, hit, _ = plan_orders(swap, held, {}, {**px, "VGLT": 60.0}, set(), eq, band=0.20)
+    assert o == [] and not hit
+    # ... but the signal override lets it through, both legs
+    o, hit, _ = plan_orders(swap, held, {}, {**px, "VGLT": 60.0}, set(), eq, band=0.20,
+                            min_trade_frac=0.005, signal_override=0.10)
+    assert hit and {(x["symbol"], x["side"]) for x in o} == {("PDBC", "sell"), ("VGLT", "buy")}
+    # 4) once triggered, a $30 full exit still trades despite the 0.5% min trade
+    held2 = {**held, "IAU": 30.0}
+    big = {"QQQM": 6000.0, "QLD": 0.0, "IEFA": 1700.0, "PDBC": 1700.0}
+    o, hit, _ = plan_orders(big, held2, {}, {**px, "IAU": 50.0}, set(), eq, band=0.20,
+                            min_trade_frac=0.005)
+    assert hit and ("IAU", "sell") in {(x["symbol"], x["side"]) for x in o}
+    # 5) orphans are never traded
+    o, _, _ = plan_orders(big, held2, {}, {**px, "IAU": 50.0}, {"IAU"}, eq, band=0.20)
+    assert "IAU" not in {x["symbol"] for x in o}
+
+
+def test_daily_action_timing():
+    """Never cycle before 09:00 ET; record weekends and holidays so a restart
+    cannot spin the loop; cycle once per session day."""
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    from ..engine.main import daily_action
+    et = ZoneInfo("America/New_York")
+    thu_0006 = datetime(2026, 9, 25, 0, 6, tzinfo=et)
+    thu_0901 = datetime(2026, 9, 25, 9, 1, tzinfo=et)
+    sat_1000 = datetime(2026, 9, 26, 10, 0, tzinfo=et)
+    assert daily_action(thu_0006, "2026-09-24", True) == "sleep"     # the 00:06 restart case
+    assert daily_action(thu_0901, "2026-09-24", True) == "cycle"
+    assert daily_action(thu_0901, "2026-09-25", True) == "sleep"     # already ran today
+    assert daily_action(sat_1000, "2026-09-25", False) == "record"   # weekend: no spin
+    assert daily_action(sat_1000, "2026-09-26", False) == "sleep"
+
+
+def test_tax_model_hand_cases():
+    """FIFO, ST/LT split and the share-matched wash-sale rule on hand-computed
+    cases (backtest/tax.py)."""
+    from ..backtest.tax import TaxRates, compute_taxes
+    R, T = TaxRates(0.32, 0.15), pd.Timestamp
+    buy = lambda d, n, p: {"date": T(d), "symbol": "X", "side": "buy", "shares": n, "price": p}
+    sell = lambda d, n, p: {"date": T(d), "symbol": "X", "side": "sell", "shares": n, "price": p}
+    r = compute_taxes([buy("2020-01-02", 10, 100), sell("2020-03-02", 10, 110)], [], {}, T("2020-12-31"), R)
+    assert abs(r.by_year[2020] - 32.0) < 1e-9                       # $100 short-term
+    r = compute_taxes([buy("2019-01-02", 10, 100), sell("2020-03-02", 10, 110)], [], {}, T("2020-12-31"), R)
+    assert abs(r.by_year[2020] - 15.0) < 1e-9                       # $100 long-term
+    tr = [buy("2020-01-02", 10, 100), sell("2020-02-03", 10, 95), buy("2020-02-10", 2, 95)]
+    r = compute_taxes(tr, [], {"X": 95.0}, T("2020-12-31"), R)
+    assert abs(r.wash_disallowed - 10.0) < 1e-9                     # only 2 replacement shares
+    r = compute_taxes(tr + [sell("2020-06-01", 2, 100)], [], {}, T("2020-12-31"), R)
+    assert abs(r.by_year[2020]) < 1e-9                              # washed loss moved into basis
+
+
+def test_rotation_hold_buffer():
+    """retain_rank keeps a holding that slipped to #3; default drops it."""
+    from ..strategies.rotation import RotationStrategy, RISK_ASSETS, CASH_ASSET
+    a, b, c, d, e = RISK_ASSETS[:5]
+    scores = {a: 0.30, b: 0.20, c: 0.10, d: 0.05, e: -0.10, CASH_ASSET: 0.0}
+
+    class _View:
+        as_of = pd.Timestamp("2026-10-01")
+        def is_tradable(self, sym): return True
+
+    def stub(strat):
+        strat._blended_momentum = lambda view, sym: scores[sym]
+        return strat
+    held = {"last_rebal_month": "2026-09", "holdings": {a: 0.5, c: 0.5}}
+    # c ranks #3: the original rule swaps it for b ...
+    got = stub(RotationStrategy()).decide(_View(), dict(held)).target_weights
+    assert set(got) == {a, b}
+    # ... a buffer of 3 keeps it; a buffer of 2 (= top_n) is the original rule.
+    got = stub(RotationStrategy(retain_rank=3)).decide(_View(), dict(held)).target_weights
+    assert set(got) == {a, c}
+    got = stub(RotationStrategy(retain_rank=2)).decide(_View(), dict(held)).target_weights
+    assert set(got) == {a, b}
+    # A holding that falls out of the top 3 is dropped even with the buffer.
+    held2 = {"last_rebal_month": "2026-09", "holdings": {a: 0.5, d: 0.5}}
+    got = stub(RotationStrategy(retain_rank=3)).decide(_View(), dict(held2)).target_weights
+    assert set(got) == {a, b}
+
+
 def test_holiday_cycle_is_skipped():
     """Weekends never cycle; a weekday the broker calendar marks as closed is
     skipped; a calendar failure falls back to 'weekday = session'."""
@@ -317,6 +414,8 @@ def main() -> int:
     tests = [test_cache_freshness_is_evaluated_per_call, test_stale_cycle_is_refused,
              test_funding_guard_scales_to_account_capacity, test_gross_ceiling,
              test_buys_sized_to_cash, test_holiday_cycle_is_skipped,
+             test_plan_orders_band_and_override, test_daily_action_timing,
+             test_tax_model_hand_cases, test_rotation_hold_buffer,
              test_pulse_levered_etf_expression,
              test_no_lookahead, test_single_source_of_truth,
              test_strategies_decide_cleanly, test_risk_overlay_recovers,

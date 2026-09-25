@@ -21,6 +21,8 @@ risk tolerance high, profitability-first; scale-up at 1.4–1.8× book leverage 
 **STATUS 2026-09-25: GATE PASSED** on the CP3 configuration (13 cycles, Sep 8–24). G0/G1/G3/G4 clean;
 G2 passes at book level with one documented IEFA transition-day breach. Full evidence:
 horizon_checkpoint_2026-09-25.md. Ramp complete; move to monthly health checks.
+**2026-09-25:** live now runs a 20% no-trade band (TAX_STUDY.md). From here G1 compares live to
+`horizon/backtest/account_sim.py` (same band), not to per-strategy harness targets.
 
 - **G0 Data freshness (added 2026-09-05)**: every live cycle's `as_of` equals the last completed
   session (holiday tolerance 4 calendar days). The engine refuses to trade and alerts CRITICAL
