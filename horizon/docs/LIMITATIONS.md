@@ -110,11 +110,14 @@ engine, not an optimistic one — so this document is deliberately unflattering.
     credits BIL on idle cash; it does not — `CostModel.cash_is_bil` is unused); the withdrawal
     engine is not wired live.
 
-16. **Live now trades with a 20% no-trade band (2026-09-25, docs/TAX_STUDY.md).** Live holdings may
-    sit up to 20% of equity away from the strategies' targets until drift, a large leverage change
+16. **Live now trades with a 40% no-trade band (2026-09-25, docs/TAX_STUDY.md; 20% earlier the
+    same day).** Live holdings may sit up to 40% of equity away from the strategies' targets until drift, a large leverage change
     or a strategy entry/exit of >= 10% of equity triggers a rebalance. Decision-equivalence checks
     (live gate G1) must therefore compare live against `backtest/account_sim.py`, which runs the same
-    band, not against the per-strategy harness targets.
+    band, not against the per-strategy harness targets. Consequence: moderate PULSE leverage
+    changes (up to ~0.6x of leverage) are not traded until a larger move, a ROTATION entry/exit or
+    drift triggers the band. Large de-leveraging in a volatility spike still triggers; the 2008,
+    2020 and 2022 crash windows showed no worse drawdown than at 20%.
 
 17. **Taxes.** The live account is taxable. On the account simulator, 2008–2026, after-tax CAGR is
     about 14.0% at ST 32% / LT 15% versus about 15.2% for buy-and-hold QQQ; ~93% of realized gains

@@ -50,3 +50,17 @@ PASS. **Deployed: band 0.20, min trade 0.5% of equity, signal override 0.10.**
 - The ROTATION hold buffer was rejected: it cost 1.2–1.3pp pre-tax at every band.
 - Not modeled, so real results differ: state tax, the $3,000 ordinary-income offset, collectibles
   treatment of gold funds, and Alpaca's actual lot-relief behavior.
+
+## Addendum B — wider bands (pre-registered before any result)
+
+Baseline = current live (band 0.20, override 0.10). Crash-window drawdowns are measured on the full-period run.
+
+| band | pre-tax | Sharpe | MaxDD | GFC | COVID | 2022 | turnover | rebalance days | ST share | after-tax 32/15 | 24/15 | 37/20 | half 1 | half 2 | plateau | eligible |
+|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|---|
+| 0.20 | 19.59% | 1.06 | -26.2% | -26.2% | -20.4% | -17.6% | 7.2x | 6% | 93% | **14.02%** | 15.35% | 13.09% | 12.46% | 15.61% | 14.02% | baseline (live) |
+| 0.25 | 19.72% | 1.07 | -25.9% | -25.9% | -20.2% | -15.8% | 6.3x | 5% | 92% | **14.13%** | 15.46% | 13.19% | 12.50% | 15.79% | 13.90% | yes |
+| 0.30 | 19.35% | 1.05 | -25.9% | -25.9% | -20.2% | -15.8% | 6.1x | 5% | 92% | **13.90%** | 15.20% | 12.98% | 12.23% | 15.60% | 13.90% | no: half h1, half h2, 0.24/0.15, 0.37/0.20 |
+| 0.35 | 19.70% | 1.07 | -25.9% | -25.9% | -20.2% | -15.8% | 5.9x | 4% | 89% | **14.35%** | 15.58% | 13.42% | 12.83% | 15.62% | 13.90% | yes |
+| 0.40 | 19.58% | 1.07 | -25.9% | -25.9% | -20.2% | -15.8% | 5.4x | 4% | 86% | **14.39%** | 15.56% | 13.47% | 12.98% | 15.79% | 14.35% | yes |
+
+**Result: switch live to band 0.40** (best eligible: 0.4; after-tax gain vs live +0.36pp; switch threshold +0.20pp).

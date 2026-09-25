@@ -62,7 +62,9 @@ def simulate(dataset: Dict[str, pd.DataFrame], strategies: Dict[str, Strategy],
              cfg: EngineConfig, start: str, end: str,
              starting_equity: float = 100_000.0, band: float = 0.0,
              min_trade_frac: float = 0.0, states: Optional[Dict[str, dict]] = None,
-             signal_override: float = 0.0) -> AccountResult:
+             signal_override: float = 0.0, observer=None) -> AccountResult:
+    """observer(date, target, holdings_mv, equity, band_triggered), if given, is
+    called after every decision — for diagnostics only; it cannot alter trading."""
     sids = [s for s, c in cfg.sleeves.items() if c.enabled]
     days = calendar.window(calendar.trading_days(dataset), start, end)
     cash = float(starting_equity)
@@ -136,6 +138,8 @@ def simulate(dataset: Dict[str, pd.DataFrame], strategies: Dict[str, Strategy],
         pending_orders, _hit, _gap = plan_orders(target, mv, {}, prices, set(), equity,
                                                  band=band, min_trade_frac=min_trade_frac,
                                                  signal_override=signal_override)
+        if observer is not None:
+            observer(T, dict(target), dict(mv), equity, _hit)
         res.decision_days += 1
 
     res.equity = pd.Series(curve).sort_index()
