@@ -60,3 +60,24 @@ modeled as paid from the account each year. State tax is excluded.
 The user pre-authorized applying the recommendation ("Please apply your best recommendation").
 Deployment follows the usual path: tests, a dry-run cycle against the live account, redeploy, and
 verification of the next live cycle.
+
+---
+
+## ADDENDUM A — signal-change override (pre-registered 2026-09-25, after the main grid, before testing this variant)
+
+**Why:** the main grid selected band 0.20. Diagnosing it (not part of the selection) showed the band
+also defers ROTATION's *signal* changes: a single-slot exit is ~17% of equity, below the 20% band, so
+over 2008–2026 exits waited a median 9 trading days, p90 35, max 71 (DBC held 71 extra days while
+falling 10%). Aggregate criteria passed, but that is a regime-change risk the aggregates can hide.
+
+**Variant (tested at the chosen band 0.20 only — no new band search):** the band also triggers when
+any symbol is being fully entered (held ≈ 0, target > 0) or fully exited (target 0, held > 0) with
+|delta| ≥ 10% of equity. 10% is fixed a priori as "half a ROTATION slot"; it is not tuned. Drift and
+small PULSE leverage nudges still wait for the band.
+
+**Deploy the override instead of the plain band only if ALL hold:**
+1. it meets every main-study eligibility test against the band-0 baseline;
+2. after-tax CAGR (32/15, full period) is no more than 0.30pp below plain band 0.20;
+3. its maximum exit lag for |delta| ≥ 10% positions is 0 days (by construction — verified, not assumed).
+
+Otherwise the plain band 0.20 ships, with the lag documented in LIMITATIONS.
