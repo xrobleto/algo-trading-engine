@@ -13,7 +13,7 @@ Pulls every HZN_* order since the gate start and scores the checkpoint criteria
   C3  current HZN-symbol positions consistent with Horizon's latest targets
   C4  no cross-engine contamination: no unified-engine symbol traded by HZN orders,
       no HZN symbol in the unified sleeves' books
-  C5  capital cap respected: HZN gross exposure <= cap * 1.05
+  C5  capital cap respected (cap mode) or no borrowing (uncapped, post-CP3)
 
 Manual companions (not automatable here): unified engine logs show zero
 unclassified/conflict lines; horizon-live logs show one clean cycle per weekday
@@ -28,7 +28,8 @@ from datetime import date
 import requests
 
 GATE_START = "2026-08-12T00:00:00Z"
-HZN_SYMBOLS = {"QQQM", "IEFA", "VGLT", "IAU", "PDBC", "SHV"}
+# QLD added at CP3 (2026-09-05): PULSE expresses leverage via QLD.
+HZN_SYMBOLS = {"QQQM", "IEFA", "VGLT", "IAU", "PDBC", "SHV", "QLD"}
 UNIFIED_SYMBOLS = {"SPY", "QQQ", "IWM", "XLK", "XLF", "XLE", "XLV", "XLI", "XLY",
                    "XLC", "SMH", "IBB", "XHB", "MTUM", "QUAL", "SOXX", "IGV",
                    "CIBR", "SKYY", "ARKK", "XBI", "KWEB", "SGOV", "BIL",
@@ -70,7 +71,7 @@ def main():
     if not os.getenv("HORIZON_CAPITAL_CAP"):
         print("WARNING: HORIZON_CAPITAL_CAP not in env — run with "
               "`railway run -s horizon-live ...` or C5 will false-fail.")
-    cap = float(os.getenv("HORIZON_CAPITAL_CAP", "1290"))
+    cap = float(os.getenv("HORIZON_CAPITAL_CAP", "1290") or 0)
     checks = {}
 
     # all orders since gate start
@@ -146,11 +147,23 @@ def main():
         book_lev = float(_hcfg().book_leverage)
     except Exception:
         book_lev = 1.0
-    lev_cap = cap * book_lev
-    checks["C5 capital cap respected"] = (
-        gross <= lev_cap * 1.05,
-        f"gross ${gross:,.0f} <= cap*book_leverage*1.05 ${lev_cap*1.05:,.0f} "
-        f"(cap ${cap:,.0f} x {book_lev:.2f}x)")
+    if cap > 0:
+        lev_cap = cap * book_lev
+        checks["C5 capital cap respected"] = (
+            gross <= lev_cap * 1.05,
+            f"gross ${gross:,.0f} <= cap*book_leverage*1.05 ${lev_cap*1.05:,.0f} "
+            f"(cap ${cap:,.0f} x {book_lev:.2f}x)")
+    else:
+        # CP3 (2026-09-05): no cap — Horizon owns the whole account and the
+        # funding guard bounds it. The invariant is now "never borrows":
+        # cash >= 0 and gross <= equity x account multiplier.
+        acct = get("/v2/account")
+        eq, cash = float(acct["equity"]), float(acct["cash"])
+        mult = float(acct.get("multiplier") or 1)
+        checks["C5 no borrowing (uncapped)"] = (
+            cash >= 0 and gross <= eq * mult * 1.001,
+            f"gross ${gross:,.0f} = {gross / eq:.1%} of equity ${eq:,.0f}; "
+            f"cash ${cash:,.0f}; multiplier {mult:.0f}x")
 
     print("\n=== CHECKPOINT SCORECARD ===")
     all_ok = True

@@ -18,6 +18,10 @@ risk tolerance high, profitability-first; scale-up at 1.4–1.8× book leverage 
   frontier (1.0×→16.7% CAGR / 1.4×→19.1% / 1.8×→20.8%, maxDD −37.6%).
 
 ## Pre-registered gate criteria (evaluate ~2026-09-25, ≈30 trading days)
+**STATUS 2026-09-25: GATE PASSED** on the CP3 configuration (13 cycles, Sep 8–24). G0/G1/G3/G4 clean;
+G2 passes at book level with one documented IEFA transition-day breach. Full evidence:
+horizon_checkpoint_2026-09-25.md. Ramp complete; move to monthly health checks.
+
 - **G0 Data freshness (added 2026-09-05)**: every live cycle's `as_of` equals the last completed
   session (holiday tolerance 4 calendar days). The engine refuses to trade and alerts CRITICAL
   otherwise. Evidence: `railway logs -s horizon-live | grep "cycle:"` — the line now carries
