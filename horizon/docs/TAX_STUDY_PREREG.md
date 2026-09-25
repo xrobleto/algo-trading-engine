@@ -81,3 +81,34 @@ small PULSE leverage nudges still wait for the band.
 3. its maximum exit lag for |delta| ≥ 10% positions is 0 days (by construction — verified, not assumed).
 
 Otherwise the plain band 0.20 ships, with the lag documented in LIMITATIONS.
+
+---
+
+## ADDENDUM B — wider bands (pre-registered 2026-09-25, before any wider-band result)
+
+**Why:** in the main grid, after-tax CAGR rose monotonically through band 0.20, the edge of the grid.
+
+**Baseline = current live:** band 0.20, min trade 0.5% of equity, signal override 0.10.
+**Candidates:** band ∈ {0.25, 0.30, 0.35, 0.40}; min trade and override unchanged. Nothing else varies.
+
+**New risk this addendum must rule out:** a wider band can defer PULSE's *de-leveraging* when
+volatility spikes (a leverage cut from 1.9x to 1.5x moves ~26% of equity), leaving the book over-levered
+into a crash. Aggregate MaxDD can hide this, so crash windows are checked separately.
+
+**Eligible only if ALL hold, each versus the current live baseline:**
+1. pre-tax Sharpe ≥ baseline − 0.05;
+2. full-period MaxDD no more than 3pp worse;
+3. MaxDD inside each crash window no more than 3pp worse — GFC 2008-01-02→2009-06-30, COVID
+   2020-02-03→2020-06-30, 2022 bear 2022-01-03→2022-12-30 (measured on the full-period run);
+4. after-tax CAGR (ST 32% / LT 15%) beats baseline in BOTH halves (fresh runs, as before);
+5. after-tax CAGR beats baseline at ST 24%/LT 15% AND ST 37%/LT 20%;
+6. no deferred exit of a position ≥ 10% of equity (verified, not assumed).
+
+**Selection:** among eligible candidates, the band with the highest plateau score (minimum
+after-tax CAGR, 32/15, of the band and its grid neighbours, the baseline 0.20 included as a
+neighbour). Switch only if the chosen band beats the baseline by ≥ 0.20pp after tax; otherwise live
+stays at 0.20. If the choice is 0.40, the grid edge, it is still taken, and the edge is reported.
+
+**Deployment:** under the user's standing instruction for the tax work ("apply your best
+recommendation"), a qualifying band is deployed as a one-value config change with the usual
+verification.
