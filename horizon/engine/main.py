@@ -653,6 +653,19 @@ def main() -> None:
         log.info("daily mode — one cycle per weekday at %02d:00 ET "
                  "(immediate catch-up if today hasn't run yet)",
                  DAILY_RUN_HOUR_ET)
+        # A (re)start is worth knowing about, and this send proves alert
+        # delivery from the deployed network at boot rather than at the next
+        # cycle. A crash loop (restartPolicy ON_FAILURE, max 10) emails at most
+        # 10 times — which is exactly when you want to hear about it.
+        alerter.send("engine started",
+                     f"Horizon started in daily mode "
+                     f"({'LIVE' if not dry_run else 'dry-run'}).\n"
+                     f"sleeves: {ADMITTED_SLEEVES}\n"
+                     f"book_leverage: {cfg.book_leverage:.2f}x\n"
+                     f"rebalance band: {cfg.rebalance_band:.0%} "
+                     f"(signal override {cfg.rebalance_signal_override:.0%})\n"
+                     f"next cycle: weekdays {DAILY_RUN_HOUR_ET:02d}:00 ET",
+                     level="INFO", dedup_minutes=0)
         et = ZoneInfo("America/New_York")
         while True:
             now_et = datetime.now(et)

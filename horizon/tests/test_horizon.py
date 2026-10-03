@@ -137,6 +137,50 @@ def test_alerter_never_raises():
     a.heartbeat({"regime": "RISK_ON", "equity": 7400})  # once-per-day no-op
 
 
+def test_alerter_resend_transport():
+    """Resend is preferred over SMTP, posts the right payload over HTTPS, and a
+    failed or rejected send is logged, never raised."""
+    import os
+    from ..engine import alerts as A
+    saved = {k: os.environ.get(k) for k in
+             ("RESEND_API_KEY", "RESEND_FROM", "ALERT_EMAIL_TO", "HORIZON_ALERT_EMAIL",
+              "HORIZON_ALERTS_ENABLED", "SMTP_SERVER", "SMTP_USERNAME", "SMTP_PASSWORD")}
+    calls = []
+
+    class _Resp:
+        def __init__(self, code): self.status_code, self.text = code, "nope"
+        def json(self): return {"id": "em_123"}
+
+    real_post = A.requests.post
+    try:
+        os.environ.update({"RESEND_API_KEY": "re_test", "RESEND_FROM": "Horizon <a@x.com>",
+                           "ALERT_EMAIL_TO": "me@x.com, you@x.com",
+                           "HORIZON_ALERTS_ENABLED": "1", "SMTP_SERVER": "smtp.x.com",
+                           "SMTP_USERNAME": "u", "SMTP_PASSWORD": "p"})
+        os.environ.pop("HORIZON_ALERT_EMAIL", None)
+        a = A.Alerter()
+        assert a.enabled and a.transport == "resend"          # preferred over SMTP
+        A.requests.post = lambda url, **kw: calls.append((url, kw)) or _Resp(200)
+        a.send("hello", "body", level="CRITICAL")
+        url, kw = calls[-1]
+        assert url == A.RESEND_URL and kw["timeout"] == A.HTTP_TIMEOUT
+        assert kw["headers"]["Authorization"] == "Bearer re_test"
+        assert kw["json"]["to"] == ["me@x.com", "you@x.com"]
+        assert kw["json"]["subject"] == "[Horizon CRITICAL] hello"
+        A.requests.post = lambda url, **kw: _Resp(422)      # rejected: logged only
+        a.send("rejected", "b", dedup_minutes=0)
+        def boom(url, **kw): raise OSError("network down")
+        A.requests.post = boom                               # network error: logged only
+        a.send("boom", "b", dedup_minutes=0)
+    finally:
+        A.requests.post = real_post
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+
 def test_emergency_flatten_requires_broker():
     """Emergency flatten must refuse cleanly when there is no broker."""
     from ..engine.alerts import Alerter
@@ -416,6 +460,7 @@ def main() -> int:
              test_buys_sized_to_cash, test_holiday_cycle_is_skipped,
              test_plan_orders_band_and_override, test_daily_action_timing,
              test_tax_model_hand_cases, test_rotation_hold_buffer,
+             test_alerter_resend_transport,
              test_pulse_levered_etf_expression,
              test_no_lookahead, test_single_source_of_truth,
              test_strategies_decide_cleanly, test_risk_overlay_recovers,
