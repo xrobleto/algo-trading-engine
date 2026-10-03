@@ -22,16 +22,18 @@ import os
 import time
 import traceback
 from datetime import datetime, timedelta, timezone
-from typing import Dict
+from typing import Dict, List, Optional
 from zoneinfo import ZoneInfo
 
 import pandas as pd
 
 from ..config import build_default_config
 from ..data import cache, calendar
+from ..data import universe as _universe
 from ..paths import log_dir, state_dir
 from ..strategies.base import MarketView
 from ..strategies.registry import build_all
+from . import report as R
 from .alerts import Alerter
 from .intelligence import compute_regime
 from .killswitch import KillSwitch
@@ -69,6 +71,8 @@ MAX_GROSS_ENV = "HORIZON_MAX_GROSS"
 _STATE_FILE = "engine_state.json"
 _LEDGER_FILE = "ledger.json"
 _HALT_FILE = "HALT_ALL_TRADING"
+_TRACKER_FILE = "performance.json"     # daily-report performance tracker
+FILL_CONFIRM_SEC = 90                  # how long to wait for fills before reporting
 _LAST_CYCLE_FILE = "last_cycle.txt"   # records the ET date of the most recent cycle
 
 
@@ -267,10 +271,10 @@ def size_buys_to_cash(buys, cash: float, buffer: float = CASH_BUFFER):
 
 
 def _wait_for_cash(broker, need: float, sells, log, max_wait: int = SELL_FILL_WAIT_SEC,
-                   poll: int = SELL_POLL_SEC) -> float:
-    """Return the account's cash once it covers `need` or once the queued
-    sells have all left the open-order book (filled/cancelled) or max_wait
-    elapses. Buys are sized to whatever cash is available at that point."""
+                   poll: int = SELL_POLL_SEC):
+    """Return (cash, timed_out): the account's cash once it covers `need`, or
+    once the queued sells have all left the open-order book, or when max_wait
+    elapses (timed_out=True). Buys are sized to whatever cash is available."""
     sell_syms = {o["symbol"] for o in sells}
     # A 09:00 cycle's sells fill at the 09:30 open. A fixed 30-minute wait left
     # ~10 seconds of margin (sells filled 13:30:06 UTC against a 13:30:17
@@ -289,30 +293,59 @@ def _wait_for_cash(broker, need: float, sells, log, max_wait: int = SELL_FILL_WA
         try:
             cash = float(broker.get_account()["cash"])
             if cash * (1.0 - CASH_BUFFER) >= need:
-                return cash
+                return cash, False
             if sell_syms:
                 open_syms = {o.get("symbol") for o in broker.get_open_orders()}
                 if not (sell_syms & open_syms):
-                    return cash          # sells done; this is all the cash there is
+                    return cash, False   # sells done; this is all the cash there is
             else:
-                return cash              # nothing pending that could add cash
+                return cash, False       # nothing pending that could add cash
         except Exception as exc:
             log.warning("cash poll failed (%s)", exc)
         if time.time() >= deadline:
             log.warning("waited %ds for sells to fill; sizing buys to cash $%.0f",
                         max_wait, cash)
-            return cash
+            return cash, True
         log.info("waiting for sells to fill: cash $%.0f < need $%.0f", cash, need)
+        time.sleep(poll)
+
+
+def _confirm_fills(broker, coids, timeout: int = FILL_CONFIRM_SEC,
+                   poll: int = 5) -> Dict[str, dict]:
+    """Poll submitted orders until each is terminal or `timeout` passes, so the
+    report shows what actually filled. Market orders at the open fill in
+    seconds; a slow fill only delays the email."""
+    terminal = ("filled", "canceled", "cancelled", "expired", "rejected")
+    out: Dict[str, dict] = {}
+    deadline = time.time() + timeout
+    while True:
+        for c in coids:
+            if c in out and any(t in str(out[c].get("status", "")).lower() for t in terminal) \
+                    and "partially" not in str(out[c].get("status", "")).lower():
+                continue
+            try:
+                od = broker.get_order_by_client_id(c)
+                if od:
+                    out[c] = od
+            except Exception as exc:
+                log.warning("fill check failed for %s (%s)", c, exc)
+        done = all(c in out and any(t in str(out[c].get("status", "")).lower() for t in terminal)
+                   and "partially" not in str(out[c].get("status", "")).lower() for c in coids)
+        if done or time.time() >= deadline:
+            return out
         time.sleep(poll)
 
 
 def run_cycle(broker, strategies, cfg, ledger, kill_switch, alerter,
               dry_run: bool = True) -> dict:
     """Run one engine cycle: reconcile, decide, diff vs broker, submit (or log)."""
+    warnings: List[str] = []     # shown in the daily report; logged as they arise
     tripped, reason = kill_switch.is_triggered()
     if tripped:
         log.warning("KILL SWITCH active (%s) — new entries blocked", reason)
-        alerter.warning("kill switch active", f"New entries blocked: {reason}")
+        warnings.append(f"New buys are blocked by the kill switch ({reason}). Sells "
+                        f"still run. To resume, delete the HALT_ALL_TRADING file on "
+                        f"the /data volume or unset HORIZON_KILL_SWITCH.")
 
     dataset = cache.load_dataset()
     as_of = calendar.trading_days(dataset)[-1]
@@ -326,7 +359,9 @@ def run_cycle(broker, strategies, cfg, ledger, kill_switch, alerter,
                f"(limit {MAX_STALE_DAYS}). No orders will be placed. Check "
                f"Polygon access / cache freshness (horizon/data/cache.py).")
         log.critical("STALE DATA — cycle refused: %s", msg)
-        alerter.critical("STALE DATA — Horizon cycle refused", msg)
+        alerter.critical(*R.build_stale_data(str(as_of.date()),
+                                             str(cache.completed_through().date()),
+                                             MAX_STALE_DAYS))
         return {"as_of": str(as_of.date()), "stale_days": stale,
                 "orders_planned": 0, "orders_submitted": 0,
                 "mode": "STALE-DATA (refused)"}
@@ -350,6 +385,7 @@ def run_cycle(broker, strategies, cfg, ledger, kill_switch, alerter,
     # ONE live account, HORIZON_CAPITAL_CAP bounds the equity Horizon sizes
     # against (the Unified Engine reserves the same amount via its HORIZON
     # sleeve). Without this, both engines would deploy against the full account.
+    account_equity = equity     # performance is reported on the whole account
     _cap = float(os.getenv("HORIZON_CAPITAL_CAP", "0") or 0)
     if _cap > 0 and equity > _cap:
         log.info("capital cap: account equity $%.0f -> capped at $%.0f", equity, _cap)
@@ -368,23 +404,26 @@ def run_cycle(broker, strategies, cfg, ledger, kill_switch, alerter,
                         for s in rec.orphan_symbols
                         if abs(positions.get(s, {}).get("market_value", 0.0))
                         >= ORPHAN_ALERT_MIN_USD}
-            if material:   # dust (e.g. SGOV $0.09, XLK $0.01) is logged, not emailed
-                alerter.warning("orphaned positions detected",
-                                f"Positions with no engine record: {material}. "
-                                f"The engine will not trade these — review and "
-                                f"resolve manually.")
+            if material:   # dust (e.g. SGOV $0.09, XLK $0.01) is logged, not reported
+                warnings.append("Positions Horizon does not own and will not trade: "
+                                + ", ".join(f"{s} ${v:,.0f}" for s, v in material.items())
+                                + ". Keep or sell them manually.")
         if rec.conflicts:
             kill_switch.trigger(f"ownership conflict: {rec.conflicts}")
-            alerter.critical("ownership conflict — kill switch tripped",
-                             f"Conflicting sleeve ownership: {rec.conflicts}")
+            alerter.critical(*R.build_conflict(rec.conflicts))
 
     budgets = SleeveManager(cfg).budgets(equity, ledger, regime)
 
     # Each admitted sleeve decides; targets are summed into an account book.
     states = _load_states(strategies)
+    _cash_legs = {_universe.PULSE_CASH_ASSET, _universe.ROTATION_CASH_ASSET}
+    prev_rotation = sorted(s for s in states.get("ROTATION", {}).get("holdings", {})
+                           if s not in _cash_legs)
+    decisions = {}
     account_target: Dict[str, float] = {}
     for sid in ADMITTED_SLEEVES:
         decision = strategies[sid].decide(view, states[sid])
+        decisions[sid] = decision
         for sym, weight in decision.target_weights.items():
             account_target[sym] = (account_target.get(sym, 0.0)
                                    + weight * budgets[sid].sleeve_equity)
@@ -415,11 +454,10 @@ def run_cycle(broker, strategies, cfg, ledger, kill_switch, alerter,
             # x0.97 is the designed steady state on a cash account (the 3%
             # buffer). Only a clamp materially beyond it is worth an email.
             if funding_scale < 1.0 - FUNDING_BUFFER - FUNDING_ALERT_MARGIN:
-                alerter.warning("funding guard engaged",
-                                f"Targets scaled x{funding_scale:.3f}: the account "
-                                f"(multiplier {acct.get('multiplier', 1.0):.0f}x) "
-                                f"cannot fund the full vol-targeted book. Enable "
-                                f"margin, lower book_leverage, or accept the clamp.")
+                warnings.append(f"The account could fund only {funding_scale:.0%} of "
+                                f"the target book (normal is "
+                                f"{1 - FUNDING_BUFFER:.0%}). Usually unsettled cash "
+                                f"or a withdrawal; worth a look if it persists.")
         except Exception as exc:
             log.warning("funding guard unavailable (%s) — unguarded", exc)
 
@@ -448,6 +486,7 @@ def run_cycle(broker, strategies, cfg, ledger, kill_switch, alerter,
     sells = [o for o in orders if o["side"] == "sell"]
     buys = [o for o in orders if o["side"] == "buy"]
     submitted = 0
+    placed: List[tuple] = []          # (client_order_id or None, order dict)
 
     def _submit(o):
         coid = (f"{cfg.order_namespace}_{o['symbol']}_{o['side']}_"
@@ -456,20 +495,29 @@ def run_cycle(broker, strategies, cfg, ledger, kill_switch, alerter,
                                             o["qty"], coid)
         ledger.register_order("ENGINE", o["symbol"], o["side"], o["qty"],
                               coid, result.get("id"), o["notional"])
+        placed.append((coid, o))
 
     if dry_run or broker is None:
         for o in sells + buys:
             log.info("[DRY-RUN] %-4s %-5s qty=%.4f (~$%.0f)",
                      o["side"], o["symbol"], o["qty"], o["notional"])
+            placed.append((None, o))
     else:
         for o in sells:
             _submit(o)
             submitted += 1
         if buys:
             need = sum(o["notional"] for o in buys)
-            cash = _wait_for_cash(broker, need, sells, log)
-            buys = size_buys_to_cash(buys, cash)
-            for o in buys:
+            cash, timed_out = _wait_for_cash(broker, need, sells, log)
+            sized = size_buys_to_cash(buys, cash)
+            short = need - sum(o["notional"] for o in sized)
+            if short > 0.02 * max(account_equity, 1.0):
+                cause = ("Sells had not filled when the wait ran out"
+                         if timed_out else "There was less cash than planned")
+                warnings.append(f"{cause}, so buys were cut to the cash available. "
+                                f"The book is about ${short:,.0f} under target until "
+                                f"the next cycle.")
+            for o in sized:
                 if o["qty"] <= 0 or o["notional"] < MIN_ORDER_USD:
                     continue
                 _submit(o)
@@ -477,20 +525,109 @@ def run_cycle(broker, strategies, cfg, ledger, kill_switch, alerter,
 
     ledger.save(state_dir() / _LEDGER_FILE)
 
+    # --- the daily report --------------------------------------------------
+    fills = _confirm_fills(broker, [c for c, _ in placed if c]) if (
+        broker is not None and not dry_run and placed) else {}
+    report_orders, unfilled = [], []
+    for coid, o in placed:
+        od = fills.get(coid) if coid else None
+        filled = None
+        if od and float(od.get("filled_qty") or 0) > 0:
+            filled = float(od["filled_qty"]) * float(od.get("filled_avg_price") or 0)
+        status = str((od or {}).get("status", "")).lower()
+        if coid and any(x in status for x in ("rejected", "canceled", "cancelled", "expired")):
+            warnings.append(f"The order to {o['side']} {o['symbol']} was "
+                            f"{status.split('.')[-1]} by the broker.")
+        elif coid and filled is None:
+            unfilled.append(o["symbol"])
+        report_orders.append({"symbol": o["symbol"], "side": o["side"],
+                              "notional": o["notional"], "filled": filled})
+    if unfilled:
+        warnings.append(f"Not filled {FILL_CONFIRM_SEC} seconds after submission: "
+                        f"{', '.join(unfilled)}. Check the account.")
+
+    holdings_after = {s: mv for s, mv in holdings_mv.items()
+                      if abs(mv) >= ORPHAN_ALERT_MIN_USD}
+    cash_after = 0.0
+    close_equity = account_equity    # fallback: 9:00 equity (includes pre-market moves)
+    if broker is not None:
+        try:
+            if placed:
+                holdings_after = {s: p["market_value"] for s, p in broker.get_positions().items()
+                                  if abs(p["market_value"]) >= ORPHAN_ALERT_MIN_USD}
+            acct_now = broker.get_account()
+            cash_after = float(acct_now["cash"])
+            close_equity = float(acct_now.get("last_equity") or account_equity)
+        except Exception as exc:
+            log.warning("post-trade snapshot failed (%s) — reporting pre-trade holdings", exc)
+
+    today_iso = datetime.now(ZoneInfo("America/New_York")).date().isoformat()
+    tracker_path = state_dir() / _TRACKER_FILE
+    tracker = R.load_tracker(tracker_path)
+    net_flow = 0.0
+    if broker is not None and tracker.get("last_report_date"):
+        try:
+            net_flow = broker.net_cash_flows(tracker["last_report_date"], today_iso)
+        except Exception as exc:
+            log.warning("deposit/withdrawal lookup failed (%s) — assuming none", exc)
+            warnings.append("Could not check for deposits or withdrawals today. If "
+                            "you moved money, today's change includes it.")
+    bench = {b: float(dataset[b]["tr_close"].loc[:as_of].iloc[-1])
+             for b in R.BENCHMARKS if b in dataset}
+    new_tracker, perf = R.update_tracker(tracker, str(as_of.date()), close_equity,
+                                         net_flow, bench)
+    new_tracker.update(last_report_date=today_iso, last_regime=regime.regime)
+
+    rot = decisions.get("ROTATION")
+    rotation_now = sorted(s for s in (rot.target_weights if rot else {}) if s not in _cash_legs)
+    pulse = decisions.get("PULSE")
+    pulse_lev = sum(w * (2.0 if s == _universe.PULSE_LEVERED_ASSET else 1.0)
+                    for s, w in (pulse.target_weights if pulse else {}).items()
+                    if s not in _cash_legs)
+    trade_reason = None
+    if placed:
+        if rot and rot.note.startswith("rebal") and set(rotation_now) != set(prev_rotation):
+            gone = [s for s in prev_rotation if s not in rotation_now]
+            new = [s for s in rotation_now if s not in prev_rotation]
+            trade_reason = (f"ROTATION's monthly rebalance swapped "
+                            f"{' + '.join(gone) or 'T-bills'} for {' + '.join(new) or 'T-bills'}. "
+                            f"The other holdings were reset to target at the same time.")
+        elif weight_gap > cfg.rebalance_band:
+            trade_reason = (f"Holdings had drifted {weight_gap:.0%} from target, past "
+                            f"the {cfg.rebalance_band:.0%} rebalance band.")
+        else:
+            trade_reason = "A position was fully entered or exited."
+    if dry_run or broker is None:
+        warnings.append("DRY-RUN: no real orders were placed.")
+
+    subject, body = R.build_daily_report(
+        as_of=str(as_of.date()), equity=close_equity, perf=perf, orders=report_orders,
+        trade_reason=trade_reason, drift=weight_gap, band=cfg.rebalance_band,
+        holdings=holdings_after, cash=cash_after, regime=regime.regime,
+        score=regime.score, prev_regime=tracker.get("last_regime"),
+        pulse_lev=pulse_lev, rotation=rotation_now, warnings=warnings)
+
+    if not dry_run and broker is not None:
+        R.save_tracker(tracker_path, new_tracker)
+        if perf.get("crossed"):
+            alerter.warning(*R.build_drawdown_alert(perf["crossed"], perf, close_equity))
+
     summary = {"as_of": str(as_of.date()), "stale_days": stale,
-               "regime": regime.regime,
-               "regime_score": round(regime.score, 1),
-               "equity": round(equity, 2), "orphans": len(orphan_symbols),
+               "regime": regime.regime, "regime_score": round(regime.score, 1),
+               "equity": round(account_equity, 2), "orphans": len(orphan_symbols),
                "funding_scale": round(funding_scale, 3),
                "ceiling_scale": round(ceiling_scale, 3),
                "weight_gap": round(weight_gap, 4), "band": cfg.rebalance_band,
                "orders_planned": len(orders), "orders_submitted": submitted,
+               "warnings": len(warnings),
                "mode": "dry-run" if (dry_run or broker is None) else "LIVE"}
     log.info("cycle: as_of=%s regime=%s score=%.0f equity=$%.0f ceil=x%.2f "
-             "fund=x%.2f gap=%.1f%% band=%.1f%% orders=%d %s", as_of.date(),
-             regime.regime, regime.score, equity, ceiling_scale, funding_scale,
-             weight_gap * 100, cfg.rebalance_band * 100, len(orders), summary["mode"])
-    alerter.heartbeat(summary)
+             "fund=x%.2f gap=%.1f%% band=%.1f%% orders=%d warnings=%d %s", as_of.date(),
+             regime.regime, regime.score, account_equity, ceiling_scale, funding_scale,
+             weight_gap * 100, cfg.rebalance_band * 100, len(orders), len(warnings),
+             summary["mode"])
+    alerter.heartbeat(subject, body)
+    summary["report_subject"], summary["report_body"] = subject, body
     return summary
 
 
@@ -509,7 +646,7 @@ def emergency_flatten(broker, kill_switch, alerter) -> dict:
            f"positions. Account is going flat. Kill-switch file written "
            f"({halt}) — remove it to resume trading.")
     log.critical("EMERGENCY FLATTEN: %s", msg)
-    alerter.critical("EMERGENCY FLATTEN executed", msg)
+    alerter.critical("Emergency flatten executed", msg)
     return {"orders_cancelled": n_orders, "positions_closed": n_positions}
 
 
@@ -562,7 +699,7 @@ def _safe_cycle(broker, strategies, cfg, ledger, kill_switch, alerter,
     except Exception:
         tb = traceback.format_exc()
         log.exception("cycle error")
-        alerter.critical("engine cycle failed", tb)
+        alerter.critical(*R.build_cycle_failed(tb))
     finally:
         _record_cycle_date()
 
@@ -598,6 +735,7 @@ def main() -> None:
 
     # --flatten always needs a real broker; otherwise connect best-effort.
     broker = None
+    startup_equity: Optional[float] = None
     if args.flatten or args.live:
         from .broker import create_broker_from_env
         broker = create_broker_from_env()
@@ -611,6 +749,7 @@ def main() -> None:
                    or "")  # for logging the prefix only
         try:
             account = broker.get_account()
+            startup_equity = float(account["equity"])
             log.info("broker AUTHORIZED: paper=%s, equity=$%.2f, status=%s",
                      broker.paper, account["equity"], account["status"])
             log.info("keys resolved from %s (prefix: %s...)",
@@ -624,17 +763,7 @@ def main() -> None:
                              "horizon/.env. Clear it and re-run:")
                 log.critical("  PowerShell: Remove-Item Env:\\ALPACA_API_KEY, "
                              "Env:\\ALPACA_SECRET_KEY")
-            alerter.critical(
-                "Horizon startup: broker auth failed",
-                f"create_broker_from_env succeeded but get_account returned:\n"
-                f"  {exc}\n\n"
-                f"Resolved key source: {key_source} "
-                f"(prefix: {api_key[:6] if api_key else '(.env)'}...).\n\n"
-                f"If the source is os.environ, a stale ALPACA_API_KEY in your "
-                f"shell is shadowing horizon/.env — clear it and re-run. "
-                f"Otherwise verify the keys in horizon/.env.\n\n"
-                f"The engine REFUSED to start to avoid silently sitting in "
-                f"dry-run.")
+            alerter.critical(*R.build_auth_failed(str(exc)))
             raise SystemExit(2)
     else:
         try:
@@ -657,14 +786,15 @@ def main() -> None:
         # delivery from the deployed network at boot rather than at the next
         # cycle. A crash loop (restartPolicy ON_FAILURE, max 10) emails at most
         # 10 times — which is exactly when you want to hear about it.
-        alerter.send("engine started",
-                     f"Horizon started in daily mode "
-                     f"({'LIVE' if not dry_run else 'dry-run'}).\n"
-                     f"sleeves: {ADMITTED_SLEEVES}\n"
-                     f"book_leverage: {cfg.book_leverage:.2f}x\n"
-                     f"rebalance band: {cfg.rebalance_band:.0%} "
-                     f"(signal override {cfg.rebalance_signal_override:.0%})\n"
-                     f"next cycle: weekdays {DAILY_RUN_HOUR_ET:02d}:00 ET",
+        _et = ZoneInfo("America/New_York")
+        _now = datetime.now(_et)
+        if daily_action(_now, _last_cycle_date(), True) == "cycle":
+            _next = "today, now (catching up)"
+        else:
+            _nxt = _now + timedelta(seconds=_seconds_until_daily_run())
+            _next = f"{_nxt:%a %b} {_nxt.day}, 9:00 AM ET"
+        alerter.send(*R.build_restart(f"{_now:%a %b} {_now.day}, {_now:%I:%M %p} ET",
+                                      startup_equity, _next, live=not dry_run),
                      level="INFO", dedup_minutes=0)
         et = ZoneInfo("America/New_York")
         while True:

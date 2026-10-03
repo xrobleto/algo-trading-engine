@@ -112,7 +112,9 @@ class Alerter:
         if last is not None and (now - last) < timedelta(minutes=dedup_minutes):
             return  # suppress a repeating alert
         self._recent[subject] = now
-        full_subject = f"[Horizon {level}] {subject}"
+        # Severity goes in words a person scans for, not log levels.
+        prefix = "ACTION NEEDED: " if level == "CRITICAL" else ""
+        full_subject = f"[Horizon] {prefix}{subject}"
         try:
             if self.transport == "resend":
                 ref = self._send_resend(full_subject, body or subject)
@@ -128,12 +130,11 @@ class Alerter:
     def warning(self, subject: str, body: str = "") -> None:
         self.send(subject, body, level="WARNING")
 
-    def heartbeat(self, summary: Dict[str, object]) -> None:
-        """Send a once-per-day INFO heartbeat so silence means something broke."""
+    def heartbeat(self, subject: str, body: str) -> None:
+        """Send the once-per-day report. It doubles as a heartbeat: no report
+        on a trading day means the engine did not run."""
         today = datetime.now(timezone.utc).date()
         if self._last_heartbeat_date == today:
             return
         self._last_heartbeat_date = today
-        body = "\n".join(f"{k}: {v}" for k, v in summary.items())
-        self.send(f"daily heartbeat {today}", body, level="INFO",
-                  dedup_minutes=0)
+        self.send(subject, body, level="INFO", dedup_minutes=0)

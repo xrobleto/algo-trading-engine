@@ -133,8 +133,8 @@ def test_alerter_never_raises():
     a.send("subject", "body", level="CRITICAL")
     a.warning("w")
     a.critical("c")
-    a.heartbeat({"regime": "RISK_ON", "equity": 7400})
-    a.heartbeat({"regime": "RISK_ON", "equity": 7400})  # once-per-day no-op
+    a.heartbeat("report", "body")
+    a.heartbeat("report", "body")  # once-per-day no-op
 
 
 def test_alerter_resend_transport():
@@ -166,7 +166,7 @@ def test_alerter_resend_transport():
         assert url == A.RESEND_URL and kw["timeout"] == A.HTTP_TIMEOUT
         assert kw["headers"]["Authorization"] == "Bearer re_test"
         assert kw["json"]["to"] == ["me@x.com", "you@x.com"]
-        assert kw["json"]["subject"] == "[Horizon CRITICAL] hello"
+        assert kw["json"]["subject"] == "[Horizon] ACTION NEEDED: hello"
         A.requests.post = lambda url, **kw: _Resp(422)      # rejected: logged only
         a.send("rejected", "b", dedup_minutes=0)
         def boom(url, **kw): raise OSError("network down")
@@ -179,6 +179,78 @@ def test_alerter_resend_transport():
                 os.environ.pop(k, None)
             else:
                 os.environ[k] = v
+
+
+def test_performance_tracker():
+    """Deposits are not gains, withdrawals are not drawdowns, the week rolls on
+    the reported session, and each 10% drawdown step alerts once until a new high."""
+    from ..engine.report import update_tracker
+    b = lambda q, s: {"QQQ": q, "SPY": s}
+    st, p = update_tracker({}, "2026-10-01", 7000.0, 0.0, b(100, 100))
+    assert p["first"] and p["drawdown"] == 0.0
+    # +1% with a $3,000 deposit the same day: reported as +1%, not +44%
+    st, p = update_tracker(st, "2026-10-02", 10070.0, 3000.0, b(101, 100))
+    assert abs(p["chg_pct"] - 0.01) < 1e-12 and abs(p["bench"]["QQQ"] - 0.01) < 1e-12
+    assert p["new_high"] and abs(p["peak"] - 10070.0) < 1e-9
+    # a $1,000 withdrawal with flat markets is not a drawdown
+    st, p = update_tracker(st, "2026-10-05", 9070.0, -1000.0, b(101, 100))
+    assert abs(p["chg_abs"]) < 1e-9 and abs(p["drawdown"]) < 1e-12 and p["crossed"] is None
+    # Monday's report (as_of Fri Oct 2) stayed in the old week; Tuesday's
+    # (as_of Mon Oct 5) rolled the week base to the prior report.
+    assert st["week"] == "2026-W41"
+    # -12%: one alert at the 10% step; -15% next day: no repeat; -21%: 20% step
+    st, p = update_tracker(st, "2026-10-06", 9070.0 * 0.88, 0.0, b(90, 90))
+    assert p["crossed"] == 0.10
+    st, p = update_tracker(st, "2026-10-07", 9070.0 * 0.85, 0.0, b(88, 88))
+    assert p["crossed"] is None
+    st, p = update_tracker(st, "2026-10-08", 9070.0 * 0.79, 0.0, b(80, 80))
+    assert p["crossed"] == 0.20
+    # a new high re-arms the steps
+    st, p = update_tracker(st, "2026-10-09", 9500.0, 0.0, b(105, 101))
+    assert p["new_high"] and st["dd_alerted"] == []
+
+
+def test_daily_report_content():
+    """The report leads with performance vs benchmarks, explains trades,
+    shows holdings and exposure, lists only real warnings, and never leaks
+    engine internals."""
+    from ..engine.report import build_daily_report, update_tracker
+    st, _ = update_tracker({}, "2026-09-30", 7000.0, 0.0, {"QQQ": 100, "SPY": 100})
+    st, perf = update_tracker(st, "2026-10-01", 7070.0, 0.0, {"QQQ": 100.5, "SPY": 100.2})
+    common = dict(as_of="2026-10-01", equity=7070.0, perf=perf, drift=0.067, band=0.40,
+                  holdings={"QQQM": 3561.0, "QLD": 2225.0, "PDBC": 1086.0}, cash=206.0,
+                  regime="RISK_ON", score=73, prev_regime="NEUTRAL", pulse_lev=1.37,
+                  rotation=["PDBC", "QQQM"])
+    subj, body = build_daily_report(orders=[], trade_reason=None, warnings=[], **common)
+    assert subj == "$7,070 +1.00% (QQQ +0.50%) · held"
+    assert "Today: no trades" in body and "within 6.7% of target" in body
+    assert "Nasdaq-100 exposure: 1.13x" in body and "changed from NEUTRAL" in body
+    assert "Warnings" not in body
+    for internal in ("funding", "ceiling", "orders_planned", "stale_days", "weight_gap"):
+        assert internal not in body.lower(), internal
+    orders = [{"symbol": "IEFA", "side": "sell", "notional": 1065.0, "filled": 1064.8},
+              {"symbol": "QQQM", "side": "buy", "notional": 615.0, "filled": None}]
+    subj, body = build_daily_report(orders=orders, trade_reason="ROTATION swapped IEFA for QQQM.",
+                                    warnings=["Not filled 90 seconds after submission: QQQM."],
+                                    **common)
+    assert subj.endswith("· 2 trades · 1 warning")
+    assert "- Sold IEFA $1,065" in body and "- Bought QQQM $615 (not filled yet)" in body
+    assert body.index("Warnings:") < body.index("Today:")
+
+
+def test_event_emails_are_actionable():
+    from ..engine.report import (build_auth_failed, build_cycle_failed,
+                                 build_drawdown_alert, build_stale_data)
+    s, b = build_cycle_failed("Traceback...\n  File x\nValueError: boom")
+    assert "Error: ValueError: boom" in b and "will not retry today" in b
+    s, b = build_stale_data("2026-09-29", "2026-10-01", 4)
+    assert "No orders were placed" in b
+    s, b = build_auth_failed("401 unauthorized")
+    assert "horizon-live" in b and "PowerShell" not in b
+    s, b = build_drawdown_alert(0.10, {"drawdown": -0.12, "peak": 8000.0,
+                                       "peak_as_of": "2026-10-01"}, 7040.0)
+    assert s == "Drawdown passed -10%: now -12.0% from peak"
+    assert "within the backtested range" in b
 
 
 def test_emergency_flatten_requires_broker():
@@ -460,7 +532,8 @@ def main() -> int:
              test_buys_sized_to_cash, test_holiday_cycle_is_skipped,
              test_plan_orders_band_and_override, test_daily_action_timing,
              test_tax_model_hand_cases, test_rotation_hold_buffer,
-             test_alerter_resend_transport,
+             test_alerter_resend_transport, test_performance_tracker,
+             test_daily_report_content, test_event_emails_are_actionable,
              test_pulse_levered_etf_expression,
              test_no_lookahead, test_single_source_of_truth,
              test_strategies_decide_cleanly, test_risk_overlay_recovers,

@@ -21,12 +21,36 @@ class BrokerFacade:
         from alpaca.trading.client import TradingClient
         self._client = TradingClient(api_key, secret_key, paper=paper)
         self.paper = paper
+        self._rest = ("https://paper-api.alpaca.markets" if paper
+                      else "https://api.alpaca.markets")
+        self._headers = {"APCA-API-KEY-ID": api_key, "APCA-API-SECRET-KEY": secret_key}
+
+    def net_cash_flows(self, after_iso: str, through_iso: str) -> float:
+        """Net external cash in (+) / out (-) dated after `after_iso` up to and
+        including `through_iso`: deposits, withdrawals, cash journals. Used to
+        keep deposits out of reported performance. Raises on API error."""
+        import requests
+        resp = requests.get(f"{self._rest}/v2/account/activities",
+                            headers=self._headers, timeout=15,
+                            params={"activity_types": "CSD,CSW,JNLC,JNLS",
+                                    "after": after_iso, "page_size": 100})
+        resp.raise_for_status()
+        total = 0.0
+        for a in resp.json() or []:
+            d = str(a.get("date", ""))[:10]
+            if after_iso < d <= through_iso:
+                total += float(a.get("net_amount") or 0.0)
+        return total
 
     # --- account / positions -------------------------------------------------
     def get_account(self) -> dict:
         a = self._client.get_account()
         return {
             "equity": float(a.equity),
+            # Equity at the previous trading day's 16:00 ET close. At the 9:00
+            # cycle that is the close of the session being reported (as_of),
+            # which lines up exactly with close-to-close benchmark returns.
+            "last_equity": float(getattr(a, "last_equity", None) or a.equity),
             "cash": float(a.cash),
             "buying_power": float(a.buying_power),
             "multiplier": float(getattr(a, "multiplier", 1) or 1),
