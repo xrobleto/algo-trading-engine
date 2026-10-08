@@ -25,22 +25,43 @@ class BrokerFacade:
                       else "https://api.alpaca.markets")
         self._headers = {"APCA-API-KEY-ID": api_key, "APCA-API-SECRET-KEY": secret_key}
 
-    def net_cash_flows(self, after_iso: str, through_iso: str) -> float:
-        """Net external cash in (+) / out (-) dated after `after_iso` up to and
-        including `through_iso`: deposits, withdrawals, cash journals. Used to
-        keep deposits out of reported performance. Raises on API error."""
+    def daily_closes(self, start_iso: str, end_iso: str) -> Dict[str, float]:
+        """Account equity at each session's close, keyed by session date.
+
+        Alpaca stamps each daily point at 20:00 ET on the session date (checked
+        2026-10-07 against last_equity on three dates), so the Eastern date of
+        the timestamp is the session. An explicit start/end is required: with
+        only a start the endpoint returns a short default window."""
+        import requests
+        from datetime import datetime, time as _t
+        from zoneinfo import ZoneInfo
+        et = ZoneInfo("America/New_York")
+        lo = datetime.combine(datetime.fromisoformat(start_iso).date(), _t(0, 0), et)
+        hi = datetime.combine(datetime.fromisoformat(end_iso).date(), _t(23, 59), et)
+        resp = requests.get(f"{self._rest}/v2/account/portfolio/history",
+                            headers=self._headers, timeout=20,
+                            params={"timeframe": "1D", "start": lo.isoformat(),
+                                    "end": hi.isoformat()})
+        resp.raise_for_status()
+        h = resp.json() or {}
+        return {datetime.fromtimestamp(t, et).date().isoformat(): float(e)
+                for t, e in zip(h.get("timestamp") or [], h.get("equity") or []) if e}
+
+    def cash_flows_by_date(self, after_iso: str, through_iso: str) -> Dict[str, float]:
+        """Net external cash in (+) / out (-) per date, after `after_iso` up to
+        and including `through_iso`: deposits, withdrawals, cash journals."""
         import requests
         resp = requests.get(f"{self._rest}/v2/account/activities",
                             headers=self._headers, timeout=15,
                             params={"activity_types": "CSD,CSW,JNLC,JNLS",
                                     "after": after_iso, "page_size": 100})
         resp.raise_for_status()
-        total = 0.0
+        out: Dict[str, float] = {}
         for a in resp.json() or []:
             d = str(a.get("date", ""))[:10]
             if after_iso < d <= through_iso:
-                total += float(a.get("net_amount") or 0.0)
-        return total
+                out[d] = out.get(d, 0.0) + float(a.get("net_amount") or 0.0)
+        return out
 
     # --- account / positions -------------------------------------------------
     def get_account(self) -> dict:

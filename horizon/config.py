@@ -81,6 +81,10 @@ class EngineConfig:
     # the plain band deferred exits up to 71 trading days).
     rebalance_signal_override: float = 0.10
 
+    # Daily-report performance is measured from this session's close: the last
+    # close before Horizon took over the whole account (CP3, 2026-09-05).
+    report_inception: str = "2026-09-04"
+
     sleeves: Dict[str, SleeveConfig] = field(default_factory=dict)
     # Constructor kwargs per strategy — THE single source of truth for the
     # parameters that trade live. strategies/registry.py applies them, and

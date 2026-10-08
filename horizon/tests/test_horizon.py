@@ -167,6 +167,9 @@ def test_alerter_resend_transport():
         assert kw["headers"]["Authorization"] == "Bearer re_test"
         assert kw["json"]["to"] == ["me@x.com", "you@x.com"]
         assert kw["json"]["subject"] == "[Horizon] ACTION NEEDED: hello"
+        assert "html" not in kw["json"]                       # text-only when no HTML
+        a.send("styled", "body", "<p>hi</p>", dedup_minutes=0)
+        assert calls[-1][1]["json"]["html"] == "<p>hi</p>"
         A.requests.post = lambda url, **kw: _Resp(422)      # rejected: logged only
         a.send("rejected", "b", dedup_minutes=0)
         def boom(url, **kw): raise OSError("network down")
@@ -181,76 +184,109 @@ def test_alerter_resend_transport():
                 os.environ[k] = v
 
 
-def test_performance_tracker():
-    """Deposits are not gains, withdrawals are not drawdowns, the week rolls on
-    the reported session, and each 10% drawdown step alerts once until a new high."""
-    from ..engine.report import update_tracker
-    b = lambda q, s: {"QQQ": q, "SPY": s}
-    st, p = update_tracker({}, "2026-10-01", 7000.0, 0.0, b(100, 100))
-    assert p["first"] and p["drawdown"] == 0.0
-    # +1% with a $3,000 deposit the same day: reported as +1%, not +44%
-    st, p = update_tracker(st, "2026-10-02", 10070.0, 3000.0, b(101, 100))
-    assert abs(p["chg_pct"] - 0.01) < 1e-12 and abs(p["bench"]["QQQ"] - 0.01) < 1e-12
-    assert p["new_high"] and abs(p["peak"] - 10070.0) < 1e-9
-    # a $1,000 withdrawal with flat markets is not a drawdown
-    st, p = update_tracker(st, "2026-10-05", 9070.0, -1000.0, b(101, 100))
-    assert abs(p["chg_abs"]) < 1e-9 and abs(p["drawdown"]) < 1e-12 and p["crossed"] is None
-    # Monday's report (as_of Fri Oct 2) stayed in the old week; Tuesday's
-    # (as_of Mon Oct 5) rolled the week base to the prior report.
-    assert st["week"] == "2026-W41"
-    # -12%: one alert at the 10% step; -15% next day: no repeat; -21%: 20% step
-    st, p = update_tracker(st, "2026-10-06", 9070.0 * 0.88, 0.0, b(90, 90))
-    assert p["crossed"] == 0.10
-    st, p = update_tracker(st, "2026-10-07", 9070.0 * 0.85, 0.0, b(88, 88))
-    assert p["crossed"] is None
-    st, p = update_tracker(st, "2026-10-08", 9070.0 * 0.79, 0.0, b(80, 80))
-    assert p["crossed"] == 0.20
-    # a new high re-arms the steps
-    st, p = update_tracker(st, "2026-10-09", 9500.0, 0.0, b(105, 101))
-    assert p["new_high"] and st["dd_alerted"] == []
+def test_performance_from_daily_closes():
+    """Time-weighted: a deposit is not a gain, a withdrawal is not a loss.
+    Windows pick the right base closes; benchmarks use the same dates; the
+    drawdown is measured from the flow-adjusted high."""
+    from ..engine.report import compute_performance, drawdown_steps
+    idx = pd.to_datetime(["2026-09-04", "2026-09-30", "2026-10-02", "2026-10-05", "2026-10-06"])
+    qqq = pd.Series([100.0, 104.0, 105.0, 106.0, 107.06], index=idx)
+    spy = pd.Series([100.0, 102.0, 102.0, 103.0, 103.0], index=idx)
+    closes = {"2026-09-04": 7000.0, "2026-09-30": 7280.0, "2026-10-02": 7280.0,
+              "2026-10-05": 10352.8, "2026-10-06": 10456.33}
+    flows = {"2026-10-05": 3000.0}            # deposit landed on Monday
+    p = compute_performance(closes, flows, {"QQQ": qqq, "SPY": spy}, "2026-10-06", "2026-09-04")
+    rows = {r["label"]: r for r in p["rows"]}
+    assert list(rows) == ["Last session", "Week to date", "Month to date", "Since Sep 4"]
+    # Monday: (10352.8 - 3000) / 7280 = +1.0%, not +42%
+    assert abs(rows["Week to date"]["horizon"] - (1.01 * (10456.33 / 10352.8) - 1)) < 1e-9
+    assert abs(rows["Last session"]["horizon"] - (10456.33 / 10352.8 - 1)) < 1e-9
+    assert abs(p["chg_abs"] - (10456.33 - 10352.8)) < 1e-9
+    assert rows["Week to date"]["base"] == "2026-10-02" and rows["Month to date"]["base"] == "2026-09-30"
+    assert abs(rows["Since Sep 4"]["QQQ"] - 0.0706) < 1e-9
+    assert p["new_high"] and p["drawdown"] == 0.0
+    assert p["peak_equity"] == 10456.33
+    # a withdrawal with flat markets is not a drawdown
+    closes2 = dict(closes, **{"2026-10-07": 9456.33})
+    q2 = pd.concat([qqq, pd.Series([107.06], index=pd.to_datetime(["2026-10-07"]))])
+    p2 = compute_performance(closes2, dict(flows, **{"2026-10-07": -1000.0}),
+                             {"QQQ": q2, "SPY": spy}, "2026-10-07", "2026-09-04")
+    assert abs(p2["rows"][0]["horizon"]) < 1e-12 and abs(p2["drawdown"]) < 1e-12
+    # as_of missing from closes -> None (caller falls back to last_equity)
+    assert compute_performance(closes, flows, {"QQQ": qqq}, "2026-10-09", "2026-09-04") is None
+    # drawdown steps: one alert per 10% step, re-armed at a new high
+    st, c = drawdown_steps({}, {"drawdown": -0.12, "peak_date": "2026-10-06"})
+    assert c == 0.10
+    st, c = drawdown_steps(st, {"drawdown": -0.15, "peak_date": "2026-10-06"})
+    assert c is None
+    st, c = drawdown_steps(st, {"drawdown": -0.21, "peak_date": "2026-10-06"})
+    assert c == 0.20
+    st, c = drawdown_steps(st, {"drawdown": 0.0, "peak_date": "2026-11-02"})
+    assert c is None and st["dd_alerted"] == []
+
+
+def _sample_perf():
+    from ..engine.report import compute_performance
+    idx = pd.to_datetime(["2026-09-04", "2026-09-30", "2026-10-05", "2026-10-06"])
+    qqq = pd.Series([100.0, 102.0, 103.0, 103.474], index=idx)
+    spy = pd.Series([100.0, 101.0, 101.5, 102.058], index=idx)
+    return compute_performance({"2026-09-04": 6829.61, "2026-09-30": 7008.32,
+                                "2026-10-05": 7156.43, "2026-10-06": 7205.14}, {},
+                               {"QQQ": qqq, "SPY": spy}, "2026-10-06", "2026-09-04")
 
 
 def test_daily_report_content():
-    """The report leads with performance vs benchmarks, explains trades,
-    shows holdings and exposure, lists only real warnings, and never leaks
-    engine internals."""
-    from ..engine.report import build_daily_report, update_tracker
-    st, _ = update_tracker({}, "2026-09-30", 7000.0, 0.0, {"QQQ": 100, "SPY": 100})
-    st, perf = update_tracker(st, "2026-10-01", 7070.0, 0.0, {"QQQ": 100.5, "SPY": 100.2})
-    common = dict(as_of="2026-10-01", equity=7070.0, perf=perf, drift=0.067, band=0.40,
-                  holdings={"QQQM": 3561.0, "QLD": 2225.0, "PDBC": 1086.0}, cash=206.0,
-                  regime="RISK_ON", score=73, prev_regime="NEUTRAL", pulse_lev=1.37,
+    """Leads with performance vs QQQ and SPY in a table, explains trades, shows
+    holdings and exposure, warnings only when real, and no engine internals.
+    Text and HTML carry the same facts."""
+    from ..engine.report import build_daily_report
+    perf = _sample_perf()
+    common = dict(as_of="2026-10-06", perf=perf, equity=7205.14, drift=0.002, band=0.40,
+                  holdings={"QQQM": 3600.0, "QLD": 2280.0, "PDBC": 1119.0}, cash=206.14,
+                  regime="RISK_ON", score=74, prev_regime="NEUTRAL", pulse_lev=1.48,
                   rotation=["PDBC", "QQQM"])
-    subj, body = build_daily_report(orders=[], trade_reason=None, warnings=[], **common)
-    assert subj == "$7,070 +1.00% (QQQ +0.50%) · held"
-    assert "Today: no trades" in body and "within 6.7% of target" in body
-    assert "Nasdaq-100 exposure: 1.13x" in body and "changed from NEUTRAL" in body
-    assert "Warnings" not in body
+    subj, text, html = build_daily_report(orders=[], trade_reason=None, warnings=[], **common)
+    assert subj == "$7,205 +0.68% · QQQ +0.46% · SPY +0.55% · held", subj
+    for label in ("Last session", "Week to date", "Month to date", "Since Sep 4"):
+        assert label in text and label in html
+    assert "vs QQQ" in text and ">vs SPY</th>" in html
+    assert "Nasdaq-100 exposure" in text and "1.13x" in html and "changed from NEUTRAL" in text
+    assert "Warnings" not in text and "Warnings" not in html
     for internal in ("funding", "ceiling", "orders_planned", "stale_days", "weight_gap"):
-        assert internal not in body.lower(), internal
+        assert internal not in text.lower() and internal not in html.lower(), internal
+    assert html.startswith("<!doctype html>") and "max-width:600px" in html
     orders = [{"symbol": "IEFA", "side": "sell", "notional": 1065.0, "filled": 1064.8},
               {"symbol": "QQQM", "side": "buy", "notional": 615.0, "filled": None}]
-    subj, body = build_daily_report(orders=orders, trade_reason="ROTATION swapped IEFA for QQQM.",
-                                    warnings=["Not filled 90 seconds after submission: QQQM."],
-                                    **common)
+    subj, text, html = build_daily_report(orders=orders, trade_reason="ROTATION swapped IEFA for QQQM.",
+                                          warnings=["Not filled 90 seconds after submission: QQQM."],
+                                          **common)
     assert subj.endswith("· 2 trades · 1 warning")
-    assert "- Sold IEFA $1,065" in body and "- Bought QQQM $615 (not filled yet)" in body
-    assert body.index("Warnings:") < body.index("Today:")
+    assert "- Sold IEFA $1,065" in text and "- Bought QQQM $615 (not filled yet)" in text
+    assert text.index("Warnings:") < text.index("Today:")
+    assert html.index("Warnings") < html.index("Today") and "IEFA" in html
+    # Performance unavailable: still a complete report, no crash
+    subj, text, html = build_daily_report(orders=[], trade_reason=None, warnings=["x"],
+                                          **dict(common, perf=None))
+    assert subj.startswith("$7,205 · held") and "unavailable" in text
 
 
 def test_event_emails_are_actionable():
-    from ..engine.report import (build_auth_failed, build_cycle_failed,
-                                 build_drawdown_alert, build_stale_data)
-    s, b = build_cycle_failed("Traceback...\n  File x\nValueError: boom")
-    assert "Error: ValueError: boom" in b and "will not retry today" in b
-    s, b = build_stale_data("2026-09-29", "2026-10-01", 4)
-    assert "No orders were placed" in b
-    s, b = build_auth_failed("401 unauthorized")
-    assert "horizon-live" in b and "PowerShell" not in b
-    s, b = build_drawdown_alert(0.10, {"drawdown": -0.12, "peak": 8000.0,
-                                       "peak_as_of": "2026-10-01"}, 7040.0)
-    assert s == "Drawdown passed -10%: now -12.0% from peak"
-    assert "within the backtested range" in b
+    from ..engine.report import (build_auth_failed, build_cycle_failed, build_drawdown_alert,
+                                 build_flatten, build_restart, build_stale_data)
+    s, t, h = build_cycle_failed("Traceback...\n  File x\nValueError: boom")
+    assert "Error: ValueError: boom" in t and "will not retry today" in t and "ValueError: boom" in h
+    s, t, h = build_stale_data("2026-09-29", "2026-10-01", 4)
+    assert "No orders were placed" in t and s == "No trades today, market data is stale"
+    s, t, h = build_auth_failed("401 unauthorized")
+    assert "horizon-live" in t and "PowerShell" not in t
+    perf = dict(_sample_perf(), drawdown=-0.12, peak_date="2026-09-22", peak_equity=8000.0)
+    s, t, h = build_drawdown_alert(0.10, perf)
+    assert s == "Drawdown passed -10%: now -12.0% from the high" and "within the backtested range" in t
+    s, t, h = build_restart("Fri Oct 2, 10:49 PM ET", 7097.18, "Mon Oct 5, 9:00 AM ET", True)
+    assert s.startswith("Restarted") and "trading live" in t
+    s, t, h = build_flatten("Cancelled 0 orders.")
+    for html in (h,):
+        assert html.startswith("<!doctype html>")
 
 
 def test_emergency_flatten_requires_broker():
@@ -532,7 +568,7 @@ def main() -> int:
              test_buys_sized_to_cash, test_holiday_cycle_is_skipped,
              test_plan_orders_band_and_override, test_daily_action_timing,
              test_tax_model_hand_cases, test_rotation_hold_buffer,
-             test_alerter_resend_transport, test_performance_tracker,
+             test_alerter_resend_transport, test_performance_from_daily_closes,
              test_daily_report_content, test_event_emails_are_actionable,
              test_pulse_levered_etf_expression,
              test_no_lookahead, test_single_source_of_truth,

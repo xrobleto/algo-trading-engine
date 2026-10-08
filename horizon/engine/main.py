@@ -71,7 +71,7 @@ MAX_GROSS_ENV = "HORIZON_MAX_GROSS"
 _STATE_FILE = "engine_state.json"
 _LEDGER_FILE = "ledger.json"
 _HALT_FILE = "HALT_ALL_TRADING"
-_TRACKER_FILE = "performance.json"     # daily-report performance tracker
+_REPORT_STATE_FILE = "report_state.json"  # drawdown-step and regime memory for the report
 FILL_CONFIRM_SEC = 90                  # how long to wait for fills before reporting
 _LAST_CYCLE_FILE = "last_cycle.txt"   # records the ET date of the most recent cycle
 
@@ -546,37 +546,64 @@ def run_cycle(broker, strategies, cfg, ledger, kill_switch, alerter,
         warnings.append(f"Not filled {FILL_CONFIRM_SEC} seconds after submission: "
                         f"{', '.join(unfilled)}. Check the account.")
 
-    holdings_after = {s: mv for s, mv in holdings_mv.items()
-                      if abs(mv) >= ORPHAN_ALERT_MIN_USD}
+    # Holdings after today's trades, valued at the as_of close so they add up
+    # to the reported equity (9:00 broker marks include pre-market moves).
+    as_of_iso = str(as_of.date())
     cash_after = 0.0
     close_equity = account_equity    # fallback: 9:00 equity (includes pre-market moves)
+    pos_after = positions
     if broker is not None:
         try:
             if placed:
-                holdings_after = {s: p["market_value"] for s, p in broker.get_positions().items()
-                                  if abs(p["market_value"]) >= ORPHAN_ALERT_MIN_USD}
+                pos_after = broker.get_positions()
             acct_now = broker.get_account()
             cash_after = float(acct_now["cash"])
             close_equity = float(acct_now.get("last_equity") or account_equity)
         except Exception as exc:
             log.warning("post-trade snapshot failed (%s) — reporting pre-trade holdings", exc)
+    holdings_after = {}
+    for sym, p in pos_after.items():
+        qty = float(p.get("qty", 0.0) or 0.0)
+        mv = qty * view.close(sym) if (qty and view.is_tradable(sym)) else float(p.get("market_value", 0.0))
+        if abs(mv) >= ORPHAN_ALERT_MIN_USD:
+            holdings_after[sym] = mv
 
+    # Performance, recomputed from Alpaca's daily closes every day (no running
+    # tally), time-weighted so deposits and withdrawals are not returns.
     today_iso = datetime.now(ZoneInfo("America/New_York")).date().isoformat()
-    tracker_path = state_dir() / _TRACKER_FILE
-    tracker = R.load_tracker(tracker_path)
-    net_flow = 0.0
-    if broker is not None and tracker.get("last_report_date"):
+    perf = None
+    if broker is not None:
         try:
-            net_flow = broker.net_cash_flows(tracker["last_report_date"], today_iso)
+            closes = broker.daily_closes(cfg.report_inception, today_iso)
+            perf_date = as_of_iso
+            if as_of_iso not in closes and closes and max(closes) < as_of_iso:
+                latest = max(closes)
+                if abs(closes[latest] - close_equity) > 0.01:
+                    closes[as_of_iso] = close_equity   # history lags; last_equity is as_of's close
+                else:
+                    # last_equity still describes the previous close (Alpaca rolls it
+                    # overnight), so as_of's close is not known yet: report the latest
+                    # close available rather than mislabel one day's equity as another's.
+                    perf_date = latest
+            elif as_of_iso in closes and abs(closes[as_of_iso] - close_equity) > 1.0:
+                log.warning("history close %.2f != last_equity %.2f for %s",
+                            closes[as_of_iso], close_equity, as_of_iso)
+            flows = broker.cash_flows_by_date(cfg.report_inception, today_iso)
+            bench = {b: dataset[b]["tr_close"] for b in R.BENCHMARKS if b in dataset}
+            perf = R.compute_performance(closes, flows, bench, perf_date, cfg.report_inception)
         except Exception as exc:
-            log.warning("deposit/withdrawal lookup failed (%s) — assuming none", exc)
-            warnings.append("Could not check for deposits or withdrawals today. If "
-                            "you moved money, today's change includes it.")
-    bench = {b: float(dataset[b]["tr_close"].loc[:as_of].iloc[-1])
-             for b in R.BENCHMARKS if b in dataset}
-    new_tracker, perf = R.update_tracker(tracker, str(as_of.date()), close_equity,
-                                         net_flow, bench)
-    new_tracker.update(last_report_date=today_iso, last_regime=regime.regime)
+            log.warning("performance unavailable (%s)", exc)
+        if perf is None:
+            warnings.append("Performance figures could not be computed today (Alpaca's "
+                            "account history did not load). Trading was not affected.")
+
+    state_path = state_dir() / _REPORT_STATE_FILE
+    rstate = R.load_state(state_path)
+    prev_regime = rstate.get("last_regime")
+    crossed = None
+    if perf is not None:
+        rstate, crossed = R.drawdown_steps(rstate, perf)
+    rstate.update(last_regime=regime.regime, last_report_date=today_iso)
 
     rot = decisions.get("ROTATION")
     rotation_now = sorted(s for s in (rot.target_weights if rot else {}) if s not in _cash_legs)
@@ -600,17 +627,17 @@ def run_cycle(broker, strategies, cfg, ledger, kill_switch, alerter,
     if dry_run or broker is None:
         warnings.append("DRY-RUN: no real orders were placed.")
 
-    subject, body = R.build_daily_report(
-        as_of=str(as_of.date()), equity=close_equity, perf=perf, orders=report_orders,
+    subject, body, html = R.build_daily_report(
+        as_of=as_of_iso, perf=perf, equity=close_equity, orders=report_orders,
         trade_reason=trade_reason, drift=weight_gap, band=cfg.rebalance_band,
         holdings=holdings_after, cash=cash_after, regime=regime.regime,
-        score=regime.score, prev_regime=tracker.get("last_regime"),
+        score=regime.score, prev_regime=prev_regime,
         pulse_lev=pulse_lev, rotation=rotation_now, warnings=warnings)
 
     if not dry_run and broker is not None:
-        R.save_tracker(tracker_path, new_tracker)
-        if perf.get("crossed"):
-            alerter.warning(*R.build_drawdown_alert(perf["crossed"], perf, close_equity))
+        R.save_state(state_path, rstate)
+        if crossed:
+            alerter.warning(*R.build_drawdown_alert(crossed, perf))
 
     summary = {"as_of": str(as_of.date()), "stale_days": stale,
                "regime": regime.regime, "regime_score": round(regime.score, 1),
@@ -626,8 +653,8 @@ def run_cycle(broker, strategies, cfg, ledger, kill_switch, alerter,
              regime.regime, regime.score, account_equity, ceiling_scale, funding_scale,
              weight_gap * 100, cfg.rebalance_band * 100, len(orders), len(warnings),
              summary["mode"])
-    alerter.heartbeat(subject, body)
-    summary["report_subject"], summary["report_body"] = subject, body
+    alerter.heartbeat(subject, body, html)
+    summary["report_subject"], summary["report_body"], summary["report_html"] = subject, body, html
     return summary
 
 
@@ -646,7 +673,7 @@ def emergency_flatten(broker, kill_switch, alerter) -> dict:
            f"positions. Account is going flat. Kill-switch file written "
            f"({halt}) — remove it to resume trading.")
     log.critical("EMERGENCY FLATTEN: %s", msg)
-    alerter.critical("Emergency flatten executed", msg)
+    alerter.critical(*R.build_flatten(msg))
     return {"orders_cancelled": n_orders, "positions_closed": n_positions}
 
 

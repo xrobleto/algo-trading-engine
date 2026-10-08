@@ -72,25 +72,28 @@ class Alerter:
     def _recipients(self):
         return [a.strip() for a in (self.to or "").split(",") if a.strip()]
 
-    def _send_resend(self, subject: str, body: str) -> str:
+    def _send_resend(self, subject: str, body: str, html: Optional[str] = None) -> str:
         resp = requests.post(
             RESEND_URL,
             headers={"Authorization": f"Bearer {self.resend_key}",
                      "Content-Type": "application/json"},
             json={"from": self.resend_from, "to": self._recipients(),
-                  "subject": subject, "text": body},
+                  "subject": subject, "text": body,
+                  **({"html": html} if html else {})},
             timeout=HTTP_TIMEOUT)
         if resp.status_code >= 300:
             # Never log the key; the response body carries Resend's reason.
             raise RuntimeError(f"Resend HTTP {resp.status_code}: {resp.text[:200]}")
         return str((resp.json() or {}).get("id", "?"))
 
-    def _send_smtp(self, subject: str, body: str) -> str:
+    def _send_smtp(self, subject: str, body: str, html: Optional[str] = None) -> str:
         msg = EmailMessage()
         msg["Subject"] = subject
         msg["From"] = self.sender
         msg["To"] = ", ".join(self._recipients())
         msg.set_content(body)
+        if html:
+            msg.add_alternative(html, subtype="html")
         context = ssl.create_default_context()
         with smtplib.SMTP(self.smtp_server, self.smtp_port,
                           timeout=SMTP_TIMEOUT) as server:
@@ -99,8 +102,8 @@ class Alerter:
             server.send_message(msg)
         return "smtp"
 
-    def send(self, subject: str, body: str, level: str = "INFO",
-             dedup_minutes: int = 240) -> None:
+    def send(self, subject: str, body: str, html: Optional[str] = None,
+             level: str = "INFO", dedup_minutes: int = 240) -> None:
         """Send an alert. Always logs; emails if enabled and not a duplicate."""
         logger = {"CRITICAL": log.critical, "WARNING": log.warning}.get(
             level, log.info)
@@ -117,24 +120,24 @@ class Alerter:
         full_subject = f"[Horizon] {prefix}{subject}"
         try:
             if self.transport == "resend":
-                ref = self._send_resend(full_subject, body or subject)
+                ref = self._send_resend(full_subject, body or subject, html)
             else:
-                ref = self._send_smtp(full_subject, body or subject)
+                ref = self._send_smtp(full_subject, body or subject, html)
             log.info("alert emailed via %s (%s): %s", self.transport, ref, subject)
         except Exception as exc:  # noqa: BLE001 — alerting must not crash the engine
             log.warning("alert email failed (%s): %s", subject, exc)
 
-    def critical(self, subject: str, body: str = "") -> None:
-        self.send(subject, body, level="CRITICAL")
+    def critical(self, subject: str, body: str = "", html: Optional[str] = None) -> None:
+        self.send(subject, body, html, level="CRITICAL")
 
-    def warning(self, subject: str, body: str = "") -> None:
-        self.send(subject, body, level="WARNING")
+    def warning(self, subject: str, body: str = "", html: Optional[str] = None) -> None:
+        self.send(subject, body, html, level="WARNING")
 
-    def heartbeat(self, subject: str, body: str) -> None:
+    def heartbeat(self, subject: str, body: str, html: Optional[str] = None) -> None:
         """Send the once-per-day report. It doubles as a heartbeat: no report
         on a trading day means the engine did not run."""
         today = datetime.now(timezone.utc).date()
         if self._last_heartbeat_date == today:
             return
         self._last_heartbeat_date = today
-        self.send(subject, body, level="INFO", dedup_minutes=0)
+        self.send(subject, body, html, level="INFO", dedup_minutes=0)
