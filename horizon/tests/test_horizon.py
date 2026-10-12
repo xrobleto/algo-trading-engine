@@ -548,6 +548,29 @@ def test_core_floor_and_never_sold():
     assert r.core_shares > 0 and low >= r.core_shares - 1e-6
 
 
+def test_one_time_rebalance():
+    """A new token forces one rebalance through the band; once applied it does
+    not repeat; never under the kill switch. With the band bypassed, the
+    0.22 -> 0.25 switch (a ~12% gap) trades; with the band it would hold."""
+    from ..engine.main import forced_rebalance_due, plan_orders
+    assert forced_rebalance_due("t1", "", False)
+    assert not forced_rebalance_due("t1", "t1", False)
+    assert forced_rebalance_due("t2", "t1", False)
+    assert not forced_rebalance_due("t1", "", True)
+    assert not forced_rebalance_due("", "", False)
+    eq = 7134.0
+    held = {"QQQM": 3569.0, "QLD": 2229.0, "PDBC": 1131.0}
+    target = {"QQQM": 2711.0, "QLD": 3139.0, "PDBC": 1070.0}       # ~12% shift QQQM -> QLD
+    px = {"QQQM": 310.0, "QLD": 98.0, "PDBC": 19.5}
+    o, hit, gap = plan_orders(target, held, {}, px, set(), eq, band=0.40, min_trade_frac=0.005,
+                              signal_override=0.10)
+    assert o == [] and not hit and 0.10 < gap < 0.40
+    o, hit, _ = plan_orders(target, held, {}, px, set(), eq, band=0.0, min_trade_frac=0.005)
+    sides = {(x["symbol"], x["side"]) for x in o}
+    assert hit and ("QQQM", "sell") in sides and ("QLD", "buy") in sides
+    assert ("PDBC", "sell") in sides        # $61 > 0.5% min trade; dust would be skipped
+
+
 def test_holiday_cycle_is_skipped():
     """Weekends never cycle; a weekday the broker calendar marks as closed is
     skipped; a calendar failure falls back to 'weekday = session'."""
@@ -593,6 +616,7 @@ def main() -> int:
     tests = [test_cache_freshness_is_evaluated_per_call, test_stale_cycle_is_refused,
              test_funding_guard_scales_to_account_capacity, test_gross_ceiling,
              test_buys_sized_to_cash, test_holiday_cycle_is_skipped, test_core_floor_and_never_sold,
+             test_one_time_rebalance,
              test_plan_orders_band_and_override, test_daily_action_timing,
              test_tax_model_hand_cases, test_rotation_hold_buffer,
              test_alerter_resend_transport, test_performance_from_daily_closes,

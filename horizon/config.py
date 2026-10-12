@@ -80,6 +80,14 @@ class EngineConfig:
     # band immediately, so strategy signals never wait for drift (addendum A:
     # the plain band deferred exits up to 71 trading days).
     rebalance_signal_override: float = 0.10
+    # One-time rebalance: when this token differs from the last one applied
+    # (state file rebalance_token.txt), the next live cycle ignores the band
+    # once and trades the whole book to target, then records the token. Used
+    # when a config change should take effect now rather than at the next band
+    # trigger. Change the token to request another; "" disables.
+    rebalance_now_token: str = "2026-10-12-pulse-tv025"
+    rebalance_now_note: str = ("One-time rebalance to the new 25% volatility target: PULSE "
+                               "now carries more QLD in calm markets.")
 
     # Daily-report performance is measured from this session's close: the last
     # close before Horizon took over the whole account (CP3, 2026-09-05).
@@ -137,8 +145,13 @@ def build_default_config() -> EngineConfig:
     # bar: engine 19.3% CAGR / Sharpe 0.84 / MaxDD -24.8% at book 1.0, versus
     # 19.3% / 0.65 / -34.2% for the margin config at 1.5x — same return, a
     # third less drawdown, no borrowing.
+    # 2026-10-12: target_vol 0.22 -> 0.25 on the pre-registered leverage study
+    # (docs/LEVERAGE_STUDY.md, user-approved): after tax (ST 32% / LT 15%)
+    # 14.6% -> 16.4% vs QQQ 15.4%; Sharpe 1.09 unchanged; account MaxDD -25.9%
+    # -> -28.5%; dot-com stress -41.8% -> -45.1%. 0.275 failed the original
+    # -45% PULSE drawdown limit (-45.1%) and is not eligible.
     strategy_params = {
-        "PULSE": {"target_vol": 0.22, "leverage_via": "levered_etf"},
+        "PULSE": {"target_vol": 0.25, "leverage_via": "levered_etf"},
         "ROTATION": {"lookbacks": (47, 95, 189)},
     }
     cfg = EngineConfig(sleeves=sleeves, strategy_params=strategy_params)

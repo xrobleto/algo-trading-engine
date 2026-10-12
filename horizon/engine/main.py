@@ -71,6 +71,7 @@ MAX_GROSS_ENV = "HORIZON_MAX_GROSS"
 _STATE_FILE = "engine_state.json"
 _LEDGER_FILE = "ledger.json"
 _HALT_FILE = "HALT_ALL_TRADING"
+_REBALANCE_TOKEN_FILE = "rebalance_token.txt"   # last one-time rebalance applied
 _REPORT_STATE_FILE = "report_state.json"  # drawdown-step and regime memory for the report
 FILL_CONFIRM_SEC = 90                  # how long to wait for fills before reporting
 _LAST_CYCLE_FILE = "last_cycle.txt"   # records the ET date of the most recent cycle
@@ -336,6 +337,24 @@ def _confirm_fills(broker, coids, timeout: int = FILL_CONFIRM_SEC,
         time.sleep(poll)
 
 
+def forced_rebalance_due(token: str, applied: str, kill_switch_tripped: bool) -> bool:
+    """A one-time rebalance runs when the configured token is new. Never under
+    the kill switch: it blocks buys, so a forced rebalance would only sell."""
+    return bool(token) and token != applied and not kill_switch_tripped
+
+
+def _applied_rebalance_token() -> str:
+    path = state_dir() / _REBALANCE_TOKEN_FILE
+    try:
+        return path.read_text(encoding="utf-8").strip() if path.exists() else ""
+    except OSError:
+        return ""
+
+
+def _record_rebalance_token(token: str) -> None:
+    (state_dir() / _REBALANCE_TOKEN_FILE).write_text(token, encoding="utf-8")
+
+
 def run_cycle(broker, strategies, cfg, ledger, kill_switch, alerter,
               dry_run: bool = True) -> dict:
     """Run one engine cycle: reconcile, decide, diff vs broker, submit (or log)."""
@@ -470,11 +489,16 @@ def run_cycle(broker, strategies, cfg, ledger, kill_switch, alerter,
     holdings_mv = {s: p.get("market_value", 0.0) for s, p in positions.items()}
     prices = {s: view.close(s) for s in set(account_target) | set(holdings_mv) | set(pending)
               if view.is_tradable(s)}
+    token = getattr(cfg, "rebalance_now_token", "")
+    forced = forced_rebalance_due(token, _applied_rebalance_token(), tripped)
+    band_now = 0.0 if forced else cfg.rebalance_band
+    if forced:
+        log.info("one-time rebalance %s: band bypassed for this cycle", token)
     orders, band_hit, weight_gap = plan_orders(
         account_target, holdings_mv, pending, prices, orphan_symbols, equity,
-        band=cfg.rebalance_band, min_trade_frac=cfg.rebalance_min_trade,
+        band=band_now, min_trade_frac=cfg.rebalance_min_trade,
         block_buys=tripped, signal_override=cfg.rebalance_signal_override)
-    if cfg.rebalance_band > 0 and not band_hit:
+    if band_now > 0 and not band_hit:
         log.info("rebalance band: largest weight gap %.2f%% <= band %.2f%% — holding",
                  weight_gap * 100, cfg.rebalance_band * 100)
 
@@ -524,6 +548,10 @@ def run_cycle(broker, strategies, cfg, ledger, kill_switch, alerter,
                 submitted += 1
 
     ledger.save(state_dir() / _LEDGER_FILE)
+    if forced and not dry_run and broker is not None:
+        # Recorded only once orders are in (or nothing needed trading), so a
+        # cycle that fails before this point retries the rebalance next time.
+        _record_rebalance_token(token)
 
     # --- the daily report --------------------------------------------------
     fills = _confirm_fills(broker, [c for c, _ in placed if c]) if (
@@ -612,7 +640,9 @@ def run_cycle(broker, strategies, cfg, ledger, kill_switch, alerter,
                     for s, w in (pulse.target_weights if pulse else {}).items()
                     if s not in _cash_legs)
     trade_reason = None
-    if placed:
+    if placed and forced:
+        trade_reason = getattr(cfg, "rebalance_now_note", "") or "One-time rebalance to target."
+    elif placed:
         if rot and rot.note.startswith("rebal") and set(rotation_now) != set(prev_rotation):
             gone = [s for s in prev_rotation if s not in rotation_now]
             new = [s for s in rotation_now if s not in prev_rotation]

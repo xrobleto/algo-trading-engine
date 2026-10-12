@@ -35,8 +35,8 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 DRAWDOWN_STEPS = (0.10, 0.20, 0.30, 0.40)
-BACKTEST_MAX_DD = 0.26   # account simulator 2008-2026, live config (docs/TAX_STUDY.md)
-STRESS_DD = 0.42         # dot-com-style bust estimate (2026-09-25 review)
+BACKTEST_MAX_DD = 0.29   # account simulator 2008-2026, live config: -28.5% (docs/LEVERAGE_STUDY.md)
+STRESS_DD = 0.45         # dot-com-style bust estimate at target_vol 0.25 (docs/LEVERAGE_STUDY.md)
 NASDAQ_WEIGHTS = {"QQQ": 1.0, "QQQM": 1.0, "QLD": 2.0}
 BENCHMARKS = ("QQQ", "SPY")
 

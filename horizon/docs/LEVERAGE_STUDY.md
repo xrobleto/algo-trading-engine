@@ -47,3 +47,23 @@ Dot-com stress is the synthetic model fixed in the pre-registration (price index
 - PASS — L8 dot-com >= -50%: -48.4%
 
 **Selection: target_vol 0.25.** Per the pre-registration this is NOT deployed automatically; the user decides.
+
+## Double-check before deployment (2026-10-12, not part of the pre-registered selection)
+
+| check | 0.22 (live) | 0.25 |
+|---|--:|--:|
+| Second backtest engine (harness portfolio, overlay off): CAGR / MaxDD | 20.15% / −26.7% | 21.39% / −28.8% |
+| High-rate era only, 2022-01 → 2026-10, after tax 32/15 / MaxDD | 16.63% / −19.4% | 18.04% / −19.8% |
+| Doubled trading costs, after tax 32/15 | 14.41% | 16.28% |
+| Rolling 1-year windows where 0.25 beats 0.22 (pre-tax) | — | 70% (worst −6.1 pts, ending 2015-08) |
+| Rolling 3-year / 5-year windows where 0.25 beats 0.22 | — | 96% / 100% |
+| Synthetic Oct-1987 crash, book drawdown | −22.0% | −24.5% |
+| Synthetic worst single day (1987-10-19) | −7.8% | −8.8% |
+| Synthetic lost decade 2000–2012, CAGR | 3.16% | 3.20% |
+| Days PULSE sits at the 2x cap, 2008–2026 | 18% | 27% |
+| Maximum possible Nasdaq-100 exposure | 1.46x | 1.46x |
+| Band 0.40 vs 0.20 at 0.25, after tax | — | 16.44% vs 15.17% (keep 0.40) |
+
+Live dry run (2026-10-12, branch `tv025-switch`): the one-time rebalance sells ~$859 QQQM and buys
+~$885 QLD (PULSE leverage 1.46x → 1.66x, Nasdaq-100 exposure 1.13x → ~1.25x); estimated realized
+short-term gain ~$18, tax ~$6. VALIDATION.md regenerated for 0.25: both sleeves admitted.
