@@ -571,6 +571,22 @@ def test_one_time_rebalance():
     assert ("PDBC", "sell") in sides        # $61 > 0.5% min trade; dust would be skipped
 
 
+def test_fill_wait_plan():
+    """Pre-market orders are confirmed after the open, not 90 seconds after
+    submission (the 2026-10-15 false warning); far-off opens report as queued."""
+    from ..engine.main import fill_wait_plan, MAX_OPEN_WAIT_SEC
+    assert fill_wait_plan(0) == (0.0, False)                     # market open: poll now
+    assert fill_wait_plan(1800) == (1800, False)                 # 9:00 cycle: wait 30 min
+    assert fill_wait_plan(MAX_OPEN_WAIT_SEC + 1) == (0.0, True)  # after hours: queued
+    from ..engine.report import build_daily_report
+    _, text, html = build_daily_report(
+        as_of="2026-10-14", perf=None, equity=6895.76,
+        orders=[{"symbol": "QLD", "side": "buy", "notional": 195.0, "filled": None, "queued": True}],
+        trade_reason="x", drift=0.03, band=0.40, holdings={"QQQM": 3463.0}, cash=206.0,
+        regime="RISK_ON", score=75, prev_regime="RISK_ON", pulse_lev=1.5, rotation=["QQQM"], warnings=[])
+    assert "queued for the next open" in text and "not filled" not in text
+
+
 def test_holiday_cycle_is_skipped():
     """Weekends never cycle; a weekday the broker calendar marks as closed is
     skipped; a calendar failure falls back to 'weekday = session'."""
@@ -616,7 +632,7 @@ def main() -> int:
     tests = [test_cache_freshness_is_evaluated_per_call, test_stale_cycle_is_refused,
              test_funding_guard_scales_to_account_capacity, test_gross_ceiling,
              test_buys_sized_to_cash, test_holiday_cycle_is_skipped, test_core_floor_and_never_sold,
-             test_one_time_rebalance,
+             test_one_time_rebalance, test_fill_wait_plan,
              test_plan_orders_band_and_override, test_daily_action_timing,
              test_tax_model_hand_cases, test_rotation_hold_buffer,
              test_alerter_resend_transport, test_performance_from_daily_closes,

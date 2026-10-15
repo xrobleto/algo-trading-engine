@@ -73,7 +73,8 @@ _LEDGER_FILE = "ledger.json"
 _HALT_FILE = "HALT_ALL_TRADING"
 _REBALANCE_TOKEN_FILE = "rebalance_token.txt"   # last one-time rebalance applied
 _REPORT_STATE_FILE = "report_state.json"  # drawdown-step and regime memory for the report
-FILL_CONFIRM_SEC = 90                  # how long to wait for fills before reporting
+FILL_CONFIRM_SEC = 180                 # after the open: how long to wait for fills
+MAX_OPEN_WAIT_SEC = 3600               # wait for the open only when it is this close
 _LAST_CYCLE_FILE = "last_cycle.txt"   # records the ET date of the most recent cycle
 
 
@@ -311,11 +312,29 @@ def _wait_for_cash(broker, need: float, sells, log, max_wait: int = SELL_FILL_WA
         time.sleep(poll)
 
 
+def fill_wait_plan(until_open: float):
+    """How the report confirms fills: (seconds to wait for the open first,
+    whether to report orders as queued without waiting). The 9:00 cycle submits
+    30 minutes before the open, so it waits for the open and then confirms
+    (2026-10-15: a 90-second check right after submission flagged three
+    healthy pre-market orders as unfilled). A cycle run long before the open
+    (e.g. an after-hours catch-up) reports its orders as queued instead."""
+    if until_open <= 0:
+        return 0.0, False
+    if until_open <= MAX_OPEN_WAIT_SEC:
+        return until_open, False
+    return 0.0, True
+
+
 def _confirm_fills(broker, coids, timeout: int = FILL_CONFIRM_SEC,
-                   poll: int = 5) -> Dict[str, dict]:
-    """Poll submitted orders until each is terminal or `timeout` passes, so the
-    report shows what actually filled. Market orders at the open fill in
-    seconds; a slow fill only delays the email."""
+                   poll: int = 5, wait_first: float = 0.0) -> Dict[str, dict]:
+    """Optionally wait for the open, then poll submitted orders until each is
+    terminal or `timeout` passes, so the report shows what actually filled.
+    Market orders at the open fill in seconds; a slow fill only delays the
+    email."""
+    if wait_first > 0:
+        log.info("waiting %.0f min for the open to confirm fills", wait_first / 60.0)
+        time.sleep(wait_first)
     terminal = ("filled", "canceled", "cancelled", "expired", "rejected")
     out: Dict[str, dict] = {}
     deadline = time.time() + timeout
@@ -554,8 +573,24 @@ def run_cycle(broker, strategies, cfg, ledger, kill_switch, alerter,
         _record_rebalance_token(token)
 
     # --- the daily report --------------------------------------------------
-    fills = _confirm_fills(broker, [c for c, _ in placed if c]) if (
-        broker is not None and not dry_run and placed) else {}
+    coids = [c for c, _ in placed if c]
+    fills: Dict[str, dict] = {}
+    queued = False
+    if broker is not None and not dry_run and coids:
+        try:
+            until_open = float(broker.seconds_until_open())
+        except Exception as exc:
+            log.warning("clock unavailable (%s) — confirming fills without waiting", exc)
+            until_open = 0.0
+        wait_first, queued = fill_wait_plan(until_open)
+        if queued:
+            for c in coids:
+                try:
+                    fills[c] = broker.get_order_by_client_id(c) or {}
+                except Exception as exc:
+                    log.warning("order status check failed for %s (%s)", c, exc)
+        else:
+            fills = _confirm_fills(broker, coids, wait_first=wait_first)
     report_orders, unfilled = [], []
     for coid, o in placed:
         od = fills.get(coid) if coid else None
@@ -569,9 +604,10 @@ def run_cycle(broker, strategies, cfg, ledger, kill_switch, alerter,
         elif coid and filled is None:
             unfilled.append(o["symbol"])
         report_orders.append({"symbol": o["symbol"], "side": o["side"],
-                              "notional": o["notional"], "filled": filled})
-    if unfilled:
-        warnings.append(f"Not filled {FILL_CONFIRM_SEC} seconds after submission: "
+                              "notional": o["notional"], "filled": filled,
+                              "queued": bool(queued and coid and filled is None)})
+    if unfilled and not queued:
+        warnings.append(f"Not filled within {FILL_CONFIRM_SEC // 60} minutes of the open: "
                         f"{', '.join(unfilled)}. Check the account.")
 
     # Holdings after today's trades, valued at the as_of close so they add up

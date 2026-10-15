@@ -260,7 +260,12 @@ def build_daily_report(*, as_of: str, perf: Optional[dict], equity: float,
     order_lines = []
     for o in sorted(orders, key=lambda o: (o["side"] != "sell", -o["notional"])):
         verb = "Sold" if o["side"] == "sell" else "Bought"
-        amt = _money(o["filled"]) if o.get("filled") is not None else f"{_money(o['notional'])} (not filled yet)"
+        if o.get("filled") is not None:
+            amt = _money(o["filled"])
+        elif o.get("queued"):
+            amt = f"{_money(o['notional'])} (queued for the next open)"
+        else:
+            amt = f"{_money(o['notional'])} (not filled yet)"
         order_lines.append((verb, o["symbol"], amt))
     if perf is None:
         dd_line = "Performance figures are unavailable today."
