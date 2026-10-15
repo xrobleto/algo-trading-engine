@@ -43,11 +43,36 @@ class AccountResult:
     final_marks: Dict[str, float] = field(default_factory=dict)
     rebalance_days: int = 0
     decision_days: int = 0
+    core_shares: float = 0.0
 
     def turnover(self) -> float:
         yrs = max(len(self.equity) / 252.0, 1e-9)
         traded = sum(t["shares"] * t["price"] for t in self.trades)
         return traded / (float(self.equity.mean()) * yrs)
+
+
+def apply_core_floor(target: Dict[str, float], core_value: float, core_sym: str,
+                     lev_sym: str, fundable: float) -> Dict[str, float]:
+    """Core + overlay (docs/CORE_OVERLAY_PREREG.md): deliver the engine's target
+    Nasdaq-100 exposure E = core_sym + 2 x lev_sym around a core that is never
+    sold. QQQ target = max(engine target, core value); the levered fund supplies
+    the rest of E at 2x; if that needs more capital than `fundable`, the levered
+    fund and the non-Nasdaq targets are scaled down. Identity when the core does
+    not bind."""
+    t = dict(target)
+    q0, d0 = t.get(core_sym, 0.0), t.get(lev_sym, 0.0)
+    exposure = q0 + 2.0 * d0
+    q = max(q0, core_value)
+    d = max(0.0, (exposure - q) / 2.0)
+    others = {k: v for k, v in t.items() if k not in (core_sym, lev_sym) and v > 0}
+    flex = d + sum(others.values())
+    room = max(0.0, fundable - q)
+    scale = 1.0 if (flex <= room or flex <= 0) else room / flex
+    out = {k: v * scale for k, v in others.items()}
+    out[core_sym] = q
+    if d * scale > 0:
+        out[lev_sym] = d * scale
+    return out
 
 
 def _px(ds, sym, d, field_name) -> Optional[float]:
@@ -62,7 +87,9 @@ def simulate(dataset: Dict[str, pd.DataFrame], strategies: Dict[str, Strategy],
              cfg: EngineConfig, start: str, end: str,
              starting_equity: float = 100_000.0, band: float = 0.0,
              min_trade_frac: float = 0.0, states: Optional[Dict[str, dict]] = None,
-             signal_override: float = 0.0, observer=None) -> AccountResult:
+             signal_override: float = 0.0, observer=None,
+             core_symbol: Optional[str] = None, core_frac: float = 0.0,
+             levered_symbol: Optional[str] = None) -> AccountResult:
     """observer(date, target, holdings_mv, equity, band_triggered), if given, is
     called after every decision — for diagnostics only; it cannot alter trading."""
     sids = [s for s, c in cfg.sleeves.items() if c.enabled]
@@ -74,14 +101,27 @@ def simulate(dataset: Dict[str, pd.DataFrame], strategies: Dict[str, Strategy],
     curve: Dict[pd.Timestamp, float] = {}
     pending_orders: List[dict] = []
     sm = SleeveManager(cfg)
+    core_shares = 0.0
+    use_core = bool(core_symbol) and core_frac > 0
 
     for T in days:
+        # 0. Core + overlay: buy the never-sold core at the first open.
+        if use_core and core_shares == 0.0:
+            px = _px(dataset, core_symbol, T, "open")
+            if px:
+                f = buy_fill(px, core_symbol, cfg.cost)
+                core_shares = core_frac * cash / f
+                cash -= core_shares * f
+                shares[core_symbol] = shares.get(core_symbol, 0.0) + core_shares
+                res.trades.append({"date": T, "symbol": core_symbol, "side": "buy",
+                                   "shares": core_shares, "price": f})
         # 1. Execute yesterday's plan at today's open: sells, then buys to cash.
         if pending_orders:
             for o in [o for o in pending_orders if o["side"] == "sell"]:
                 px = _px(dataset, o["symbol"], T, "open")
                 held = shares.get(o["symbol"], 0.0)
-                q = min(o["qty"], held)
+                floor = core_shares if (use_core and o["symbol"] == core_symbol) else 0.0
+                q = min(o["qty"], held - floor)     # the core is never sold
                 if px is None or q <= 0:
                     continue
                 f = sell_fill(px, o["symbol"], cfg.cost)
@@ -134,6 +174,11 @@ def simulate(dataset: Dict[str, pd.DataFrame], strategies: Dict[str, Strategy],
                 target[sym] = target.get(sym, 0.0) + w * budgets[sid].sleeve_equity
         positions = {s: {"market_value": v} for s, v in mv.items()}
         target, _scale, _fund = apply_funding_guard(target, positions, set(), cash, 1.0)
+        if use_core and core_shares > 0:
+            cpx = view.close(core_symbol) if view.is_tradable(core_symbol) else None
+            if cpx:
+                target = apply_core_floor(target, core_shares * cpx, core_symbol,
+                                          levered_symbol or "", _fund)
         prices = {s: view.close(s) for s in set(target) | set(mv) if view.is_tradable(s)}
         pending_orders, _hit, _gap = plan_orders(target, mv, {}, prices, set(), equity,
                                                  band=band, min_trade_frac=min_trade_frac,
@@ -143,6 +188,7 @@ def simulate(dataset: Dict[str, pd.DataFrame], strategies: Dict[str, Strategy],
         res.decision_days += 1
 
     res.equity = pd.Series(curve).sort_index()
+    res.core_shares = core_shares
     last = res.equity.index[-1]
     res.final_marks = {s: float(dataset[s]["close"].loc[:last].iloc[-1]) for s in shares}
     return res

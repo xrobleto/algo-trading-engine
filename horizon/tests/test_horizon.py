@@ -521,6 +521,33 @@ def test_rotation_hold_buffer():
     assert set(got) == {a, b}
 
 
+def test_core_floor_and_never_sold():
+    """Core + overlay: identity when the core does not bind; delivers the same
+    Nasdaq exposure around a binding core; keeps the core when the engine wants
+    less; scales the rest to capital; and the simulator never sells core shares,
+    even through the 2020 crash."""
+    from ..backtest.account_sim import apply_core_floor, simulate
+    t = {"QQQ": 3000.0, "QLD": 4000.0, "PDBC": 1500.0}
+    assert apply_core_floor(t, 2000.0, "QQQ", "QLD", 9000.0) == t
+    out = apply_core_floor({"QQQ": 3000.0, "QLD": 3000.0, "PDBC": 1500.0}, 5000.0, "QQQ", "QLD", 10000.0)
+    assert out["QQQ"] == 5000.0 and abs(out["QLD"] - 2000.0) < 1e-9          # E = 9000 kept
+    out = apply_core_floor({"QQQ": 2000.0, "PDBC": 3000.0}, 5000.0, "QQQ", "QLD", 9700.0)
+    assert out["QQQ"] == 5000.0 and "QLD" not in out and out["PDBC"] == 3000.0  # core kept
+    out = apply_core_floor({"QQQ": 2000.0, "QLD": 4000.0, "PDBC": 3000.0}, 6000.0, "QQQ", "QLD", 9000.0)
+    assert out["QQQ"] == 6000.0 and abs(out["QLD"] + out["PDBC"] - 3000.0) < 1e-9
+    ds = cache.load_dataset()
+    from ..config import build_default_config
+    r = simulate(ds, {s: registry.build(s) for s in ("PULSE", "ROTATION")}, build_default_config(),
+                 "2019-06-03", "2020-12-31", band=0.40, min_trade_frac=0.005, signal_override=0.10,
+                 core_symbol="QQQ", core_frac=0.5, levered_symbol="QLD")
+    held, low = 0.0, float("inf")
+    for tr in r.trades:
+        if tr["symbol"] == "QQQ":
+            held += tr["shares"] if tr["side"] == "buy" else -tr["shares"]
+            low = min(low, held)
+    assert r.core_shares > 0 and low >= r.core_shares - 1e-6
+
+
 def test_holiday_cycle_is_skipped():
     """Weekends never cycle; a weekday the broker calendar marks as closed is
     skipped; a calendar failure falls back to 'weekday = session'."""
@@ -565,7 +592,7 @@ def test_pulse_levered_etf_expression():
 def main() -> int:
     tests = [test_cache_freshness_is_evaluated_per_call, test_stale_cycle_is_refused,
              test_funding_guard_scales_to_account_capacity, test_gross_ceiling,
-             test_buys_sized_to_cash, test_holiday_cycle_is_skipped,
+             test_buys_sized_to_cash, test_holiday_cycle_is_skipped, test_core_floor_and_never_sold,
              test_plan_orders_band_and_override, test_daily_action_timing,
              test_tax_model_hand_cases, test_rotation_hold_buffer,
              test_alerter_resend_transport, test_performance_from_daily_closes,
