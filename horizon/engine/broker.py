@@ -47,6 +47,55 @@ class BrokerFacade:
         return {datetime.fromtimestamp(t, et).date().isoformat(): float(e)
                 for t, e in zip(h.get("timestamp") or [], h.get("equity") or []) if e}
 
+    def _rest_get(self, path: str, params: Optional[dict] = None, timeout: int = 20):
+        import requests
+        resp = requests.get(f"{self._rest}{path}", headers=self._headers,
+                            params=params or {}, timeout=timeout)
+        resp.raise_for_status()
+        return resp.json()
+
+    def calendar(self, start_iso: str, end_iso: str) -> List[dict]:
+        """Exchange sessions between two dates, inclusive: [{date, open, close}]
+        with open/close as timezone-aware ET datetimes (half days included)."""
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+        et = ZoneInfo("America/New_York")
+        out = []
+        for c in self._rest_get("/v2/calendar", {"start": start_iso, "end": end_iso}) or []:
+            d = str(c["date"])[:10]
+            out.append({"date": d,
+                        "open": datetime.fromisoformat(f"{d}T{c['open']}").replace(tzinfo=et),
+                        "close": datetime.fromisoformat(f"{d}T{c['close']}").replace(tzinfo=et)})
+        return out
+
+    def session_hours(self, day) -> Optional[tuple]:
+        """(open, close) ET datetimes for `day` (a date), or None if the market
+        is closed that day. Raises on API error."""
+        rows = self.calendar(day.isoformat(), day.isoformat())
+        row = next((r for r in rows if r["date"] == day.isoformat()), None)
+        return (row["open"], row["close"]) if row else None
+
+    def orders_since(self, after_utc_iso: str) -> List[dict]:
+        """Every order submitted after `after_utc_iso` (any status), oldest
+        first, as plain REST dicts (status strings like 'filled')."""
+        return self._rest_get("/v2/orders", {"status": "all", "after": after_utc_iso,
+                                             "limit": 500, "direction": "asc"}) or []
+
+    def all_activities(self) -> List[dict]:
+        """Every account activity since the account opened (fills, dividends,
+        fees, transfers), oldest first."""
+        out: List[dict] = []
+        token = None
+        while True:
+            params = {"page_size": 100, "direction": "asc"}
+            if token:
+                params["page_token"] = token
+            page = self._rest_get("/v2/account/activities", params, timeout=30) or []
+            out += page
+            if len(page) < 100:
+                return out
+            token = page[-1]["id"]
+
     def cash_flows_by_date(self, after_iso: str, through_iso: str) -> Dict[str, float]:
         """Net external cash in (+) / out (-) per date, after `after_iso` up to
         and including `through_iso`: deposits, withdrawals, cash journals."""

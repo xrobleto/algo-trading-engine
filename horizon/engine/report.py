@@ -1,26 +1,26 @@
 """What Horizon emails you, and when.
 
-Redesigned 2026-10-03 (content), restyled 2026-10-08 (HTML + benchmark-relative
-performance). Every email is written for a person deciding whether to act;
-engine internals stay in the logs.
+Redesigned 2026-10-03 (content), restyled 2026-10-08 (HTML, benchmarks), moved
+to after the close 2026-10-31. Every email is written for a person deciding
+whether to act; engine internals stay in the logs.
 
-  Daily report   After every weekday cycle. Performance vs QQQ and SPY for the
-                 last session, week, month and since Horizon took over the
-                 account; drawdown from the high; what traded and why;
-                 holdings; signals; and only the warnings that apply. It doubles
-                 as a heartbeat: no report by ~9:35 AM ET on a trading day means
-                 the engine did not run.
-  ACTION NEEDED  Something stopped or is wrong, with what to do: a failed cycle,
-                 stale data, rejected Alpaca keys, an ownership conflict, an
-                 emergency flatten.
+  Daily report   Once per market day, 30 minutes after the close (1:30 PM ET on
+                 half days): today vs QQQ and SPY, week, month and since Horizon
+                 took over the account, in percent and in dollars; this
+                 morning's trades with final fills; what tomorrow's open is
+                 expected to do; holdings; this year's realized gains for tax;
+                 signals; warnings only when they apply. It doubles as a
+                 heartbeat: no report by about 5 PM ET on a market day means
+                 the engine is not running. Built by engine/evening.py.
+  ACTION NEEDED  Sent immediately: a failed cycle, stale data, rejected Alpaca
+                 keys, an ownership conflict, an emergency flatten, a failed report.
   Drawdown       One email each time the account falls another 10% below its
                  high, with the backtested context. Re-armed at each new high.
   Restart        When the service starts (expected on deploys).
 
-Performance is time-weighted from Alpaca's daily closing equity, so deposits
-and withdrawals never count as gains or losses, and it is recomputed from
-scratch every day (no running tally to drift). Benchmarks use total-return
-closes, so their dividends count.
+Performance is time-weighted from the account's closing equity, so deposits and
+withdrawals never count as gains or losses, and it is recomputed from scratch
+every day. Benchmarks use total-return closes, so their dividends count.
 
 Every builder returns (subject, text, html). The HTML is table-based with inline
 styles, the format mail clients (Gmail web and app included) render reliably.
@@ -229,90 +229,145 @@ def _num(x: float, fmt) -> str:
     return f'<span style="color:{_color(x)};">{_e(fmt(x))}</span>'
 
 
-# --- daily report --------------------------------------------------------------
+# --- evening report ------------------------------------------------------------
 
-def build_daily_report(*, as_of: str, perf: Optional[dict], equity: float,
-                       orders: List[dict], trade_reason: Optional[str], drift: float,
-                       band: float, holdings: Dict[str, float], cash: float,
-                       regime: str, score: float, prev_regime: Optional[str],
-                       pulse_lev: float, rotation: List[str],
-                       warnings: List[str]) -> Email:
-    """orders: [{symbol, side, notional, filled}], filled = filled dollars or
-    None if not (yet) filled. holdings: dollar values after today's trades."""
-    eq = perf["equity"] if perf else equity
-    as_of = perf["as_of"] if perf else as_of      # the close the figures describe
-    n = len(orders)
+def _table(rows: List[Tuple[str, str]], muted_first: bool = True, width: int = 150) -> str:
+    cells = "".join(
+        f'<tr><td style="padding:3px 0;{f"color:{MUTED};" if muted_first else ""}width:{width}px;'
+        f'vertical-align:top;">{_e(k)}</td><td style="padding:3px 0;">{v}</td></tr>' for k, v in rows)
+    return f'<table role="presentation" cellpadding="0" cellspacing="0" style="font-size:13px;">{cells}</table>'
+
+
+def _order_rows(orders: List[dict], amount_key: str) -> List[Tuple[str, str, str]]:
+    out = []
+    for o in sorted(orders, key=lambda o: (o["side"] != "sell", -float(o.get("notional") or 0))):
+        verb = "Sold" if o["side"] == "sell" else "Bought"
+        amt = o.get(amount_key)
+        out.append((verb, o["symbol"], _money(amt) if amt is not None else
+                    f"{_money(o.get('notional') or 0)} (not filled)"))
+    return out
+
+
+def build_evening_report(*, day: str, perf: Optional[dict], equity: float,
+                         dollars: Optional[dict], trades: List[dict],
+                         trade_reason: Optional[str], cycle_note: Optional[str],
+                         outlook: Optional[dict], holdings: Dict[str, float], cash: float,
+                         signals: Optional[dict], prev_regime: Optional[str],
+                         tax: Optional[dict], warnings: List[str]) -> Email:
+    """The once-a-day report, sent after the close. See engine/evening.py."""
+    rows = [dict(r, label="Today" if r["label"] == "Last session" else r["label"])
+            for r in ((perf or {}).get("rows") or [])]
+    today = rows[0] if rows and rows[0]["label"] == "Today" else None
+    n = len(trades)
     act = "held" if n == 0 else f"{n} trade{'s' if n != 1 else ''}"
     warn_tag = f" · {len(warnings)} warning{'s' if len(warnings) != 1 else ''}" if warnings else ""
-    bs = (perf or {}).get("bench_session", {})
-    if perf and perf["rows"] and perf["rows"][0]["label"] == "Last session":
-        subject = (f"{_money(eq)} {_pct(perf['chg_pct'])} · QQQ {_pct(bs.get('QQQ', 0.0))} · "
-                   f"SPY {_pct(bs.get('SPY', 0.0))} · {act}{warn_tag}")
+    if today:
+        subject = (f"{_d(day)}: {_pct(today['horizon'])} · QQQ {_pct(today.get('QQQ', 0.0))} · "
+                   f"SPY {_pct(today.get('SPY', 0.0))} · {act}{warn_tag}")
     else:
-        subject = f"{_money(eq)} · {act}{warn_tag}"
+        subject = f"{_d(day)}: {_money(equity)} · {act}{warn_tag}"
 
-    # Narrative pieces shared by text and HTML.
-    if n == 0:
-        today_line = (f"No trades. Holdings are within {drift:.1%} of target; the engine "
-                      f"rebalances at {band:.0%}.")
-    else:
-        today_line = f"{n} trade{'s' if n != 1 else ''} at the open. {trade_reason or ''}".strip()
-    order_lines = []
-    for o in sorted(orders, key=lambda o: (o["side"] != "sell", -o["notional"])):
-        verb = "Sold" if o["side"] == "sell" else "Bought"
-        if o.get("filled") is not None:
-            amt = _money(o["filled"])
-        elif o.get("queued"):
-            amt = f"{_money(o['notional'])} (queued for the next open)"
-        else:
-            amt = f"{_money(o['notional'])} (not filled yet)"
-        order_lines.append((verb, o["symbol"], amt))
+    # ---- shared phrases ----
     if perf is None:
-        dd_line = "Performance figures are unavailable today."
+        dd_line = ""
     elif perf["new_high"]:
-        dd_line = "At a new high."
+        dd_line = "A new high."
     elif perf["drawdown"] > -0.0005:
         dd_line = "At its high."
     else:
         hi = f" of {_money(perf['peak_equity'])}" if perf.get("peak_equity") else ""
         dd_line = f"{abs(perf['drawdown']):.1%} below the {_md(perf['peak_date'])} high{hi}."
+    money_line = None
+    if dollars:
+        money_line = (f"Since {_md(dollars['since'])} in dollars: Horizon "
+                      f"{_money(dollars['Horizon'], signed=True)}. The same money in QQQ: "
+                      f"{_money(dollars['QQQ'], signed=True)}; in SPY: {_money(dollars['SPY'], signed=True)}.")
+    if n:
+        trades_line = f"{n} trade{'s' if n != 1 else ''} at the open. {trade_reason or ''}".strip()
+    else:
+        trades_line = cycle_note or "No trades this morning."
+    trade_rows = _order_rows(trades, "filled")
+    if outlook is None:
+        out_line, out_rows = "Tomorrow's outlook is unavailable today.", []
+    else:
+        when = f"{_d(outlook['session'])}'s open" if outlook.get("session") else "the next open"
+        if outlook["orders"]:
+            out_line = (f"Expected at {when}: {len(outlook['orders'])} trade"
+                        f"{'s' if len(outlook['orders']) != 1 else ''}. {outlook.get('reason') or ''} "
+                        f"Final orders are set at 9:00 AM ET.").replace("  ", " ")
+        else:
+            out_line = (f"No trades expected at {when}. Holdings are {outlook['gap']:.1%} from "
+                        f"target; the engine rebalances at {outlook['band']:.0%}.")
+        out_rows = [(("Sell" if o["side"] == "sell" else "Buy"), o["symbol"], f"about {_money(o['notional'])}")
+                    for o in sorted(outlook["orders"], key=lambda o: (o["side"] != "sell", -o["notional"]))]
     total = sum(holdings.values()) + cash
     nas = (sum(mv * NASDAQ_WEIGHTS.get(s, 0.0) for s, mv in holdings.items()) / total) if total > 0 else 0.0
-    reg = f"{regime} ({score:.0f})" + (f", changed from {prev_regime}" if prev_regime and prev_regime != regime else "")
-    rot = " + ".join(rotation) if rotation else "T-bills"
+    sig_rows = []
+    if signals:
+        reg = f"{signals['regime']} ({signals['score']:.0f})"
+        if prev_regime and prev_regime != signals["regime"]:
+            reg += f", changed from {prev_regime}"
+        rot = " + ".join(signals["rotation"]) if signals["rotation"] else "T-bills"
+        if signals.get("next_review"):
+            rot += f"; next review {_d(signals['next_review'])} close"
+        sig_rows = [("Market regime", reg), ("PULSE leverage", f"{signals['pulse_lev']:.2f}x target"),
+                    ("ROTATION holds", rot)]
+    tax_rows, tax_note = [], None
+    if tax:
+        st, lt = tax["st"], tax["lt"]
+        est, div_tax = tax["est_tax"], tax.get("div_tax", 0.0)
+        signed = lambda x: _money(x, signed=True) if abs(x) >= 0.5 else "$0"
+        if st + lt > 0:
+            est_txt = _money(est)
+        else:
+            est_txt = "none on trading (net loss so far)"
+            if div_tax >= 1:
+                est_txt += f"; about {_money(div_tax)} on dividends"
+        tax_rows = [("Realized short-term", signed(st)),
+                    ("Realized long-term", signed(lt)),
+                    ("Dividends", _money(tax["dividends"])),
+                    (f"Est. federal tax ({tax['rates'][0]:.0%} / {tax['rates'][1]:.0%})", est_txt),
+                    ("Unrealized on holdings", _money(tax["unrealized_st"] + tax["unrealized_lt"], signed=True))]
+        tax_note = ("Estimate for this account only, before losses from other accounts or prior "
+                    "years and state tax. Alpaca's 1099 is the official figure.")
 
     # ---- plain text ----
-    T = [f"Equity at {_d(as_of)} close: {_money(eq, cents=True)}"]
-    if perf and perf["rows"]:
-        if perf["rows"][0]["label"] == "Last session":
-            T.append(f"Last session: {_money(perf['chg_abs'], signed=True, cents=True)} ({_pct(perf['chg_pct'])})")
-        T += ["", "Performance (Horizon / QQQ / SPY, then Horizon minus each):"]
-        for r in perf["rows"]:
+    T = [f"Equity at {_d(day)} close: {_money(equity, cents=True)}"]
+    if today:
+        T.append(f"Today: {_money(perf['chg_abs'], signed=True, cents=True)} ({_pct(today['horizon'])}). {dd_line}".strip())
+    if rows:
+        T += ["", "Performance (Horizon / QQQ / SPY; then Horizon minus each, in points):"]
+        for r in rows:
             q, s = r.get("QQQ"), r.get("SPY")
-            line = f"- {r['label']}: {_pct(r['horizon'])} / {_pct(q) if q is not None else 'n/a'} / {_pct(s) if s is not None else 'n/a'}"
+            line = (f"- {r['label']}: {_pct(r['horizon'])} / {_pct(q) if q is not None else 'n/a'} / "
+                    f"{_pct(s) if s is not None else 'n/a'}")
             if q is not None and s is not None:
-                line += f" (vs QQQ {_pts(r['horizon'] - q)} pts, vs SPY {_pts(r['horizon'] - s)} pts)"
+                line += f" (vs QQQ {_pts(r['horizon'] - q)}, vs SPY {_pts(r['horizon'] - s)})"
             T.append(line)
-    T.append(dd_line)
+        if money_line:
+            T.append(money_line)
     if warnings:
         T += ["", "Warnings:"] + [f"- {w}" for w in warnings]
-    T += ["", f"Today: {today_line}"] + [f"- {v} {s} {a}" for v, s, a in order_lines]
+    T += ["", f"Trades today: {trades_line}"] + [f"- {v} {s} {a}" for v, s, a in trade_rows]
+    T += ["", f"Tomorrow: {out_line}"] + [f"- {v} {s} {a}" for v, s, a in out_rows]
     if total > 0:
-        T += ["", "Holdings:"]
+        T += ["", "Holdings at the close:"]
         T += [f"- {s} {_money(mv)} ({mv / total:.0%})" for s, mv in sorted(holdings.items(), key=lambda kv: -kv[1])]
         T += [f"- Cash {_money(cash)} ({cash / total:.0%})", f"Nasdaq-100 exposure: {nas:.2f}x (QLD counts double)."]
-    T += ["", "Signals:", f"- Market regime {reg}.", f"- PULSE leverage {pulse_lev:.2f}x.",
-          f"- ROTATION holds {rot}."]
+    if tax_rows:
+        T += ["", f"Taxes, {tax['year']} to date:"] + [f"- {k}: {v}" for k, v in tax_rows] + [tax_note]
+    if sig_rows:
+        T += ["", "Signals at today's close:"] + [f"- {k}: {v}" for k, v in sig_rows]
     text = "\n".join(T)
 
     # ---- HTML ----
-    hero = (f'<div style="font-size:30px;font-weight:700;letter-spacing:-.01em;">{_e(_money(eq, cents=True))}</div>'
-            f'<div style="font-size:13px;color:{MUTED};margin-top:2px;">Equity at {_e(_d(as_of))} close</div>')
-    if perf and perf["rows"] and perf["rows"][0]["label"] == "Last session":
+    hero = (f'<div style="font-size:30px;font-weight:700;letter-spacing:-.01em;">{_e(_money(equity, cents=True))}</div>'
+            f'<div style="font-size:13px;color:{MUTED};margin-top:2px;">Equity at the {_e(_d(day))} close</div>')
+    if today:
         hero += (f'<div style="font-size:15px;margin-top:8px;">'
                  f'<span style="color:{_color(perf["chg_abs"])};font-weight:600;">'
-                 f'{_e(_money(perf["chg_abs"], signed=True, cents=True))} ({_e(_pct(perf["chg_pct"]))})</span>'
-                 f'<span style="color:{MUTED};"> last session</span></div>')
+                 f'{_e(_money(perf["chg_abs"], signed=True, cents=True))} ({_e(_pct(today["horizon"]))})</span>'
+                 f'<span style="color:{MUTED};"> today</span></div>')
     chip_bg, chip_fg = ("#e8f0fe", "#1967d2") if n else ("#f1f3f4", MUTED)
     hero += (f'<div style="margin-top:10px;"><span style="display:inline-block;background:{chip_bg};'
              f'color:{chip_fg};font-size:12px;font-weight:600;padding:3px 10px;border-radius:12px;">'
@@ -320,9 +375,7 @@ def build_daily_report(*, as_of: str, perf: Optional[dict], equity: float,
              f'<span style="font-size:12px;color:{MUTED};margin-left:8px;">{_e(dd_line)}</span></div>')
     content = _section(None, hero)
 
-    if perf and perf["rows"]:
-        # Four columns so it fits a phone: the "vs" cells carry the gap in
-        # points on top and the benchmark's own return underneath.
+    if rows:
         th = (f'style="padding:6px 4px;font-size:11px;font-weight:600;color:{MUTED};'
               f'border-bottom:1px solid {LINE};text-align:right;"')
         head = (f'<tr><th width="30%" style="padding:6px 4px;font-size:11px;font-weight:600;'
@@ -338,31 +391,41 @@ def build_daily_report(*, as_of: str, perf: Optional[dict], equity: float,
             gap = r["horizon"] - v
             return (f'<td {td}><div style="font-weight:700;color:{_color(gap)};">{_e(_pts(gap))}</div>'
                     f'<div style="font-size:11px;color:{MUTED};margin-top:1px;white-space:nowrap;">{_e(_pct(v))}</div></td>')
-        body = ""
-        for r in perf["rows"]:
-            body += (f'<tr><td style="padding:8px 4px;border-bottom:1px solid {LINE};vertical-align:top;">'
-                     f'{_e(r["label"])}</td>'
-                     f'<td {td}><span style="font-weight:700;color:{_color(r["horizon"])};">'
-                     f'{_e(_pct(r["horizon"]))}</span></td>'
-                     f'{vs_cell(r, "QQQ")}{vs_cell(r, "SPY")}</tr>')
-        table = (f'<table role="presentation" width="100%" cellpadding="0" cellspacing="0" '
-                 f'style="border-collapse:collapse;font-size:13px;table-layout:fixed;">{head}{body}</table>'
-                 f'<div style="font-size:11px;color:{MUTED};margin-top:6px;line-height:1.4;">'
-                 f'vs QQQ and vs SPY: Horizon\'s return minus the benchmark\'s, in percentage points; '
-                 f'green means Horizon is ahead. The gray figure underneath is the benchmark\'s own return.</div>')
-        content += _section("Performance vs QQQ and SPY", table)
+        body = "".join(
+            f'<tr><td style="padding:8px 4px;border-bottom:1px solid {LINE};vertical-align:top;">{_e(r["label"])}</td>'
+            f'<td {td}><span style="font-weight:700;color:{_color(r["horizon"])};">{_e(_pct(r["horizon"]))}</span></td>'
+            f'{vs_cell(r, "QQQ")}{vs_cell(r, "SPY")}</tr>' for r in rows)
+        perf_html = (f'<table role="presentation" width="100%" cellpadding="0" cellspacing="0" '
+                     f'style="border-collapse:collapse;font-size:13px;table-layout:fixed;">{head}{body}</table>'
+                     f'<div style="font-size:11px;color:{MUTED};margin-top:6px;line-height:1.4;">'
+                     f'vs QQQ and vs SPY: Horizon\'s return minus the benchmark\'s, in percentage points; '
+                     f'green means Horizon is ahead. The gray figure is the benchmark\'s own return.</div>')
+        if dollars:
+            cell = lambda label, v, bold=False: (
+                f'<td style="padding:6px 4px;text-align:center;width:33%;">'
+                f'<div style="font-size:11px;color:{MUTED};">{_e(label)}</div>'
+                f'<div style="font-size:15px;font-weight:{700 if bold else 600};color:{_color(v)};">'
+                f'{_e(_money(v, signed=True))}</div></td>')
+            perf_html += (f'<div style="font-size:12px;color:{MUTED};margin:12px 0 4px 0;">'
+                          f'Since {_e(_md(dollars["since"]))} in dollars: Horizon vs the same money in each</div>'
+                          f'<table role="presentation" width="100%" cellpadding="0" cellspacing="0" '
+                          f'style="background:{BG};border-radius:6px;"><tr>'
+                          f'{cell("Horizon", dollars["Horizon"], True)}{cell("QQQ", dollars["QQQ"])}'
+                          f'{cell("SPY", dollars["SPY"])}</tr></table>')
+        content += _section("Performance vs QQQ and SPY", perf_html)
 
     if warnings:
         content += _section("Warnings", _callout(warnings))
 
-    trades_html = _para(today_line)
-    if order_lines:
-        rows = "".join(
-            f'<tr><td style="padding:4px 0;color:{RED if v == "Sold" else GREEN};font-weight:600;width:70px;">{_e(v)}</td>'
-            f'<td style="padding:4px 0;font-weight:600;">{_e(s)}</td>'
-            f'<td style="padding:4px 0;text-align:right;">{_e(a)}</td></tr>' for v, s, a in order_lines)
-        trades_html += f'<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="font-size:14px;">{rows}</table>'
-    content += _section("Today", trades_html)
+    def order_table(rws, green_word):
+        return ('<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="font-size:14px;">'
+                + "".join(f'<tr><td style="padding:4px 0;color:{GREEN if v == green_word else RED};font-weight:600;width:70px;">{_e(v)}</td>'
+                          f'<td style="padding:4px 0;font-weight:600;">{_e(s)}</td>'
+                          f'<td style="padding:4px 0;text-align:right;">{_e(a)}</td></tr>' for v, s, a in rws)
+                + '</table>')
+    content += _section("Trades today", _para(trades_line) + (order_table(trade_rows, "Bought") if trade_rows else ""))
+    title_tom = f"Tomorrow's open" + (f" · {_d(outlook['session'])}" if outlook and outlook.get("session") else "")
+    content += _section(title_tom, _para(out_line) + (order_table(out_rows, "Buy") if out_rows else ""))
 
     if total > 0:
         def hrow(name: str, mv: float, color: str) -> str:
@@ -372,26 +435,26 @@ def build_daily_report(*, as_of: str, perf: Optional[dict], equity: float,
                     f'<td style="padding:5px 0;"><div style="background:{BG};border-radius:3px;height:8px;">'
                     f'<div style="width:{w * 100:.1f}%;background:{color};height:8px;border-radius:3px;"></div></div></td>'
                     f'<td style="padding:5px 0 5px 8px;text-align:right;width:40px;color:{MUTED};">{w:.0%}</td></tr>')
-        rows = "".join(hrow(s, mv, TONES["report"]) for s, mv in sorted(holdings.items(), key=lambda kv: -kv[1]))
-        rows += hrow("Cash", cash, "#9aa0a6")
-        content += _section("Holdings", (
-            f'<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="font-size:13px;">{rows}</table>'
+        hrows = "".join(hrow(s, mv, TONES["report"]) for s, mv in sorted(holdings.items(), key=lambda kv: -kv[1]))
+        hrows += hrow("Cash", cash, "#9aa0a6")
+        content += _section("Holdings at the close", (
+            f'<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="font-size:13px;">{hrows}</table>'
             f'<div style="font-size:13px;margin-top:8px;">Nasdaq-100 exposure <b>{nas:.2f}x</b>'
             f'<span style="color:{MUTED};"> (QLD counts double)</span></div>'))
 
-    sig = "".join(f'<tr><td style="padding:3px 0;color:{MUTED};width:130px;">{_e(k)}</td>'
-                  f'<td style="padding:3px 0;">{_e(v)}</td></tr>'
-                  for k, v in (("Market regime", reg), ("PULSE leverage", f"{pulse_lev:.2f}x"),
-                               ("ROTATION holds", rot)))
-    content += _section("Signals", f'<table role="presentation" cellpadding="0" cellspacing="0" style="font-size:13px;">{sig}</table>')
+    if tax_rows:
+        content += _section(f"Taxes, {tax['year']} to date", _table([(k, _e(v)) for k, v in tax_rows], width=190)
+                            + f'<div style="font-size:11px;color:{MUTED};margin-top:6px;line-height:1.4;">{_e(tax_note)}</div>')
+    if sig_rows:
+        content += _section("Signals at today's close", _table([(k, _e(v)) for k, v in sig_rows], width=130))
 
     since = f" since {_md(perf['inception'])}, when Horizon took over the whole account" if perf else ""
-    footer = (f"Returns are time-weighted from Alpaca's daily closing equity{_e(since)}, so deposits and "
-              f"withdrawals do not count as gains or losses. QQQ and SPY include dividends. "
-              f"Data through {_e(_d(as_of))} close.")
-    pre = (f"Horizon {_pct(perf['chg_pct'])} vs QQQ {_pct(bs.get('QQQ', 0.0))} and SPY "
-           f"{_pct(bs.get('SPY', 0.0))}. {today_line}") if perf and perf["rows"] else today_line
-    html = _page(kicker=f"Horizon · {_d(as_of)}", title="Daily report", tone="report",
+    footer = (f"Sent after the close. Returns are time-weighted from the account's closing equity{_e(since)}, "
+              f"so deposits and withdrawals are not gains or losses. Today's equity is priced at the same "
+              f"official closes as QQQ and SPY, which include dividends. The 9:00 AM ET cycle trades at the open.")
+    pre = (f"Horizon {_pct(today['horizon'])} today vs QQQ {_pct(today.get('QQQ', 0))} and SPY "
+           f"{_pct(today.get('SPY', 0))}. {trades_line}") if today else trades_line
+    html = _page(kicker=f"Horizon · {_d(day)} close", title="Daily report", tone="report",
                  preheader=pre, content=content, footer=footer)
     return subject, text, html
 
@@ -433,17 +496,28 @@ def build_drawdown_alert(step: float, perf: dict) -> Email:
         ])
 
 
+def build_report_failed(tb: str) -> Email:
+    last = next((ln.strip() for ln in reversed(tb.strip().splitlines()) if ln.strip()), "unknown error")
+    return _event(
+        kicker="Horizon · Action needed", title="Today's report failed", tone="action",
+        paragraphs=["The evening report could not be built, so today's summary is missing. "
+                    "Trading is not affected: the next 9:00 AM ET cycle runs as usual.",
+                    "Check the account directly in Alpaca for today's figures."],
+        callout=[f"Error: {last}"], detail=tb.strip())
+
+
 def build_restart(when_et: str, equity: Optional[float], next_cycle: str, live: bool) -> Email:
     paras = [f"Horizon restarted at {when_et} and is "
              f"{'trading live' if live else 'in DRY-RUN, placing no real orders'}."]
     if equity is not None:
-        paras.append(f"Equity: {_money(equity, cents=True)}. Next cycle: {next_cycle}.")
+        paras.append(f"Equity: {_money(equity, cents=True)}. Next: {next_cycle}. Trading cycles "
+                     f"run at 9:00 AM ET and the daily report arrives 30 minutes after the close.")
     else:
-        paras.append(f"Next cycle: {next_cycle}.")
+        paras.append(f"Next: {next_cycle}.")
     paras.append("Restarts happen on every deploy. If nothing was deployed, the service crashed "
                  "and Railway restarted it; the Railway logs show why.")
     return _event(kicker="Horizon · Service", title="Restarted", tone="info", paragraphs=paras,
-                  subject=f"Restarted · next cycle {next_cycle}")
+                  subject=f"Restarted · next: {next_cycle}")
 
 
 def build_cycle_failed(tb: str) -> Email:

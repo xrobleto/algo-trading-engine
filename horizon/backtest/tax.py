@@ -18,7 +18,7 @@ feeds back into trading decisions.
 from __future__ import annotations
 
 from collections import defaultdict, deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, List, Tuple
 
 import pandas as pd
@@ -44,6 +44,15 @@ class TaxReport:
     st_realized: float                   # gross short-term gains realized (positive parts)
     lt_realized: float
     wash_disallowed: float               # total losses disallowed by the wash-sale rule
+    # Per calendar year, before netting or carryforward: realized short- and
+    # long-term gains (losses negative) and gross dividends.
+    st_net_by_year: Dict[int, float] = field(default_factory=dict)
+    lt_net_by_year: Dict[int, float] = field(default_factory=dict)
+    div_by_year: Dict[int, float] = field(default_factory=dict)
+    div_tax_by_year: Dict[int, float] = field(default_factory=dict)
+    # Unrealized gains on the lots still open at final_date.
+    unrealized_st: float = 0.0
+    unrealized_lt: float = 0.0
 
     @property
     def st_share(self) -> float:
@@ -93,6 +102,7 @@ def compute_taxes(trades: List[dict], dividends: List[dict],
     st_y: Dict[int, float] = defaultdict(float)
     lt_y: Dict[int, float] = defaultdict(float)
     div_tax: Dict[int, float] = defaultdict(float)
+    div_amt: Dict[int, float] = defaultdict(float)
     st_gross = lt_gross = wash_total = 0.0
 
     for i, t in enumerate(trades):
@@ -121,16 +131,28 @@ def compute_taxes(trades: List[dict], dividends: List[dict],
                         continue
                     if abs((b["date"] - d).days) > WASH_DAYS:
                         continue
-                    use = min(need, b["cap"])
+                    # A wash sale defers a loss into the replacement shares'
+                    # basis; it never erases it. Replacements bought earlier
+                    # must still be held (an open lot) to carry the loss;
+                    # purchases later in the sequence carry it from the day
+                    # they are bought. (Fixed 2026-10-31: an earlier version
+                    # also matched already-sold earlier purchases and dropped
+                    # the loss, which overstated taxes and broke the identity
+                    # realized + unrealized = profit on a live account.)
+                    if b["id"] < i:
+                        open_lot = next((L for L in lots[sym] if L[3] == b["id"]), None)
+                        if open_lot is None or open_lot[0] <= 1e-12:
+                            continue
+                        use = min(need, b["cap"], open_lot[0])
+                    else:
+                        open_lot = None
+                        use = min(need, b["cap"])
                     b["cap"] -= use; need -= use
                     amt = use * loss_ps
                     disallowed += amt
-                    # Add to the replacement shares' basis: to the open lot if
-                    # it was already bought, else to the future purchase.
-                    open_lot = next((L for L in lots[sym] if L[3] == b["id"]), None)
                     if open_lot is not None:
                         open_lot[1] += amt / open_lot[0]
-                    elif b["date"] >= d:
+                    else:
                         b["adj"] += amt
                 wash_total += disallowed
             gain = take * (px - lot[1]) + disallowed
@@ -148,6 +170,7 @@ def compute_taxes(trades: List[dict], dividends: List[dict],
         y = pd.Timestamp(dv["date"]).year
         rate = rates.st if dv["symbol"] in ORDINARY_DISTRIBUTORS else rates.lt
         div_tax[y] += max(float(dv["amount"]), 0.0) * rate
+        div_amt[y] += float(dv["amount"])
 
     by_year: Dict[int, float] = {}
     carry = 0.0
@@ -170,7 +193,16 @@ def compute_taxes(trades: List[dict], dividends: List[dict],
                 st_u += g
     s, l, _ = _net(st_u, lt_u, carry)
     terminal = s * rates.st + l * rates.lt
-    return TaxReport(by_year, terminal, st_gross, lt_gross, wash_total)
+    return TaxReport(by_year, terminal, st_gross, lt_gross, wash_total,
+                     st_net_by_year=dict(st_y), lt_net_by_year=dict(lt_y),
+                     div_by_year=dict(div_amt), div_tax_by_year=dict(div_tax),
+                     unrealized_st=st_u, unrealized_lt=lt_u)
+
+
+def year_tax(st: float, lt: float, dividends_tax: float, rates: "TaxRates") -> float:
+    """Federal tax on one year's realized gains alone (no carryforward)."""
+    s, l, _ = _net(st, lt, 0.0)
+    return s * rates.st + l * rates.lt + dividends_tax
 
 
 def after_tax_curve(equity: pd.Series, report: TaxReport) -> pd.Series:

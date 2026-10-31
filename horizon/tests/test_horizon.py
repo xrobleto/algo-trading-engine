@@ -235,39 +235,128 @@ def _sample_perf():
                                {"QQQ": qqq, "SPY": spy}, "2026-10-06", "2026-09-04")
 
 
-def test_daily_report_content():
-    """Leads with performance vs QQQ and SPY in a table, explains trades, shows
-    holdings and exposure, warnings only when real, and no engine internals.
-    Text and HTML carry the same facts."""
-    from ..engine.report import build_daily_report
-    perf = _sample_perf()
-    common = dict(as_of="2026-10-06", perf=perf, equity=7205.14, drift=0.002, band=0.40,
-                  holdings={"QQQM": 3600.0, "QLD": 2280.0, "PDBC": 1119.0}, cash=206.14,
-                  regime="RISK_ON", score=74, prev_regime="NEUTRAL", pulse_lev=1.48,
-                  rotation=["PDBC", "QQQM"])
-    subj, text, html = build_daily_report(orders=[], trade_reason=None, warnings=[], **common)
-    assert subj == "$7,205 +0.68% · QQQ +0.46% · SPY +0.55% · held", subj
-    for label in ("Last session", "Week to date", "Month to date", "Since Sep 4"):
+def test_daily_plan_schedule():
+    """Cycle at 9:00 ET, report 30 minutes after the close (1:30 PM on half
+    days), retries while prices are missing, a final send after 150 minutes,
+    no trading after the close, and weekends/holidays are recorded, not spun."""
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    from ..engine.main import daily_plan
+    et = ZoneInfo("America/New_York")
+    at = lambda d, h, m=0: datetime(2026, 11, d, h, m, tzinfo=et)
+    reg = (at(2, 9, 30), at(2, 16))
+    assert daily_plan(at(2, 0, 6), reg, "2026-10-30", "2026-10-30") == ("sleep", at(2, 9))
+    assert daily_plan(at(2, 9, 0), reg, "2026-10-30", "2026-10-30")[0] == "cycle"
+    assert daily_plan(at(2, 9, 1), reg, "2026-11-02", "2026-10-30") == ("sleep", at(2, 16, 30))
+    assert daily_plan(at(2, 16, 30), reg, "2026-11-02", "2026-10-30")[0] == "report"
+    retry = at(2, 16, 40)
+    assert daily_plan(at(2, 16, 31), reg, "2026-11-02", "2026-10-30", retry) == ("sleep", retry)
+    assert daily_plan(at(2, 18, 31), reg, "2026-11-02", "2026-10-30", at(2, 18, 30))[0] == "report_final"
+    act, wake = daily_plan(at(2, 16, 45), reg, "2026-11-02", "2026-11-02")
+    assert act == "sleep" and wake.day == 3 and wake.hour == 0
+    assert daily_plan(at(2, 17, 0), reg, "2026-10-30", "2026-10-30")[0] == "skip_cycle"
+    half = (datetime(2026, 11, 27, 9, 30, tzinfo=et), datetime(2026, 11, 27, 13, tzinfo=et))
+    assert daily_plan(datetime(2026, 11, 27, 9, 5, tzinfo=et), half, "2026-11-27", "2026-11-26") == \
+        ("sleep", datetime(2026, 11, 27, 13, 30, tzinfo=et))
+    sat = datetime(2026, 10, 31, 12, tzinfo=et)
+    assert daily_plan(sat, None, "2026-10-30", "2026-10-30")[0] == "record"
+    assert daily_plan(sat, None, "2026-10-31", "2026-10-31")[0] == "sleep"
+
+
+def test_evening_helpers():
+    """Closing equity uses official closes; the same-money comparison handles
+    deposits; data readiness lists missing bars; ROTATION's next review is the
+    first session of the next month."""
+    from ..engine.evening import closing_marks, data_ready, next_review, same_money
+    pos = {"QQQM": {"qty": 10.0, "market_value": 2900.0}, "XLK": {"qty": 0.0001, "market_value": 0.01}}
+    m = closing_marks(pos, {"QQQM": 284.34})
+    assert abs(m["QQQM"] - 2843.4) < 1e-9 and m["XLK"] == 0.01
+    idx = pd.to_datetime(["2026-09-04", "2026-10-01", "2026-10-30"])
+    q = pd.Series([100.0, 110.0, 121.0], index=idx)
+    assert abs(same_money(1000.0, "2026-09-04", {}, q, "2026-10-30") - 1210.0) < 1e-9
+    v = same_money(1000.0, "2026-09-04", {"2026-10-01": 500.0}, q, "2026-10-30")
+    assert abs(v - (1210.0 + 550.0)) < 1e-9
+    ds = {"QQQ": pd.DataFrame({"close": [1.0]}, index=pd.to_datetime(["2026-10-30"])),
+          "SPY": pd.DataFrame({"close": [1.0]}, index=pd.to_datetime(["2026-10-29"]))}
+    assert data_ready(ds, "2026-10-30", ["QQQ", "SPY", "QLD"]) == ["QLD", "SPY"]
+    sessions = ["2026-10-29", "2026-10-30", "2026-11-02", "2026-11-03"]
+    assert next_review(sessions, "2026-10-29") == "2026-11-02"
+
+
+def test_wash_sales_conserve_losses():
+    """Realized plus unrealized always equals the trades' cash profit plus the
+    value still held: wash sales defer losses, never erase them (the bug fixed
+    2026-10-31 dropped losses whose earlier replacement shares were already sold)."""
+    import random
+    from ..backtest.tax import TaxRates, compute_taxes
+    rng = random.Random(7)
+    for _ in range(40):
+        trades, held, price, d = [], 0.0, 100.0, pd.Timestamp("2025-01-02")
+        for _ in range(60):
+            d += pd.Timedelta(days=rng.randint(1, 9))
+            price *= 1 + rng.uniform(-0.08, 0.08)
+            if held > 0 and rng.random() < 0.45:
+                q = held * rng.choice([0.3, 0.5, 1.0])
+                trades.append({"date": d, "symbol": "X", "side": "sell", "shares": q, "price": price})
+                held -= q
+            else:
+                q = rng.uniform(1, 10)
+                trades.append({"date": d, "symbol": "X", "side": "buy", "shares": q, "price": price})
+                held += q
+        rep = compute_taxes(trades, [], {"X": price}, d, TaxRates(0.32, 0.15))
+        realized = sum(rep.st_net_by_year.values()) + sum(rep.lt_net_by_year.values())
+        cash = sum((1 if t["side"] == "sell" else -1) * t["shares"] * t["price"] for t in trades)
+        assert abs(realized + rep.unrealized_st + rep.unrealized_lt - (cash + held * price)) < 1e-6
+
+
+def test_evening_report_content():
+    """Subject leads with today vs QQQ and SPY; performance in percent and in
+    dollars; trades with fills; tomorrow's outlook; holdings; taxes; signals;
+    warnings only when real; no engine internals. Text and HTML agree."""
+    from ..engine.report import build_evening_report, compute_performance
+    idx = pd.to_datetime(["2026-09-04", "2026-10-23", "2026-10-29", "2026-10-30"])
+    qqq = pd.Series([100.0, 98.06, 99.59, 96.13], index=idx)
+    spy = pd.Series([100.0, 98.92, 100.14, 98.37], index=idx)
+    perf = compute_performance({"2026-09-04": 6829.61, "2026-10-23": 6653.86, "2026-10-29": 6755.71,
+                                "2026-10-30": 6484.91}, {}, {"QQQ": qqq, "SPY": spy}, "2026-10-30", "2026-09-04")
+    common = dict(day="2026-10-30", perf=perf, equity=6484.91,
+                  dollars={"since": "2026-09-04", "Horizon": -344.7, "QQQ": -264.0, "SPY": -112.0},
+                  holdings={"QQQM": 3171.0, "QLD": 2047.0, "PDBC": 1060.0}, cash=207.42,
+                  signals={"regime": "RISK_ON", "score": 74, "pulse_lev": 1.14,
+                           "rotation": ["PDBC", "QQQM"], "next_review": "2026-11-02"},
+                  prev_regime="RISK_ON",
+                  tax={"year": 2026, "st": -784.2, "lt": 0.0, "dividends": 19.0, "est_tax": 0.0,
+                       "unrealized_st": -376.3, "unrealized_lt": 0.0, "rates": (0.32, 0.15), "div_tax": 0.4})
+    outlook = {"session": "2026-11-02", "gap": 0.236, "band": 0.40, "reason": None, "orders": []}
+    subj, text, html = build_evening_report(trades=[], trade_reason=None,
+                                            cycle_note="No trades this morning.", outlook=outlook,
+                                            warnings=[], **common)
+    assert subj == "Fri Oct 30: -4.01% · QQQ -3.47% · SPY -1.77% · held", subj
+    for label in ("Today", "Week to date", "Month to date", "Since Sep 4"):
         assert label in text and label in html
-    assert "vs QQQ" in text and ">vs SPY</th>" in html
-    assert "Nasdaq-100 exposure" in text and "1.13x" in html and "changed from NEUTRAL" in text
-    assert "Warnings" not in text and "Warnings" not in html
-    for internal in ("funding", "ceiling", "orders_planned", "stale_days", "weight_gap"):
+    assert "Last session" not in text and "Last session" not in html
+    assert "The same money in QQQ: -$264" in text and "Horizon vs the same money" in html
+    assert "No trades expected at Mon Nov 2's open" in text and "23.6% from target" in text
+    assert "Realized short-term: -$784" in text and "Realized long-term: $0" in text
+    assert "none on trading (net loss so far)" in text
+    assert "next review Mon Nov 2 close" in text and "Warnings" not in html
+    for internal in ("funding", "ceiling", "orders_planned", "stale_days", "weight_gap", "coid"):
         assert internal not in text.lower() and internal not in html.lower(), internal
-    assert html.startswith("<!doctype html>") and "max-width:600px" in html
-    orders = [{"symbol": "IEFA", "side": "sell", "notional": 1065.0, "filled": 1064.8},
-              {"symbol": "QQQM", "side": "buy", "notional": 615.0, "filled": None}]
-    subj, text, html = build_daily_report(orders=orders, trade_reason="ROTATION swapped IEFA for QQQM.",
-                                          warnings=["Not filled 90 seconds after submission: QQQM."],
-                                          **common)
+    trades = [{"symbol": "QQQM", "side": "sell", "notional": 117.0, "filled": 115.0, "status": "filled"},
+              {"symbol": "QLD", "side": "buy", "notional": 195.0, "filled": None, "status": "canceled"}]
+    out2 = dict(outlook, orders=[{"symbol": "QLD", "side": "sell", "notional": 1458.0}],
+                reason="Holdings are 45% from target, past the 40% rebalance band.")
+    subj, text, html = build_evening_report(trades=trades, trade_reason="ROTATION swapped X.",
+                                            cycle_note=None, outlook=out2,
+                                            warnings=["The order to buy QLD did not fully fill."], **common)
     assert subj.endswith("· 2 trades · 1 warning")
-    assert "- Sold IEFA $1,065" in text and "- Bought QQQM $615 (not filled yet)" in text
-    assert text.index("Warnings:") < text.index("Today:")
-    assert html.index("Warnings") < html.index("Today") and "IEFA" in html
-    # Performance unavailable: still a complete report, no crash
-    subj, text, html = build_daily_report(orders=[], trade_reason=None, warnings=["x"],
-                                          **dict(common, perf=None))
-    assert subj.startswith("$7,205 · held") and "unavailable" in text
+    assert "- Sold QQQM $115" in text and "- Bought QLD $195 (not filled)" in text
+    assert "Expected at Mon Nov 2's open: 1 trade." in text and "- Sell QLD about $1,458" in text
+    assert html.index("Warnings") < html.index("Trades today") < html.index("Tomorrow")
+    subj, text, html = build_evening_report(trades=[], trade_reason=None, cycle_note=None,
+                                            outlook=None, warnings=["x"],
+                                            **dict(common, perf=None, dollars=None, tax=None, signals=None))
+    assert subj.startswith("Fri Oct 30: $6,485 · held") and "unavailable" in text
 
 
 def test_event_emails_are_actionable():
@@ -283,7 +372,7 @@ def test_event_emails_are_actionable():
     s, t, h = build_drawdown_alert(0.10, perf)
     assert s == "Drawdown passed -10%: now -12.0% from the high" and "within the backtested range" in t
     s, t, h = build_restart("Fri Oct 2, 10:49 PM ET", 7097.18, "Mon Oct 5, 9:00 AM ET", True)
-    assert s.startswith("Restarted") and "trading live" in t
+    assert s.startswith("Restarted · next:") and "trading live" in t
     s, t, h = build_flatten("Cancelled 0 orders.")
     for html in (h,):
         assert html.startswith("<!doctype html>")
@@ -458,23 +547,6 @@ def test_plan_orders_band_and_override():
     assert "IAU" not in {x["symbol"] for x in o}
 
 
-def test_daily_action_timing():
-    """Never cycle before 09:00 ET; record weekends and holidays so a restart
-    cannot spin the loop; cycle once per session day."""
-    from datetime import datetime
-    from zoneinfo import ZoneInfo
-    from ..engine.main import daily_action
-    et = ZoneInfo("America/New_York")
-    thu_0006 = datetime(2026, 9, 25, 0, 6, tzinfo=et)
-    thu_0901 = datetime(2026, 9, 25, 9, 1, tzinfo=et)
-    sat_1000 = datetime(2026, 9, 26, 10, 0, tzinfo=et)
-    assert daily_action(thu_0006, "2026-09-24", True) == "sleep"     # the 00:06 restart case
-    assert daily_action(thu_0901, "2026-09-24", True) == "cycle"
-    assert daily_action(thu_0901, "2026-09-25", True) == "sleep"     # already ran today
-    assert daily_action(sat_1000, "2026-09-25", False) == "record"   # weekend: no spin
-    assert daily_action(sat_1000, "2026-09-26", False) == "sleep"
-
-
 def test_tax_model_hand_cases():
     """FIFO, ST/LT split and the share-matched wash-sale rule on hand-computed
     cases (backtest/tax.py)."""
@@ -571,22 +643,6 @@ def test_one_time_rebalance():
     assert ("PDBC", "sell") in sides        # $61 > 0.5% min trade; dust would be skipped
 
 
-def test_fill_wait_plan():
-    """Pre-market orders are confirmed after the open, not 90 seconds after
-    submission (the 2026-10-15 false warning); far-off opens report as queued."""
-    from ..engine.main import fill_wait_plan, MAX_OPEN_WAIT_SEC
-    assert fill_wait_plan(0) == (0.0, False)                     # market open: poll now
-    assert fill_wait_plan(1800) == (1800, False)                 # 9:00 cycle: wait 30 min
-    assert fill_wait_plan(MAX_OPEN_WAIT_SEC + 1) == (0.0, True)  # after hours: queued
-    from ..engine.report import build_daily_report
-    _, text, html = build_daily_report(
-        as_of="2026-10-14", perf=None, equity=6895.76,
-        orders=[{"symbol": "QLD", "side": "buy", "notional": 195.0, "filled": None, "queued": True}],
-        trade_reason="x", drift=0.03, band=0.40, holdings={"QQQM": 3463.0}, cash=206.0,
-        regime="RISK_ON", score=75, prev_regime="RISK_ON", pulse_lev=1.5, rotation=["QQQM"], warnings=[])
-    assert "queued for the next open" in text and "not filled" not in text
-
-
 def test_holiday_cycle_is_skipped():
     """Weekends never cycle; a weekday the broker calendar marks as closed is
     skipped; a calendar failure falls back to 'weekday = session'."""
@@ -632,11 +688,12 @@ def main() -> int:
     tests = [test_cache_freshness_is_evaluated_per_call, test_stale_cycle_is_refused,
              test_funding_guard_scales_to_account_capacity, test_gross_ceiling,
              test_buys_sized_to_cash, test_holiday_cycle_is_skipped, test_core_floor_and_never_sold,
-             test_one_time_rebalance, test_fill_wait_plan,
-             test_plan_orders_band_and_override, test_daily_action_timing,
+             test_one_time_rebalance, test_plan_orders_band_and_override,
+             test_daily_plan_schedule, test_evening_helpers, test_wash_sales_conserve_losses,
+             test_evening_report_content,
              test_tax_model_hand_cases, test_rotation_hold_buffer,
              test_alerter_resend_transport, test_performance_from_daily_closes,
-             test_daily_report_content, test_event_emails_are_actionable,
+             test_event_emails_are_actionable,
              test_pulse_levered_etf_expression,
              test_no_lookahead, test_single_source_of_truth,
              test_strategies_decide_cleanly, test_risk_overlay_recovers,

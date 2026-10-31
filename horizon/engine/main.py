@@ -73,9 +73,12 @@ _LEDGER_FILE = "ledger.json"
 _HALT_FILE = "HALT_ALL_TRADING"
 _REBALANCE_TOKEN_FILE = "rebalance_token.txt"   # last one-time rebalance applied
 _REPORT_STATE_FILE = "report_state.json"  # drawdown-step and regime memory for the report
-FILL_CONFIRM_SEC = 180                 # after the open: how long to wait for fills
-MAX_OPEN_WAIT_SEC = 3600               # wait for the open only when it is this close
+_CYCLE_SUMMARY_FILE = "cycle_summary.json"  # what the morning cycle did, for the evening report
 _LAST_CYCLE_FILE = "last_cycle.txt"   # records the ET date of the most recent cycle
+_LAST_REPORT_FILE = "last_report.txt"  # records the ET date of the most recent evening report
+REPORT_DELAY_MIN = 30      # evening report: this long after the close (data settles)
+REPORT_RETRY_MIN = 10      # retry interval while the day's closing prices are missing
+REPORT_GIVE_UP_MIN = 150   # after this long past the close, send with what is available
 
 
 def _load_states(strategies) -> Dict[str, dict]:
@@ -312,50 +315,6 @@ def _wait_for_cash(broker, need: float, sells, log, max_wait: int = SELL_FILL_WA
         time.sleep(poll)
 
 
-def fill_wait_plan(until_open: float):
-    """How the report confirms fills: (seconds to wait for the open first,
-    whether to report orders as queued without waiting). The 9:00 cycle submits
-    30 minutes before the open, so it waits for the open and then confirms
-    (2026-10-15: a 90-second check right after submission flagged three
-    healthy pre-market orders as unfilled). A cycle run long before the open
-    (e.g. an after-hours catch-up) reports its orders as queued instead."""
-    if until_open <= 0:
-        return 0.0, False
-    if until_open <= MAX_OPEN_WAIT_SEC:
-        return until_open, False
-    return 0.0, True
-
-
-def _confirm_fills(broker, coids, timeout: int = FILL_CONFIRM_SEC,
-                   poll: int = 5, wait_first: float = 0.0) -> Dict[str, dict]:
-    """Optionally wait for the open, then poll submitted orders until each is
-    terminal or `timeout` passes, so the report shows what actually filled.
-    Market orders at the open fill in seconds; a slow fill only delays the
-    email."""
-    if wait_first > 0:
-        log.info("waiting %.0f min for the open to confirm fills", wait_first / 60.0)
-        time.sleep(wait_first)
-    terminal = ("filled", "canceled", "cancelled", "expired", "rejected")
-    out: Dict[str, dict] = {}
-    deadline = time.time() + timeout
-    while True:
-        for c in coids:
-            if c in out and any(t in str(out[c].get("status", "")).lower() for t in terminal) \
-                    and "partially" not in str(out[c].get("status", "")).lower():
-                continue
-            try:
-                od = broker.get_order_by_client_id(c)
-                if od:
-                    out[c] = od
-            except Exception as exc:
-                log.warning("fill check failed for %s (%s)", c, exc)
-        done = all(c in out and any(t in str(out[c].get("status", "")).lower() for t in terminal)
-                   and "partially" not in str(out[c].get("status", "")).lower() for c in coids)
-        if done or time.time() >= deadline:
-            return out
-        time.sleep(poll)
-
-
 def forced_rebalance_due(token: str, applied: str, kill_switch_tripped: bool) -> bool:
     """A one-time rebalance runs when the configured token is new. Never under
     the kill switch: it blocks buys, so a forced rebalance would only sell."""
@@ -372,6 +331,35 @@ def _applied_rebalance_token() -> str:
 
 def _record_rebalance_token(token: str) -> None:
     (state_dir() / _REBALANCE_TOKEN_FILE).write_text(token, encoding="utf-8")
+
+
+def target_book(view, regime, strategies, states, cfg, ledger, equity):
+    """Each admitted sleeve decides; targets are summed into one account book
+    in dollars. Shared by the live cycle and the evening outlook (which passes
+    a copy of the states so nothing is saved). decide() mutates `states`."""
+    budgets = SleeveManager(cfg).budgets(equity, ledger, regime)
+    decisions = {}
+    account_target: Dict[str, float] = {}
+    for sid in ADMITTED_SLEEVES:
+        decision = strategies[sid].decide(view, states[sid])
+        decisions[sid] = decision
+        for sym, weight in decision.target_weights.items():
+            account_target[sym] = (account_target.get(sym, 0.0)
+                                   + weight * budgets[sid].sleeve_equity)
+    return account_target, decisions
+
+
+def save_cycle_summary(summary: dict) -> None:
+    (state_dir() / _CYCLE_SUMMARY_FILE).write_text(
+        json.dumps(summary, indent=2, default=str), encoding="utf-8")
+
+
+def load_cycle_summary() -> dict:
+    path = state_dir() / _CYCLE_SUMMARY_FILE
+    try:
+        return json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+    except (OSError, ValueError):
+        return {}
 
 
 def run_cycle(broker, strategies, cfg, ledger, kill_switch, alerter,
@@ -400,9 +388,16 @@ def run_cycle(broker, strategies, cfg, ledger, kill_switch, alerter,
         alerter.critical(*R.build_stale_data(str(as_of.date()),
                                              str(cache.completed_through().date()),
                                              MAX_STALE_DAYS))
-        return {"as_of": str(as_of.date()), "stale_days": stale,
-                "orders_planned": 0, "orders_submitted": 0,
-                "mode": "STALE-DATA (refused)"}
+        refused = {"date": datetime.now(ZoneInfo("America/New_York")).date().isoformat(),
+                   "as_of": str(as_of.date()), "status": "refused-stale",
+                   "stale_days": stale, "orders": [], "trade_reason": None,
+                   "warnings": ["This morning's cycle refused to trade: the market data "
+                                "was stale. Positions were unchanged."],
+                   "orders_planned": 0, "orders_submitted": 0,
+                   "mode": "STALE-DATA (refused)"}
+        if not dry_run and broker is not None:
+            save_cycle_summary(refused)
+        return refused
 
     view = MarketView(dataset, as_of)
     regime = compute_regime(view)
@@ -450,21 +445,13 @@ def run_cycle(broker, strategies, cfg, ledger, kill_switch, alerter,
             kill_switch.trigger(f"ownership conflict: {rec.conflicts}")
             alerter.critical(*R.build_conflict(rec.conflicts))
 
-    budgets = SleeveManager(cfg).budgets(equity, ledger, regime)
-
     # Each admitted sleeve decides; targets are summed into an account book.
     states = _load_states(strategies)
     _cash_legs = {_universe.PULSE_CASH_ASSET, _universe.ROTATION_CASH_ASSET}
     prev_rotation = sorted(s for s in states.get("ROTATION", {}).get("holdings", {})
                            if s not in _cash_legs)
-    decisions = {}
-    account_target: Dict[str, float] = {}
-    for sid in ADMITTED_SLEEVES:
-        decision = strategies[sid].decide(view, states[sid])
-        decisions[sid] = decision
-        for sym, weight in decision.target_weights.items():
-            account_target[sym] = (account_target.get(sym, 0.0)
-                                   + weight * budgets[sid].sleeve_equity)
+    account_target, decisions = target_book(view, regime, strategies, states, cfg,
+                                            ledger, equity)
     _save_states(states)
 
     # Gross ceiling (checkpoint boundary) — applied before the funding guard.
@@ -572,103 +559,8 @@ def run_cycle(broker, strategies, cfg, ledger, kill_switch, alerter,
         # cycle that fails before this point retries the rebalance next time.
         _record_rebalance_token(token)
 
-    # --- the daily report --------------------------------------------------
-    coids = [c for c, _ in placed if c]
-    fills: Dict[str, dict] = {}
-    queued = False
-    if broker is not None and not dry_run and coids:
-        try:
-            until_open = float(broker.seconds_until_open())
-        except Exception as exc:
-            log.warning("clock unavailable (%s) — confirming fills without waiting", exc)
-            until_open = 0.0
-        wait_first, queued = fill_wait_plan(until_open)
-        if queued:
-            for c in coids:
-                try:
-                    fills[c] = broker.get_order_by_client_id(c) or {}
-                except Exception as exc:
-                    log.warning("order status check failed for %s (%s)", c, exc)
-        else:
-            fills = _confirm_fills(broker, coids, wait_first=wait_first)
-    report_orders, unfilled = [], []
-    for coid, o in placed:
-        od = fills.get(coid) if coid else None
-        filled = None
-        if od and float(od.get("filled_qty") or 0) > 0:
-            filled = float(od["filled_qty"]) * float(od.get("filled_avg_price") or 0)
-        status = str((od or {}).get("status", "")).lower()
-        if coid and any(x in status for x in ("rejected", "canceled", "cancelled", "expired")):
-            warnings.append(f"The order to {o['side']} {o['symbol']} was "
-                            f"{status.split('.')[-1]} by the broker.")
-        elif coid and filled is None:
-            unfilled.append(o["symbol"])
-        report_orders.append({"symbol": o["symbol"], "side": o["side"],
-                              "notional": o["notional"], "filled": filled,
-                              "queued": bool(queued and coid and filled is None)})
-    if unfilled and not queued:
-        warnings.append(f"Not filled within {FILL_CONFIRM_SEC // 60} minutes of the open: "
-                        f"{', '.join(unfilled)}. Check the account.")
-
-    # Holdings after today's trades, valued at the as_of close so they add up
-    # to the reported equity (9:00 broker marks include pre-market moves).
-    as_of_iso = str(as_of.date())
-    cash_after = 0.0
-    close_equity = account_equity    # fallback: 9:00 equity (includes pre-market moves)
-    pos_after = positions
-    if broker is not None:
-        try:
-            if placed:
-                pos_after = broker.get_positions()
-            acct_now = broker.get_account()
-            cash_after = float(acct_now["cash"])
-            close_equity = float(acct_now.get("last_equity") or account_equity)
-        except Exception as exc:
-            log.warning("post-trade snapshot failed (%s) — reporting pre-trade holdings", exc)
-    holdings_after = {}
-    for sym, p in pos_after.items():
-        qty = float(p.get("qty", 0.0) or 0.0)
-        mv = qty * view.close(sym) if (qty and view.is_tradable(sym)) else float(p.get("market_value", 0.0))
-        if abs(mv) >= ORPHAN_ALERT_MIN_USD:
-            holdings_after[sym] = mv
-
-    # Performance, recomputed from Alpaca's daily closes every day (no running
-    # tally), time-weighted so deposits and withdrawals are not returns.
-    today_iso = datetime.now(ZoneInfo("America/New_York")).date().isoformat()
-    perf = None
-    if broker is not None:
-        try:
-            closes = broker.daily_closes(cfg.report_inception, today_iso)
-            perf_date = as_of_iso
-            if as_of_iso not in closes and closes and max(closes) < as_of_iso:
-                latest = max(closes)
-                if abs(closes[latest] - close_equity) > 0.01:
-                    closes[as_of_iso] = close_equity   # history lags; last_equity is as_of's close
-                else:
-                    # last_equity still describes the previous close (Alpaca rolls it
-                    # overnight), so as_of's close is not known yet: report the latest
-                    # close available rather than mislabel one day's equity as another's.
-                    perf_date = latest
-            elif as_of_iso in closes and abs(closes[as_of_iso] - close_equity) > 1.0:
-                log.warning("history close %.2f != last_equity %.2f for %s",
-                            closes[as_of_iso], close_equity, as_of_iso)
-            flows = broker.cash_flows_by_date(cfg.report_inception, today_iso)
-            bench = {b: dataset[b]["tr_close"] for b in R.BENCHMARKS if b in dataset}
-            perf = R.compute_performance(closes, flows, bench, perf_date, cfg.report_inception)
-        except Exception as exc:
-            log.warning("performance unavailable (%s)", exc)
-        if perf is None:
-            warnings.append("Performance figures could not be computed today (Alpaca's "
-                            "account history did not load). Trading was not affected.")
-
-    state_path = state_dir() / _REPORT_STATE_FILE
-    rstate = R.load_state(state_path)
-    prev_regime = rstate.get("last_regime")
-    crossed = None
-    if perf is not None:
-        rstate, crossed = R.drawdown_steps(rstate, perf)
-    rstate.update(last_regime=regime.regime, last_report_date=today_iso)
-
+    # The evening report (engine/evening.py) tells the day's story after the
+    # close, with final fills. The morning cycle records what it did and why.
     rot = decisions.get("ROTATION")
     rotation_now = sorted(s for s in (rot.target_weights if rot else {}) if s not in _cash_legs)
     pulse = decisions.get("PULSE")
@@ -682,7 +574,7 @@ def run_cycle(broker, strategies, cfg, ledger, kill_switch, alerter,
         if rot and rot.note.startswith("rebal") and set(rotation_now) != set(prev_rotation):
             gone = [s for s in prev_rotation if s not in rotation_now]
             new = [s for s in rotation_now if s not in prev_rotation]
-            trade_reason = (f"ROTATION's monthly rebalance swapped "
+            trade_reason = (f"ROTATION's monthly review swapped "
                             f"{' + '.join(gone) or 'T-bills'} for {' + '.join(new) or 'T-bills'}. "
                             f"The other holdings were reset to target at the same time.")
         elif weight_gap > cfg.rebalance_band:
@@ -693,34 +585,28 @@ def run_cycle(broker, strategies, cfg, ledger, kill_switch, alerter,
     if dry_run or broker is None:
         warnings.append("DRY-RUN: no real orders were placed.")
 
-    subject, body, html = R.build_daily_report(
-        as_of=as_of_iso, perf=perf, equity=close_equity, orders=report_orders,
-        trade_reason=trade_reason, drift=weight_gap, band=cfg.rebalance_band,
-        holdings=holdings_after, cash=cash_after, regime=regime.regime,
-        score=regime.score, prev_regime=prev_regime,
-        pulse_lev=pulse_lev, rotation=rotation_now, warnings=warnings)
-
-    if not dry_run and broker is not None:
-        R.save_state(state_path, rstate)
-        if crossed:
-            alerter.warning(*R.build_drawdown_alert(crossed, perf))
-
-    summary = {"as_of": str(as_of.date()), "stale_days": stale,
+    summary = {"date": datetime.now(ZoneInfo("America/New_York")).date().isoformat(),
+               "as_of": str(as_of.date()), "stale_days": stale,
+               "status": "traded" if placed else "held",
                "regime": regime.regime, "regime_score": round(regime.score, 1),
+               "pulse_leverage": round(pulse_lev, 3), "rotation": rotation_now,
                "equity": round(account_equity, 2), "orphans": len(orphan_symbols),
                "funding_scale": round(funding_scale, 3),
                "ceiling_scale": round(ceiling_scale, 3),
                "weight_gap": round(weight_gap, 4), "band": cfg.rebalance_band,
+               "forced": bool(forced),
+               "orders": [{"coid": c, "symbol": o["symbol"], "side": o["side"],
+                           "notional": round(o["notional"], 2)} for c, o in placed],
+               "trade_reason": trade_reason, "warnings": list(warnings),
                "orders_planned": len(orders), "orders_submitted": submitted,
-               "warnings": len(warnings),
                "mode": "dry-run" if (dry_run or broker is None) else "LIVE"}
+    if not dry_run and broker is not None:
+        save_cycle_summary(summary)
     log.info("cycle: as_of=%s regime=%s score=%.0f equity=$%.0f ceil=x%.2f "
              "fund=x%.2f gap=%.1f%% band=%.1f%% orders=%d warnings=%d %s", as_of.date(),
              regime.regime, regime.score, account_equity, ceiling_scale, funding_scale,
              weight_gap * 100, cfg.rebalance_band * 100, len(orders), len(warnings),
              summary["mode"])
-    alerter.heartbeat(subject, body, html)
-    summary["report_subject"], summary["report_body"], summary["report_html"] = subject, body, html
     return summary
 
 
@@ -760,26 +646,95 @@ def is_session_day(day, broker, log=log) -> bool:
         return True
 
 
-def daily_action(now_et, last_cycle_iso: str, session_today: bool) -> str:
-    """What the --daily loop should do right now: 'cycle', 'record' (mark a
-    non-session day as handled), or 'sleep'. Pure, so it is unit-tested."""
-    if last_cycle_iso == now_et.date().isoformat():
-        return "sleep"
-    if now_et.hour < DAILY_RUN_HOUR_ET:
-        return "sleep"     # never fire before 09:00 ET: sells could not fill for hours
-    return "cycle" if session_today else "record"
+def daily_plan(now, session, last_cycle_iso: str, last_report_iso: str,
+               report_retry_at=None):
+    """What the --daily loop does next. Pure, so every timing case is tested.
+
+    now:      timezone-aware ET datetime
+    session:  (open, close) ET datetimes for today, or None (weekend/holiday)
+    Returns (action, wake_at): action is one of
+      'cycle'        run the 9:00 trading cycle now
+      'skip_cycle'   the close has passed without a cycle: too late to trade
+      'report'       send the evening report now
+      'report_final' send it now even if closing prices are still missing
+      'record'       a non-session day: mark the cycle and report as handled
+      'sleep'        nothing due; sleep until wake_at
+    """
+    today = now.date().isoformat()
+    tomorrow = (now + timedelta(days=1)).replace(hour=0, minute=5, second=0, microsecond=0)
+    if session is None:
+        if last_cycle_iso != today or last_report_iso != today:
+            return "record", now
+        return "sleep", tomorrow
+    _open, close = session
+    cycle_at = now.replace(hour=DAILY_RUN_HOUR_ET, minute=0, second=0, microsecond=0)
+    if last_cycle_iso != today:
+        if now < cycle_at:
+            return "sleep", cycle_at
+        return ("cycle" if now < close else "skip_cycle"), now
+    if last_report_iso != today:
+        report_at = close + timedelta(minutes=REPORT_DELAY_MIN)
+        due = max(report_at, report_retry_at) if report_retry_at else report_at
+        if now < due:
+            return "sleep", due
+        final = now >= close + timedelta(minutes=REPORT_GIVE_UP_MIN)
+        return ("report_final" if final else "report"), now
+    return "sleep", tomorrow
 
 
-def _seconds_until_daily_run(hour_et: int = DAILY_RUN_HOUR_ET) -> float:
-    """Seconds until the next weekday run time, in US/Eastern."""
+def _last_report_date() -> str:
+    path = state_dir() / _LAST_REPORT_FILE
+    try:
+        return path.read_text(encoding="utf-8").strip() if path.exists() else ""
+    except OSError:
+        return ""
+
+
+def _record_report_date() -> None:
+    now_et = datetime.now(ZoneInfo("America/New_York"))
+    (state_dir() / _LAST_REPORT_FILE).write_text(now_et.date().isoformat(), encoding="utf-8")
+
+
+def _session_today(broker, day):
+    """Today's (open, close), or None if closed. If the calendar is unavailable
+    a weekday is assumed to be a regular session, so a broker hiccup can never
+    suppress trading."""
+    if day.weekday() >= 5:
+        return None
     et = ZoneInfo("America/New_York")
-    now = datetime.now(et)
-    target = now.replace(hour=hour_et, minute=0, second=0, microsecond=0)
-    if target <= now:
-        target += timedelta(days=1)
-    while target.weekday() >= 5:   # Saturday=5, Sunday=6
-        target += timedelta(days=1)
-    return max(0.0, (target - now).total_seconds())
+    regular = (datetime(day.year, day.month, day.day, 9, 30, tzinfo=et),
+               datetime(day.year, day.month, day.day, 16, 0, tzinfo=et))
+    if broker is None:
+        return regular
+    try:
+        return broker.session_hours(day)
+    except Exception as exc:
+        log.warning("calendar unavailable (%s) — assuming a regular session", exc)
+        return regular
+
+
+def _fmt_when(dt) -> str:
+    return f"{dt:%a %b} {dt.day}, {dt.hour % 12 or 12}:{dt:%M} {'AM' if dt.hour < 12 else 'PM'} ET"
+
+
+def _safe_report(broker, strategies, cfg, ledger, kill_switch, alerter, final: bool):
+    """Send the evening report. Returns True when the day's report is done
+    (sent, or failed hard and alerted), False to retry later because the
+    day's closing prices are not available yet."""
+    from .evening import run_evening_report
+    try:
+        out = run_evening_report(broker, strategies, cfg, ledger, kill_switch, alerter,
+                                 final=final)
+        if out.get("ready") is False:
+            log.info("evening report: closing prices not available yet — retrying "
+                     "in %d min", REPORT_RETRY_MIN)
+            return False
+        return True
+    except Exception:
+        tb = traceback.format_exc()
+        log.exception("evening report error")
+        alerter.critical(*R.build_report_failed(tb))
+        return True
 
 
 def _safe_cycle(broker, strategies, cfg, ledger, kill_switch, alerter,
@@ -872,56 +827,62 @@ def main() -> None:
 
     dry_run = not args.live
     if args.daily:
-        log.info("daily mode — one cycle per weekday at %02d:00 ET "
-                 "(immediate catch-up if today hasn't run yet)",
-                 DAILY_RUN_HOUR_ET)
+        log.info("daily mode — trading cycle at %02d:00 ET, evening report %d min "
+                 "after the close, on market days", DAILY_RUN_HOUR_ET, REPORT_DELAY_MIN)
+        et = ZoneInfo("America/New_York")
+        _now = datetime.now(et)
+        _sess = _session_today(broker, _now.date())
+        _action, _wake = daily_plan(_now, _sess, _last_cycle_date(), _last_report_date())
+        if _action == "cycle":
+            _next = "now (catching up)"
+        elif _action in ("report", "report_final"):
+            _next = "evening report now"
+        else:
+            _next = _fmt_when(_wake) if _action == "sleep" else "next market day, 9:00 AM ET"
         # A (re)start is worth knowing about, and this send proves alert
         # delivery from the deployed network at boot rather than at the next
         # cycle. A crash loop (restartPolicy ON_FAILURE, max 10) emails at most
         # 10 times — which is exactly when you want to hear about it.
-        _et = ZoneInfo("America/New_York")
-        _now = datetime.now(_et)
-        if daily_action(_now, _last_cycle_date(), True) == "cycle":
-            _next = "today, now (catching up)"
-        else:
-            _nxt = _now + timedelta(seconds=_seconds_until_daily_run())
-            _next = f"{_nxt:%a %b} {_nxt.day}, 9:00 AM ET"
-        alerter.send(*R.build_restart(f"{_now:%a %b} {_now.day}, {_now:%I:%M %p} ET",
-                                      startup_equity, _next, live=not dry_run),
+        alerter.send(*R.build_restart(_fmt_when(_now), startup_equity, _next,
+                                      live=not dry_run),
                      level="INFO", dedup_minutes=0)
-        et = ZoneInfo("America/New_York")
+        retry_at = None
         while True:
             now_et = datetime.now(et)
             today_iso = now_et.date().isoformat()
-            # Catch-up: if today is a session and no cycle has run today yet,
-            # fire one immediately instead of sleeping to tomorrow — but only
-            # at/after the scheduled hour. A restart at 00:06 ET used to fire
-            # the day's cycle immediately: its sells could not fill for 9
-            # hours, so the buys were sized to the cash on hand and the book
-            # sat under-invested until the next cycle.
-            last = _last_cycle_date()
-            pre = daily_action(now_et, last, True)
-            if pre != "sleep":
-                action = daily_action(now_et, last,
-                                      is_session_day(now_et.date(), broker))
-                if action == "cycle":
-                    log.info("catch-up: today (%s) has not run yet — firing now",
-                             today_iso)
-                    _safe_cycle(broker, strategies, cfg, ledger, kill_switch,
-                                alerter, dry_run)
+            session = _session_today(broker, now_et.date())
+            action, wake = daily_plan(now_et, session, _last_cycle_date(),
+                                      _last_report_date(), retry_at)
+            if action == "cycle":
+                log.info("trading cycle for %s", today_iso)
+                _safe_cycle(broker, strategies, cfg, ledger, kill_switch, alerter, dry_run)
+            elif action == "skip_cycle":
+                log.warning("%s: the close passed without a cycle — too late to trade "
+                            "today; the next cycle trades at the next open", today_iso)
+                save_cycle_summary({"date": today_iso, "status": "skipped", "orders": [],
+                                    "trade_reason": None, "warnings": [
+                                        "No trading cycle ran today: the engine was not "
+                                        "running at 9:00 AM ET. It trades at the next open."]})
+                _record_cycle_date()
+            elif action in ("report", "report_final"):
+                done = _safe_report(broker, strategies, cfg, ledger, kill_switch, alerter,
+                                    final=(action == "report_final"))
+                if done:
+                    _record_report_date()
+                    retry_at = None
                 else:
-                    if now_et.weekday() < 5:
-                        log.info("%s is a market holiday — no cycle", today_iso)
-                    # Record EVERY non-session day (weekends included). The
-                    # 2026-09-10 version only recorded holidays, so a weekend
-                    # restart spun this loop with no sleep until Monday.
-                    _record_cycle_date()
-                continue   # loop back, then sleep to the next scheduled slot
-            wait = _seconds_until_daily_run()
-            log.info("next cycle in %.1f hours", wait / 3600.0)
-            time.sleep(wait)
-            # After the sleep the loop re-enters and the session check above
-            # decides whether to cycle — holidays are skipped there.
+                    retry_at = now_et + timedelta(minutes=REPORT_RETRY_MIN)
+            elif action == "record":
+                if now_et.weekday() < 5:
+                    log.info("%s is a market holiday — no cycle, no report", today_iso)
+                # Record EVERY non-session day (weekends included), so a weekend
+                # restart cannot spin this loop.
+                _record_cycle_date()
+                _record_report_date()
+            else:
+                secs = max(1.0, (wake - now_et).total_seconds())
+                log.info("next check %s (in %.1f hours)", _fmt_when(wake), secs / 3600.0)
+                time.sleep(secs)
     elif args.interval > 0:
         log.info("interval mode — every %ds (Ctrl-C to stop)", args.interval)
         while True:

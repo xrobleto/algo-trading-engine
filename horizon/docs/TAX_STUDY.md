@@ -64,3 +64,28 @@ Baseline = current live (band 0.20, override 0.10). Crash-window drawdowns are m
 | 0.40 | 19.58% | 1.07 | -25.9% | -25.9% | -20.2% | -15.8% | 5.4x | 4% | 86% | **14.39%** | 15.56% | 13.47% | 12.98% | 15.79% | 14.35% | yes |
 
 **Result: switch live to band 0.40** (best eligible: 0.4; after-tax gain vs live +0.36pp; switch threshold +0.20pp).
+
+## Erratum (2026-10-31): wash-sale losses were sometimes dropped
+
+`backtest/tax.py` matched a loss sale to replacement shares bought *earlier* even when those
+shares had already been sold, then had nowhere to carry the disallowed loss, so the loss vanished
+instead of being deferred. Found when the live account's figures failed the identity
+realized + unrealized + dividends + fees = profit (off by $1,335; after the fix it closes to the
+$25.64 non-trading cash item). Fixed: earlier replacements must still be held; later purchases
+carry the loss. A randomized test now asserts the identity on every run.
+
+Impact: the bug only bites when the same fund is bought and sold within 30 days repeatedly, so it
+overstated taxes for **unbanded** configurations and left banded ones nearly untouched.
+Re-measured at the live target_vol 0.25, ST 32% / LT 15%, 2008-01-02 → 2026-10-09:
+
+| band | after tax (fixed model) |
+|---|--:|
+| 0.00 | 14.72% |
+| 0.10 | 15.18% |
+| 0.20 | 15.17% |
+| 0.30 | 15.66% |
+| **0.40 (live)** | **16.44%** |
+
+The band choice stands (0.40 best in the full period and both halves). The live configuration's
+figures in LEVERAGE_STUDY.md and CORE_OVERLAY_STUDY.md are unchanged (16.44% / 16.67% never sold);
+the no-band baselines in the tables above this erratum are understated by about 1 pp.
