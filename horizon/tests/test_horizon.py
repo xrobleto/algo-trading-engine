@@ -684,6 +684,55 @@ def test_pulse_levered_etf_expression():
     assert LEVERED_ASSET not in PulseStrategy().universe()
 
 
+def test_recovery_credit_confirmation():
+    """Recovery mode (docs/CREDIT_STUDY_PREREG.md): "price+credit" needs both
+    confirmations, "credit" can lead price, every rule ends at a new high, the
+    incremental tracker matches a one-shot pass, and a missing credit series
+    keeps recovery mode off."""
+    from ..strategies.pulse import (CASH_ASSET, CONFIRM_BOTH, CONFIRM_CREDIT, CONFIRM_PRICE,
+                                    LEVERED_ASSET, MODE_NORMAL, MODE_RECOVERY, RISK_ASSET,
+                                    PulseStrategy, RecoveryTracker, recovery_modes)
+    idx = pd.bdate_range("2020-01-01", periods=400)
+    trend = np.r_[np.linspace(50, 100, 260), np.linspace(99, 80, 40), np.linspace(80.3, 110, 100)]
+    px = pd.Series(trend * (1 + 0.012 * (-1.0) ** np.arange(400)), index=idx)  # ~38% vol
+    late = pd.Series(np.r_[np.full(260, 2.0), np.linspace(2.0, 3.0, 60),
+                           np.linspace(3.0, 2.0, 80)], index=idx)     # narrows after the low
+    early = pd.Series(np.r_[np.full(260, 2.0), np.linspace(2.0, 3.0, 20),
+                            np.linspace(3.0, 2.0, 20), np.full(100, 2.0)], index=idx)
+
+    def first(m):
+        hits = np.flatnonzero(np.asarray(m) == MODE_RECOVERY)
+        return int(hits[0]) if len(hits) else None
+
+    price = recovery_modes(px, 0.10, 50)
+    assert first(price) is not None and price[-1] == MODE_NORMAL
+    assert first(recovery_modes(px, 0.10, 50, credit=late, confirm=CONFIRM_BOTH)) > first(price)
+    assert (first(recovery_modes(px, 0.10, 50, credit=early, confirm=CONFIRM_CREDIT))
+            < first(price) <= first(recovery_modes(px, 0.10, 50, credit=early,
+                                                   confirm=CONFIRM_BOTH)))
+    for k, how in ((late, CONFIRM_BOTH), (early, CONFIRM_CREDIT)):
+        full = recovery_modes(px, 0.10, 50, credit=k, confirm=how)
+        assert full[-1] == MODE_NORMAL, f"{how}: no exit at the new high"
+        t = RecoveryTracker(0.10, 50, 0.015, confirm=how)
+        for i in range(1, len(px) + 1):
+            step = t.modes(px.iloc[:i], k.iloc[:i])
+        assert list(step) == list(full), f"{how}: incremental != one-shot"
+    assert list(recovery_modes(px, 0.10, 50)) == list(
+        recovery_modes(px, 0.10, 50, credit=late, confirm=CONFIRM_PRICE))
+
+    bars = lambda s: pd.DataFrame({"open": s, "close": s, "tr_close": s, "dividend": 0.0})
+    ds = {RISK_ASSET: bars(px), LEVERED_ASSET: bars(px), CASH_ASSET: bars(px * 0 + 100)}
+    kw = dict(leverage_via="levered_etf", recovery_dd=0.10, recovery_confirm=CONFIRM_CREDIT,
+              recovery_credit="SPREAD")
+    day = idx[first(recovery_modes(px, 0.10, 50, credit=early, confirm=CONFIRM_CREDIT))]
+    s1, s2 = {}, {}
+    on = PulseStrategy(**kw).decide(MarketView(dict(ds, SPREAD=bars(early)), day), s1)
+    off = PulseStrategy(**kw).decide(MarketView(ds, day), s2)
+    assert on.target_weights.get(LEVERED_ASSET) == 1.0 and s1.get("force_rebalance")
+    assert "recovery_mode" not in s2 and off.target_weights.get(LEVERED_ASSET, 0.0) < 1.0
+    assert "SPREAD" in PulseStrategy(**kw).universe()
+
+
 def main() -> int:
     tests = [test_cache_freshness_is_evaluated_per_call, test_stale_cycle_is_refused,
              test_funding_guard_scales_to_account_capacity, test_gross_ceiling,
@@ -694,7 +743,7 @@ def main() -> int:
              test_tax_model_hand_cases, test_rotation_hold_buffer,
              test_alerter_resend_transport, test_performance_from_daily_closes,
              test_event_emails_are_actionable,
-             test_pulse_levered_etf_expression,
+             test_pulse_levered_etf_expression, test_recovery_credit_confirmation,
              test_no_lookahead, test_single_source_of_truth,
              test_strategies_decide_cleanly, test_risk_overlay_recovers,
              test_ledger_roundtrip, test_harness_smoke,

@@ -98,15 +98,17 @@ def _rate(series_id: str, index: pd.DatetimeIndex) -> pd.Series:
 
 
 def index_book(px: pd.Series, rate: pd.Series, l_rec: Optional[float] = None,
-               arm: float = ARM, sma: int = SMA, tv: float = 0.25) -> pd.Series:
-    """64.3% PULSE + 35.7% cash on a price index; leverage set at close T, held T+1."""
+               arm: float = ARM, sma: int = SMA, tv: float = 0.25,
+               modes: Optional[np.ndarray] = None) -> pd.Series:
+    """64.3% PULSE + 35.7% cash on a price index; leverage set at close T, held T+1.
+    `modes` (per bar of px.dropna()) replaces the price-only recovery rule."""
     px = px.dropna()
     rate = rate.reindex(px.index).ffill().fillna(0.0)
     r = px.pct_change().fillna(0.0)
     rv = r.rolling(20).std(ddof=0) * np.sqrt(252)
     lev = (tv / rv).clip(0.5, 2.0)
     if l_rec:
-        modes = recovery_modes(px, arm, sma)
+        modes = recovery_modes(px, arm, sma) if modes is None else modes
         lev = lev.where(modes != MODE_RECOVERY, np.maximum(lev.fillna(0.0), l_rec))
     lev = lev.shift(1).fillna(1.0)
     fin = (rate.shift(1).fillna(0.0) + SPREAD) / 252

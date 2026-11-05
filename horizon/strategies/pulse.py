@@ -66,60 +66,94 @@ DEFAULT_MIN_LEVERAGE = 0.5
 # (-hysteresis): the rally failed, and recovery mode may re-trigger while the
 # drawdown lasts. Volatility targeting alone re-levers only after realized vol
 # falls, weeks into a recovery.
+#
+# Credit confirmation (docs/CREDIT_STUDY_PREREG.md) — CANDIDATE. With
+# recovery_confirm="price+credit" the credit spread must also be narrowing
+# (below its `recovery_credit_sma`-day average, same hysteresis); with "credit"
+# the credit condition alone confirms. The spread is the dataset symbol
+# `recovery_credit`, whose close on each date is the value known at that
+# decision. If the series is missing, recovery mode stays off.
 RECOVERY_LOOKBACK = 252
 MODE_NORMAL, MODE_ARMED, MODE_RECOVERY = 0, 1, 2
+CONFIRM_PRICE, CONFIRM_BOTH, CONFIRM_CREDIT = "price", "price+credit", "credit"
 
 
 class RecoveryTracker:
-    """Recovery-mode state per bar, a pure function of closes through that bar.
+    """Recovery-mode state per bar, a pure function of the data through that bar.
 
     Incremental: backtests call decide() once a day on a series that grows by
     one bar, so only new bars are processed. If the history changes (a restart
     on different data, a split adjustment) it recomputes from the start.
+    `armed`, `price_ok` and `credit_ok` hold the state after the last bar.
     """
 
     def __init__(self, dd: float, sma_days: int, hysteresis: float,
-                 lookback: int = RECOVERY_LOOKBACK):
+                 lookback: int = RECOVERY_LOOKBACK, confirm: str = CONFIRM_PRICE,
+                 credit_sma: int = 50):
+        if confirm not in (CONFIRM_PRICE, CONFIRM_BOTH, CONFIRM_CREDIT):
+            raise ValueError(f"confirm must be price|price+credit|credit, got {confirm}")
         self.dd, self.sma_days = float(dd), int(sma_days)
         self.hysteresis, self.lookback = float(hysteresis), int(lookback)
+        self.confirm, self.credit_sma = confirm, int(credit_sma)
         self._reset()
 
     def _reset(self) -> None:
         self._modes: List[int] = []
         self._last = None
-        self._armed = self._rec = False
+        self.armed = self.price_ok = self.credit_ok = False
 
-    def modes(self, closes: pd.Series) -> List[int]:
+    def modes(self, closes: pd.Series, credit: Optional[pd.Series] = None) -> List[int]:
+        if self.confirm != CONFIRM_PRICE and credit is None:
+            raise ValueError("credit confirmation needs a credit series")
+        c = closes.to_numpy(dtype=float)
+        k = None if credit is None else credit.reindex(closes.index).to_numpy(dtype=float)
+
+        def stamp(i):
+            kv = None if k is None or np.isnan(k[i]) else float(k[i])
+            return closes.index[i], float(c[i]), kv
+
         n, done = len(closes), len(self._modes)
-        if done and (n < done or (closes.index[done - 1], float(closes.iloc[done - 1]))
-                     != self._last):
+        if done and (n < done or stamp(done - 1) != self._last):
             self._reset()
             done = 0
-        c = closes.to_numpy(dtype=float)
+        h = self.hysteresis
         for i in range(done, n):
             high = c[max(0, i - self.lookback + 1):i + 1].max()
             if c[i] >= high:                       # new 252-session high: over
-                self._armed = self._rec = False
+                self.armed = self.price_ok = self.credit_ok = False
             else:
                 if c[i] <= high * (1.0 - self.dd):
-                    self._armed = True
-                if self._armed and i + 1 >= self.sma_days:
+                    self.armed = True
+                if self.armed and i + 1 >= self.sma_days:
                     sma = c[i + 1 - self.sma_days:i + 1].mean()
-                    if not self._rec and c[i] > sma * (1.0 + self.hysteresis):
-                        self._rec = True
-                    elif self._rec and c[i] < sma * (1.0 - self.hysteresis):
-                        self._rec = False
-            self._modes.append(MODE_RECOVERY if self._rec
-                               else MODE_ARMED if self._armed else MODE_NORMAL)
+                    if not self.price_ok and c[i] > sma * (1.0 + h):
+                        self.price_ok = True
+                    elif self.price_ok and c[i] < sma * (1.0 - h):
+                        self.price_ok = False
+                if self.armed and k is not None and i + 1 >= self.credit_sma:
+                    w = k[i + 1 - self.credit_sma:i + 1]
+                    if not np.isnan(w).any():
+                        avg = w.mean()
+                        if not self.credit_ok and k[i] < avg * (1.0 - h):
+                            self.credit_ok = True
+                        elif self.credit_ok and k[i] > avg * (1.0 + h):
+                            self.credit_ok = False
+            ok = {CONFIRM_PRICE: self.price_ok, CONFIRM_CREDIT: self.credit_ok,
+                  CONFIRM_BOTH: self.price_ok and self.credit_ok}[self.confirm]
+            self._modes.append(MODE_RECOVERY if self.armed and ok
+                               else MODE_ARMED if self.armed else MODE_NORMAL)
         if n:
-            self._last = (closes.index[-1], float(c[-1]))
+            self._last = stamp(n - 1)
         return self._modes
 
 
 def recovery_modes(closes: pd.Series, dd: float, sma_days: int,
-                   hysteresis: float = DEFAULT_HYSTERESIS) -> np.ndarray:
+                   hysteresis: float = DEFAULT_HYSTERESIS,
+                   credit: Optional[pd.Series] = None, confirm: str = CONFIRM_PRICE,
+                   credit_sma: int = 50) -> np.ndarray:
     """Recovery-mode state for every bar of `closes` (MODE_* values)."""
-    return np.asarray(RecoveryTracker(dd, sma_days, hysteresis).modes(closes))
+    t = RecoveryTracker(dd, sma_days, hysteresis, confirm=confirm, credit_sma=credit_sma)
+    return np.asarray(t.modes(closes, credit))
 
 
 class PulseStrategy(Strategy):
@@ -137,7 +171,10 @@ class PulseStrategy(Strategy):
                  leverage_via: str = LEVERAGE_VIA_MARGIN,
                  recovery_dd: Optional[float] = None,
                  recovery_sma: int = 50,
-                 recovery_leverage: float = 2.0):
+                 recovery_leverage: float = 2.0,
+                 recovery_confirm: str = CONFIRM_PRICE,
+                 recovery_credit: Optional[str] = None,
+                 recovery_credit_sma: int = 50):
         self.trend_ema = int(trend_ema)
         self.hysteresis = float(hysteresis)
         self.abs_mom_days = int(abs_mom_days)
@@ -152,13 +189,20 @@ class PulseStrategy(Strategy):
         self.recovery_dd = float(recovery_dd) if recovery_dd else None
         self.recovery_sma = int(recovery_sma)
         self.recovery_leverage = float(recovery_leverage)
-        self._tracker = (RecoveryTracker(self.recovery_dd, self.recovery_sma, self.hysteresis)
+        self.recovery_confirm = recovery_confirm
+        self.recovery_credit = (recovery_credit if self.recovery_dd
+                                and recovery_confirm != CONFIRM_PRICE else None)
+        if self.recovery_dd and recovery_confirm != CONFIRM_PRICE and not recovery_credit:
+            raise ValueError("credit confirmation needs recovery_credit (a dataset symbol)")
+        self._tracker = (RecoveryTracker(self.recovery_dd, self.recovery_sma, self.hysteresis,
+                                         confirm=recovery_confirm,
+                                         credit_sma=recovery_credit_sma)
                          if self.recovery_dd else None)
 
     def universe(self) -> List[str]:
-        if self.leverage_via == LEVERAGE_VIA_ETF:
-            return [RISK_ASSET, LEVERED_ASSET, CASH_ASSET]
-        return [RISK_ASSET, CASH_ASSET]
+        syms = ([RISK_ASSET, LEVERED_ASSET, CASH_ASSET] if self.leverage_via == LEVERAGE_VIA_ETF
+                else [RISK_ASSET, CASH_ASSET])
+        return syms + ([self.recovery_credit] if self.recovery_credit else [])
 
     def _express(self, view: MarketView, lev: float, note: str) -> Decision:
         """Turn a leverage number into target weights per `leverage_via`."""
@@ -197,8 +241,11 @@ class PulseStrategy(Strategy):
         if not self.use_trend_filter:
             lev = self._leverage(closes)
             note = f"always-on lev={lev:.2f}"
-            if self._tracker is not None:
-                modes = self._tracker.modes(closes)
+            credit = None
+            if self.recovery_credit and view.trading_age(self.recovery_credit):
+                credit = view.closes(self.recovery_credit)
+            if self._tracker is not None and (credit is not None or not self.recovery_credit):
+                modes = self._tracker.modes(closes, credit)
                 now = modes[-1]
                 prev = modes[-2] if len(modes) > 1 else MODE_NORMAL
                 if now == MODE_RECOVERY:
