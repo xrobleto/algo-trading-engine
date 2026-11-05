@@ -2,7 +2,8 @@
 
 A thin wrapper over alpaca-py for account queries and order submission. Live
 trading is refused unless explicitly confirmed via env vars — the engine
-defaults to paper.
+defaults to paper. --preview reads the live account through ReadOnlyBroker,
+which can place, cancel and close nothing.
 """
 
 from __future__ import annotations
@@ -14,6 +15,10 @@ from ..paths import get_secret, require_secret
 
 class BrokerError(RuntimeError):
     pass
+
+
+class ReadOnlyError(BrokerError):
+    """A read-only broker was asked to write."""
 
 
 class BrokerFacade:
@@ -226,6 +231,69 @@ class BrokerFacade:
                                  if o.filled_avg_price else None),
             "side": getattr(o.side, "value", str(o.side)).lower(),
         }
+
+
+# BrokerFacade members that only read. ReadOnlyBroker passes these through and
+# refuses everything else, so a method added to the facade later stays blocked
+# until someone checks it and lists it here.
+READ_ONLY_MEMBERS = frozenset({
+    "paper", "get_account", "get_equity", "get_positions", "get_open_orders",
+    "get_order_by_client_id", "is_market_open", "seconds_until_open",
+    "is_trading_day", "session_hours", "calendar", "daily_closes", "orders_since",
+    "all_activities", "cash_flows_by_date"})
+
+
+class ReadOnlyBroker:
+    """A BrokerFacade that can only read: what --preview runs on.
+
+    Two independent locks. Any member outside READ_ONLY_MEMBERS raises
+    ReadOnlyError on access (submit_market_order, cancel_all_orders,
+    close_all_positions, _client, ...). And the alpaca-py client underneath
+    sends nothing but GET, so a code path that reaches the client directly is
+    refused before any request leaves the process.
+    """
+
+    def __init__(self, broker):
+        self._broker = broker
+        client = getattr(broker, "_client", None)
+        if client is not None:
+            _refuse_all_but_get(client)
+
+    def __getattr__(self, name):
+        if name in READ_ONLY_MEMBERS:
+            return getattr(self._broker, name)
+        raise ReadOnlyError(f"read-only broker: '{name}' is blocked (a preview places, "
+                            f"cancels and closes nothing)")
+
+
+def _refuse_all_but_get(client) -> None:
+    """Make an alpaca-py REST client refuse every HTTP method except GET.
+    Every client request goes through its requests.Session; if that hook is
+    missing (a changed alpaca-py), refuse to build the broker at all."""
+    session = getattr(client, "_session", None)
+    if session is None or not callable(getattr(session, "request", None)):
+        raise ReadOnlyError("cannot make this alpaca-py client read-only: no _session")
+    send = session.request
+
+    def get_only(method, url, *args, **kwargs):
+        if str(method).upper() != "GET":
+            raise ReadOnlyError(f"read-only broker: refused {method} {url}")
+        return send(method, url, *args, **kwargs)
+
+    session.request = get_only
+
+
+def create_preview_broker_from_env() -> ReadOnlyBroker:
+    """The live account, read-only, for --preview. LIVE_TRADING and
+    I_UNDERSTAND_LIVE_TRADING gate order submission, which a preview never
+    reaches, so they are not required here; the keys must be live keys."""
+    key = require_secret("ALPACA_API_KEY")
+    secret = require_secret("ALPACA_SECRET_KEY")
+    base_url = (get_secret("ALPACA_BASE_URL", "") or "").lower()
+    if "paper" in base_url:
+        raise BrokerError("--preview reads the live account, but ALPACA_BASE_URL "
+                          "points to paper")
+    return ReadOnlyBroker(BrokerFacade(key, secret, paper=False))
 
 
 def create_broker_from_env() -> BrokerFacade:

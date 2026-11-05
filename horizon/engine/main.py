@@ -11,6 +11,12 @@ submits nothing. Live trading is the user's explicit decision. Run:
     python -m horizon.engine.main --daily --live      # live (needs env confirm)
     python -m horizon.engine.main --interval 900      # dry-run loop (testing)
     python -m horizon.engine.main --flatten           # emergency: cancel + liquidate
+    python -m horizon.engine.main --preview           # read-only cycle vs the LIVE account
+
+A dry run reads the account its keys resolve to under LIVE_TRADING (paper
+unless LIVE_TRADING=1). To see what the next cycle would do on the live
+account, use --preview (engine/preview.py): it reads the live account, submits
+nothing, and works on a copy of the engine state.
 """
 
 from __future__ import annotations
@@ -363,8 +369,15 @@ def load_cycle_summary() -> dict:
 
 
 def run_cycle(broker, strategies, cfg, ledger, kill_switch, alerter,
-              dry_run: bool = True) -> dict:
-    """Run one engine cycle: reconcile, decide, diff vs broker, submit (or log)."""
+              dry_run: bool = True, preview: bool = False) -> dict:
+    """Run one engine cycle: reconcile, decide, diff vs broker, submit (or log).
+
+    preview: a read-only cycle against the real account (engine/preview.py).
+    It never submits, and an account that cannot be read is an error, not a
+    quiet fallback to modeled equity."""
+    if preview and broker is None:
+        raise RuntimeError("preview needs a broker: it plans against the real account")
+    dry_run = dry_run or preview
     warnings: List[str] = []     # shown in the daily report; logged as they arise
     tripped, reason = kill_switch.is_triggered()
     if tripped:
@@ -411,6 +424,8 @@ def run_cycle(broker, strategies, cfg, ledger, kill_switch, alerter,
             equity = broker.get_equity()
             positions = broker.get_positions()
         except Exception as exc:
+            if preview:
+                raise RuntimeError(f"preview: the account could not be read ({exc})") from exc
             log.warning("broker unavailable (%s) — modeled equity, dry-run", exc)
             broker, dry_run = None, True
 
@@ -529,7 +544,7 @@ def run_cycle(broker, strategies, cfg, ledger, kill_switch, alerter,
 
     if dry_run or broker is None:
         for o in sells + buys:
-            log.info("[DRY-RUN] %-4s %-5s qty=%.4f (~$%.0f)",
+            log.info("[%s] %-4s %-5s qty=%.4f (~$%.0f)", "PREVIEW" if preview else "DRY-RUN",
                      o["side"], o["symbol"], o["qty"], o["notional"])
             placed.append((None, o))
     else:
@@ -582,7 +597,9 @@ def run_cycle(broker, strategies, cfg, ledger, kill_switch, alerter,
                             f"the {cfg.rebalance_band:.0%} rebalance band.")
         else:
             trade_reason = "A position was fully entered or exited."
-    if dry_run or broker is None:
+    if preview:
+        warnings.append("PREVIEW: read-only against the live account; no orders were placed.")
+    elif dry_run or broker is None:
         warnings.append("DRY-RUN: no real orders were placed.")
 
     summary = {"date": datetime.now(ZoneInfo("America/New_York")).date().isoformat(),
@@ -599,7 +616,8 @@ def run_cycle(broker, strategies, cfg, ledger, kill_switch, alerter,
                            "notional": round(o["notional"], 2)} for c, o in placed],
                "trade_reason": trade_reason, "warnings": list(warnings),
                "orders_planned": len(orders), "orders_submitted": submitted,
-               "mode": "dry-run" if (dry_run or broker is None) else "LIVE"}
+               "mode": ("PREVIEW" if preview else
+                        "dry-run" if (dry_run or broker is None) else "LIVE")}
     if not dry_run and broker is not None:
         save_cycle_summary(summary)
     log.info("cycle: as_of=%s regime=%s score=%.0f equity=$%.0f ceil=x%.2f "
@@ -763,7 +781,22 @@ def main() -> None:
                         help="EMERGENCY: cancel all orders and liquidate all")
     parser.add_argument("--live", action="store_true",
                         help="submit real orders (requires env confirmation)")
+    parser.add_argument("--preview", action="store_true",
+                        help="one read-only cycle against the LIVE account: submits "
+                             "nothing, writes nothing to the live state, sends no alerts")
+    parser.add_argument("--state-from", metavar="DIR",
+                        help="with --preview: a copy of the live state directory "
+                             "(default: this engine's own state directory)")
     args = parser.parse_args()
+    if args.preview:
+        if args.live or args.flatten or args.daily or args.interval:
+            parser.error("--preview runs one read-only cycle; it cannot be combined "
+                         "with --live, --flatten, --daily or --interval")
+        from .preview import main as preview_main
+        preview_main(args.state_from)
+        return
+    if args.state_from:
+        parser.error("--state-from only applies to --preview")
 
     logging.basicConfig(
         level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s",
@@ -817,9 +850,20 @@ def main() -> None:
         try:
             from .broker import create_broker_from_env
             broker = create_broker_from_env()
-            log.info("dry-run — broker connected for equity/positions only")
         except Exception as exc:
             log.warning("no broker (%s) — using modeled equity", exc)
+        if broker is not None:
+            # Constructing the client proves nothing. Live keys sent to the paper
+            # endpoint (LIVE_TRADING=0) fail here, and every cycle would then
+            # plan a fresh book against modeled equity without saying so.
+            try:
+                broker.get_account()
+                log.info("dry-run — broker connected for equity/positions only "
+                         "(paper=%s)", broker.paper)
+            except Exception as exc:
+                log.warning("dry-run cannot read the account (%s) — cycles will plan "
+                            "against modeled equity with no positions. To see the "
+                            "live account, use --preview.", exc)
 
     if args.flatten:
         emergency_flatten(broker, kill_switch, alerter)

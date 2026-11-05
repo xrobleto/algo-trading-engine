@@ -61,6 +61,22 @@ python -m horizon.engine.main --interval 900     # dry-run loop (testing)
 python -m horizon.engine.main --flatten          # EMERGENCY: cancel + liquidate all
 ```
 
+A dry run reads whichever account its keys resolve to under `LIVE_TRADING`
+(paper unless `LIVE_TRADING=1`). To see what the next cycle would do on the
+**live** account, use the read-only preview:
+
+```bash
+railway run -s horizon-live -- python -m horizon.engine.main --preview
+python -m horizon.engine.main --preview --state-from DIR   # DIR = a copy of /data/horizon/state
+```
+
+It reads the live account with GET requests only, cannot place, cancel or close
+anything, sends no alerts, and runs on a scratch copy of the engine state, so
+the live state is never written. Inside the horizon-live container
+(`ALGO_OUTPUT_DIR=/data`) it reads `/data/horizon/state` itself. Elsewhere, state
+the source lacks (ledger, strategy states, rebalance token) is rebuilt and listed
+in the output. See `engine/preview.py`.
+
 Live trading is the user's explicit decision and requires `LIVE_TRADING=1` plus
 `I_UNDERSTAND_LIVE_TRADING=YES` in `.env` (add `--live` to the command).
 The engine emails alerts on failures, kill-switch trips, and a daily heartbeat

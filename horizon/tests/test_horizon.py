@@ -109,6 +109,193 @@ class _StubBroker:
         return None
 
 
+class _SpyBroker:
+    """A live-account stand-in for preview tests: an empty book with cash, and
+    a record of every write that reaches it. No network."""
+
+    paper = False
+
+    def __init__(self, equity=10_000.0):
+        self.equity, self.writes = equity, []
+
+    def get_account(self):
+        return {"equity": self.equity, "last_equity": self.equity, "cash": self.equity,
+                "buying_power": self.equity, "multiplier": 1.0, "status": "ACTIVE"}
+
+    def get_equity(self):
+        return self.equity
+
+    def get_positions(self):
+        return {}
+
+    def get_open_orders(self):
+        return []
+
+    def get_order_by_client_id(self, client_order_id):
+        return None
+
+    def seconds_until_open(self):
+        return 0.0
+
+    def submit_market_order(self, *args, **kwargs):
+        self.writes.append(("submit_market_order", args))
+        return {"id": "should-never-exist"}
+
+    def cancel_all_orders(self):
+        self.writes.append(("cancel_all_orders",))
+        return 0
+
+    def close_all_positions(self):
+        self.writes.append(("close_all_positions",))
+        return 0
+
+
+def test_preview_broker_is_read_only():
+    """--preview's broker passes reads through and refuses every write: at the
+    method layer (submit, cancel, close, or any member not listed as a read)
+    and at the HTTP layer underneath, where only GET leaves the alpaca-py
+    client. The session records instead of sending, so nothing hits Alpaca."""
+    from alpaca.trading.enums import OrderSide, TimeInForce
+    from alpaca.trading.requests import MarketOrderRequest
+    from ..engine.broker import BrokerFacade, ReadOnlyBroker, ReadOnlyError
+    spy = _SpyBroker()
+    ro = ReadOnlyBroker(spy)
+    assert ro.get_equity() == spy.equity and ro.paper is False
+    for name in ("submit_market_order", "cancel_all_orders", "close_all_positions",
+                 "_client", "replace_order"):
+        try:
+            getattr(ro, name)
+        except ReadOnlyError:
+            continue
+        raise AssertionError(f"the read-only broker let '{name}' through")
+    assert spy.writes == []
+
+    class _Resp:
+        status_code, text = 200, "{}"
+        def raise_for_status(self): pass
+        def json(self): return {}
+
+    facade = BrokerFacade("PKTEST0000", "not-a-secret", paper=False)
+    sent = []
+    facade._client._session.request = lambda method, url, **kw: sent.append((method, url)) or _Resp()
+    ReadOnlyBroker(facade)
+    order = MarketOrderRequest(symbol="QQQM", side=OrderSide.BUY, qty=1,
+                               time_in_force=TimeInForce.DAY)
+    for write in (lambda: facade._client.submit_order(order), facade._client.cancel_orders,
+                  facade._client.close_all_positions):
+        try:
+            write()
+        except ReadOnlyError:
+            continue
+        raise AssertionError("a write reached the HTTP session")
+    assert sent == []
+    facade._client.get("/account")                    # reads still work, on the live host
+    assert len(sent) == 1 and sent[0][0] == "GET" and "paper" not in sent[0][1], sent
+
+
+def test_preview_never_submits_an_order():
+    """The preview path end to end, on an account that would trade (an empty
+    book: every target is a buy). Orders are planned and none reaches the
+    broker. Even with the preview flag lost (dry_run=False), the read-only
+    broker refuses the submit. The source state directory is left byte for
+    byte, the environment is restored, and --preview cannot run with --live."""
+    import contextlib
+    import io
+    import json
+    import os
+    import shutil
+    import sys
+    from ..config import build_default_config
+    from ..engine import main as M
+    from ..engine import preview as P
+    from ..engine.alerts import Alerter
+    from ..engine.broker import ReadOnlyBroker, ReadOnlyError
+    from ..engine.killswitch import KillSwitch
+    env = {k: os.environ.get(k) for k in ("ALGO_OUTPUT_DIR", "HORIZON_ALERTS_ENABLED")}
+    spy = _SpyBroker()
+    broker = ReadOnlyBroker(spy)
+    cfg = build_default_config()
+    real_staleness = M.data_staleness_days
+    M.data_staleness_days = lambda as_of, now=None: 0     # plan even on an old cache
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            live = Path(d)
+            OwnershipLedger().save(live / M._LEDGER_FILE)
+            (live / M._STATE_FILE).write_text(json.dumps({}), encoding="utf-8")
+            (live / M._REBALANCE_TOKEN_FILE).write_text("an-older-token", encoding="utf-8")
+            before = {p.name: p.read_bytes() for p in live.iterdir()}
+            with P.isolated(live) as (root, found):
+                assert sorted(found) == sorted([M._LEDGER_FILE, M._STATE_FILE,
+                                                M._REBALANCE_TOKEN_FILE])
+                assert os.environ["HORIZON_ALERTS_ENABLED"] == "0"
+                summary, notes = P.run_preview(broker, cfg, registry.build_all(), found)
+                again = M.run_cycle(broker, registry.build_all(), cfg, OwnershipLedger(),
+                                    KillSwitch(), Alerter(), dry_run=False, preview=True)
+                assert again["mode"] == "PREVIEW" and again["orders_submitted"] == 0
+                try:
+                    M.run_cycle(broker, registry.build_all(), cfg, OwnershipLedger(),
+                                KillSwitch(), Alerter(), dry_run=False)
+                except ReadOnlyError:
+                    pass
+                else:
+                    raise AssertionError("run_cycle got an order through the read-only broker")
+            assert {p.name: p.read_bytes() for p in live.iterdir()} == before, \
+                "the preview wrote to the source state"
+            shutil.rmtree(root)
+    finally:
+        M.data_staleness_days = real_staleness
+    assert summary["mode"] == "PREVIEW" and summary["orders_submitted"] == 0
+    assert summary["orders_planned"] > 0 and {o["side"] for o in summary["orders"]} == {"buy"}
+    assert summary["forced"], "the copied token differs from the config's; the band is bypassed"
+    assert spy.writes == []
+    assert {k: os.environ.get(k) for k in env} == env, "isolated() leaked its environment"
+    argv, err = sys.argv, io.StringIO()
+    try:
+        sys.argv = ["horizon.engine.main", "--preview", "--live"]
+        with contextlib.redirect_stderr(err):
+            M.main()
+    except SystemExit as exc:
+        assert exc.code == 2 and "--preview runs one read-only cycle" in err.getvalue()
+    else:
+        raise AssertionError("--preview --live was accepted")
+    finally:
+        sys.argv = argv
+
+
+def test_preview_rebuilds_missing_state():
+    """Without a copy of the live state, the preview owns positions in the
+    admitted universes as ENGINE (anything else is left for reconcile to adopt
+    as UNMANAGED) and replays the strategies, so ROTATION keeps the pick it made
+    on the month's first session instead of re-ranking on as_of."""
+    from ..data import calendar
+    from ..engine import preview as P
+    from ..engine.reconciler import UNMANAGED, reconcile
+    strategies = registry.build_all()
+    risk = strategies["PULSE"].universe()[0]
+    positions = {risk: {"symbol": risk, "qty": 2.0, "market_value": 600.0,
+                        "avg_entry_price": 290.0},
+                 "XLK": {"symbol": "XLK", "qty": 1.0, "market_value": 250.0,
+                         "avg_entry_price": 240.0}}
+    led = OwnershipLedger()
+    assert P.seed_ownership(led, positions, strategies) == [risk]
+    reconcile(_StubBroker(positions), led)
+    assert led.get_owner(risk) == "ENGINE" and led.get_owner("XLK") == UNMANAGED
+
+    ds = cache.load_dataset()
+    months: dict = {}
+    for day in calendar.trading_days(ds):
+        months.setdefault(f"{day.year}-{day.month:02d}", []).append(day)
+    keys = sorted(months)
+    month, prev = keys[-2], keys[-3]          # the last complete month and the one before
+    first = months[month][0]
+    picked = strategies["ROTATION"].decide(MarketView(ds, first),
+                                           strategies["ROTATION"].initial_state())
+    mid = P.replay_states(strategies, ds, months[month][9])["ROTATION"]
+    assert mid["last_rebal_month"] == month and mid["holdings"] == picked.target_weights
+    # Going into the month's first session, the review is still due.
+    assert P.replay_states(strategies, ds, first)["ROTATION"]["last_rebal_month"] == prev
+
+
 def test_reconciler_orphan_recovery():
     """An unrecognized broker position is adopted as a tracked UNMANAGED entry."""
     from ..engine.reconciler import UNMANAGED, reconcile
@@ -749,7 +936,8 @@ def main() -> int:
              test_ledger_roundtrip, test_harness_smoke,
              test_reconciler_orphan_recovery, test_alerter_never_raises,
              test_emergency_flatten_requires_broker,
-             test_pending_order_awareness]
+             test_pending_order_awareness, test_preview_broker_is_read_only,
+             test_preview_never_submits_an_order, test_preview_rebuilds_missing_state]
     failed = 0
     for t in tests:
         try:
