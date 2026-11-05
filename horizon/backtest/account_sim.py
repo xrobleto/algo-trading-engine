@@ -180,8 +180,12 @@ def simulate(dataset: Dict[str, pd.DataFrame], strategies: Dict[str, Strategy],
                 target = apply_core_floor(target, core_shares * cpx, core_symbol,
                                           levered_symbol or "", _fund)
         prices = {s: view.close(s) for s in set(target) | set(mv) if view.is_tradable(s)}
+        # A strategy may flag a signal that must not wait for the band (PULSE
+        # recovery mode, docs/RECOVERY_STUDY_PREREG.md); the flag is consumed.
+        force = [st[sid].pop("force_rebalance", False) for sid in sids]
         pending_orders, _hit, _gap = plan_orders(target, mv, {}, prices, set(), equity,
-                                                 band=band, min_trade_frac=min_trade_frac,
+                                                 band=0.0 if any(force) else band,
+                                                 min_trade_frac=min_trade_frac,
                                                  signal_override=signal_override)
         if observer is not None:
             observer(T, dict(target), dict(mv), equity, _hit)
