@@ -67,3 +67,21 @@ Dot-com stress is the synthetic model fixed in the pre-registration (price index
 Live dry run (2026-10-12, branch `tv025-switch`): the one-time rebalance sells ~$859 QQQM and buys
 ~$885 QLD (PULSE leverage 1.46x → 1.66x, Nasdaq-100 exposure 1.13x → ~1.25x); estimated realized
 short-term gain ~$18, tax ~$6. VALIDATION.md regenerated for 0.25: both sleeves admitted.
+
+## Addendum 2026-11-05: switch to 0.275 by user decision (outside the pre-registered selection)
+
+After the recovery-mode and credit-confirmation studies failed ([RECOVERY_STUDY.md](RECOVERY_STUDY.md),
+[CREDIT_STUDY.md](CREDIT_STUDY.md)), the user chose 0.275 for more upside, knowing it misses the original
+−45% PULSE standalone drawdown limit. Re-check on the same code, 2008-01-02 → 2026-11-04:
+
+| target vol | after tax 32/15 | 24/15 | 37/20 | pre-tax | Sharpe | MaxDD | COVID | 2022 | Oct 6 → Nov 4 2026 | turnover | PULSE standalone MaxDD |
+|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|
+| 0.25 | 15.83% | 16.91% | 14.87% | 20.95% | 1.055 | −28.5% | −22.1% | −18.1% | −12.9% | 5.1x | −42.7% (admitted) |
+| 0.275 | 16.75% | 17.72% | 15.76% | 21.72% | 1.046 | −29.3% | −24.6% | −24.2% | −14.7% | 5.3x | −45.1% (misses −45%) |
+
+Dot-com stress (index model, unchanged): −45.1% → −48.4%.
+
+Live dry run (2026-11-04 evening, as_of Nov 4, read-only against the live account): without the
+one-time rebalance the 40% band holds at either target. With it, the next cycle sells ~$351 QQQM and
+buys ~$338 QLD (PULSE target 1.12x → 1.23x; Nasdaq-100 exposure 0.76x → 0.81x); the QQQM sold
+realizes about −$21 at average cost.
