@@ -41,6 +41,7 @@ from ..strategies.base import MarketView
 from ..strategies.registry import build_all
 from . import report as R
 from .alerts import Alerter
+from .broker import OrderRejected
 from .intelligence import compute_regime
 from .killswitch import KillSwitch
 from .ledger import OwnershipLedger
@@ -278,6 +279,34 @@ def size_buys_to_cash(buys, cash: float, buffer: float = CASH_BUFFER):
     for o in buys:
         out.append({**o, "qty": round(o["qty"] * scale, 4),
                     "notional": o["notional"] * scale})
+    return out
+
+
+def fit_sells_to_positions(orders: List[dict], positions: Dict[str, dict],
+                           account_target: Dict[str, float]) -> List[dict]:
+    """Size sells in the shares the account actually holds (live boundary only).
+
+    plan_orders sizes in dollars at the prior close, but the broker marks
+    holdings at its latest trade, which at 09:00 is pre-market. A full exit
+    sized that way asks for more shares than are held when the stock is up
+    overnight. Alpaca rejected those on 2026-11-06 and 11-09, and that stopped
+    the cycle. When the stock is down it strands a sliver instead (2026-11-10).
+    So a full exit sells exactly the shares available, and no sell asks for
+    more than that. Buys are untouched. The account simulator needs none of
+    this: it marks holdings at the same close it sizes with.
+    """
+    out = []
+    for o in orders:
+        pos = positions.get(o["symbol"])
+        if o["side"] != "sell" or pos is None:
+            out.append(dict(o))
+            continue
+        avail = float(pos.get("qty_available", pos.get("qty", 0.0)) or 0.0)
+        qty = avail if account_target.get(o["symbol"], 0.0) <= 0.0 else min(o["qty"], avail)
+        if qty <= 0.0:
+            continue
+        price = o["notional"] / o["qty"] if o["qty"] > 0 else 0.0
+        out.append({**o, "qty": qty, "notional": qty * price})
     return out
 
 
@@ -522,6 +551,7 @@ def run_cycle(broker, strategies, cfg, ledger, kill_switch, alerter,
     if band_now > 0 and not band_hit:
         log.info("rebalance band: largest weight gap %.2f%% <= band %.2f%% — holding",
                  weight_gap * 100, cfg.rebalance_band * 100)
+    orders = fit_sells_to_positions(orders, positions, account_target)
 
     # Sells first, buys second. On a cash account (multiplier 1) buying power
     # is settled+unsettled cash; a sell queued at 09:00 frees nothing until it
@@ -532,15 +562,24 @@ def run_cycle(broker, strategies, cfg, ledger, kill_switch, alerter,
     buys = [o for o in orders if o["side"] == "buy"]
     submitted = 0
     placed: List[tuple] = []          # (client_order_id or None, order dict)
+    rejected: List[tuple] = []        # (order dict, broker's reason)
 
-    def _submit(o):
+    def _submit(o) -> bool:
         coid = (f"{cfg.order_namespace}_{o['symbol']}_{o['side']}_"
                 f"{int(time.time() * 1000)}")
-        result = broker.submit_market_order(o["symbol"], o["side"],
-                                            o["qty"], coid)
+        try:
+            result = broker.submit_market_order(o["symbol"], o["side"],
+                                                o["qty"], coid)
+        except OrderRejected as exc:
+            # One refused order must not stop the rest of the cycle: on
+            # 2026-11-06 a rejected QLD sell left every other trade undone.
+            log.error("order rejected: %s", exc)
+            rejected.append((o, str(exc)))
+            return False
         ledger.register_order("ENGINE", o["symbol"], o["side"], o["qty"],
                               coid, result.get("id"), o["notional"])
         placed.append((coid, o))
+        return True
 
     if dry_run or broker is None:
         for o in sells + buys:
@@ -549,11 +588,11 @@ def run_cycle(broker, strategies, cfg, ledger, kill_switch, alerter,
             placed.append((None, o))
     else:
         for o in sells:
-            _submit(o)
-            submitted += 1
+            submitted += _submit(o)
         if buys:
             need = sum(o["notional"] for o in buys)
-            cash, timed_out = _wait_for_cash(broker, need, sells, log)
+            cash, timed_out = _wait_for_cash(broker, need,
+                                             [o for _, o in placed if o["side"] == "sell"], log)
             sized = size_buys_to_cash(buys, cash)
             short = need - sum(o["notional"] for o in sized)
             if short > 0.02 * max(account_equity, 1.0):
@@ -565,13 +604,19 @@ def run_cycle(broker, strategies, cfg, ledger, kill_switch, alerter,
             for o in sized:
                 if o["qty"] <= 0 or o["notional"] < MIN_ORDER_USD:
                     continue
-                _submit(o)
-                submitted += 1
+                submitted += _submit(o)
+        if rejected:
+            names = ", ".join(f"{o['side']} {o['symbol']}" for o, _ in rejected)
+            warnings.append(f"The broker rejected the order{'s' if len(rejected) > 1 else ''} "
+                            f"to {names}. The rest of this morning's orders went in; the "
+                            f"next cycle plans again.")
+            alerter.critical(*R.build_orders_rejected(
+                [f"{o['side']} {o['symbol']} ~${o['notional']:,.0f}: {why}" for o, why in rejected]))
 
     ledger.save(state_dir() / _LEDGER_FILE)
-    if forced and not dry_run and broker is not None:
-        # Recorded only once orders are in (or nothing needed trading), so a
-        # cycle that fails before this point retries the rebalance next time.
+    if forced and not dry_run and broker is not None and not rejected:
+        # Recorded only once every order is in (or nothing needed trading), so
+        # a cycle that fails or has an order refused retries the rebalance.
         _record_rebalance_token(token)
 
     # The evening report (engine/evening.py) tells the day's story after the
@@ -604,7 +649,7 @@ def run_cycle(broker, strategies, cfg, ledger, kill_switch, alerter,
 
     summary = {"date": datetime.now(ZoneInfo("America/New_York")).date().isoformat(),
                "as_of": str(as_of.date()), "stale_days": stale,
-               "status": "traded" if placed else "held",
+               "status": "traded" if placed else ("rejected" if rejected else "held"),
                "regime": regime.regime, "regime_score": round(regime.score, 1),
                "pulse_leverage": round(pulse_lev, 3), "rotation": rotation_now,
                "equity": round(account_equity, 2), "orphans": len(orphan_symbols),
@@ -766,6 +811,18 @@ def _safe_cycle(broker, strategies, cfg, ledger, kill_switch, alerter,
         tb = traceback.format_exc()
         log.exception("cycle error")
         alerter.critical(*R.build_cycle_failed(tb))
+        if not dry_run:
+            # So the evening report says the cycle failed instead of "held".
+            try:
+                save_cycle_summary({
+                    "date": datetime.now(ZoneInfo("America/New_York")).date().isoformat(),
+                    "status": "failed", "orders": [], "trade_reason": None,
+                    "warnings": ["This morning's cycle stopped with an error before it "
+                                 "finished, so the book was not fully rebalanced. The "
+                                 "\"Today's cycle failed\" email has the details."],
+                    "mode": "FAILED"})
+            except Exception:
+                log.exception("could not record the failed cycle")
     finally:
         _record_cycle_date()
 

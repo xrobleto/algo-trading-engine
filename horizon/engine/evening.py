@@ -298,8 +298,10 @@ def run_evening_report(broker, strategies, cfg, ledger, kill_switch, alerter,
         if summary.get("status") == "held":
             cycle_note = (f"No trades this morning. Holdings were {summary.get('weight_gap', 0):.1%} "
                           f"from target; the engine rebalances at {cfg.rebalance_band:.0%}.")
-        elif summary.get("status") in ("refused-stale", "skipped"):
+        elif summary.get("status") in ("refused-stale", "skipped", "rejected"):
             cycle_note = "No trades: this morning's cycle did not trade (see warnings)."
+        elif summary.get("status") == "failed":
+            cycle_note = "No trades: this morning's cycle stopped with an error (see warnings)."
         else:
             cycle_note = "No trades this morning."
 
@@ -307,7 +309,7 @@ def run_evening_report(broker, strategies, cfg, ledger, kill_switch, alerter,
         day=day, perf=perf, equity=equity, dollars=dollars, trades=trades,
         trade_reason=summary.get("trade_reason"), cycle_note=cycle_note, outlook=outlook,
         holdings=holdings, cash=cash, signals=signals, prev_regime=prev_regime, tax=tax,
-        warnings=warnings)
+        warnings=warnings, cycle_failed=summary.get("status") == "failed")
     if send:
         R.save_state(state_path, rstate)
         alerter.heartbeat(subject, text, html)

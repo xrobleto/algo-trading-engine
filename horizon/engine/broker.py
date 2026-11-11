@@ -21,6 +21,10 @@ class ReadOnlyError(BrokerError):
     """A read-only broker was asked to write."""
 
 
+class OrderRejected(BrokerError):
+    """The broker answered an order with an error: that order was not placed."""
+
+
 class BrokerFacade:
     def __init__(self, api_key: str, secret_key: str, paper: bool = True):
         from alpaca.trading.client import TradingClient
@@ -142,6 +146,8 @@ class BrokerFacade:
             out[p.symbol] = {
                 "symbol": p.symbol,
                 "qty": float(p.qty),
+                # shares not already committed to open orders: the most a sell may ask for
+                "qty_available": float(getattr(p, "qty_available", None) or p.qty),
                 "market_value": float(p.market_value),
                 "avg_entry_price": float(p.avg_entry_price),
             }
@@ -163,6 +169,7 @@ class BrokerFacade:
 
     def submit_market_order(self, symbol: str, side: str, qty: float,
                             client_order_id: str) -> dict:
+        from alpaca.common.exceptions import APIError
         from alpaca.trading.enums import OrderSide, TimeInForce
         from alpaca.trading.requests import MarketOrderRequest
         req = MarketOrderRequest(
@@ -172,7 +179,10 @@ class BrokerFacade:
             time_in_force=TimeInForce.DAY,
             client_order_id=client_order_id,
         )
-        return self._order_dict(self._client.submit_order(req))
+        try:
+            return self._order_dict(self._client.submit_order(req))
+        except APIError as exc:
+            raise OrderRejected(f"{side} {symbol} qty={abs(qty):g}: {exc}") from exc
 
     def cancel_all_orders(self) -> int:
         """Cancel every open order. Returns the count attempted."""

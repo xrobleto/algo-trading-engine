@@ -253,13 +253,16 @@ def build_evening_report(*, day: str, perf: Optional[dict], equity: float,
                          trade_reason: Optional[str], cycle_note: Optional[str],
                          outlook: Optional[dict], holdings: Dict[str, float], cash: float,
                          signals: Optional[dict], prev_regime: Optional[str],
-                         tax: Optional[dict], warnings: List[str]) -> Email:
+                         tax: Optional[dict], warnings: List[str],
+                         cycle_failed: bool = False) -> Email:
     """The once-a-day report, sent after the close. See engine/evening.py."""
     rows = [dict(r, label="Today" if r["label"] == "Last session" else r["label"])
             for r in ((perf or {}).get("rows") or [])]
     today = rows[0] if rows and rows[0]["label"] == "Today" else None
     n = len(trades)
     act = "held" if n == 0 else f"{n} trade{'s' if n != 1 else ''}"
+    if cycle_failed:
+        act = "cycle failed" if n == 0 else f"{act} · cycle failed"
     warn_tag = f" · {len(warnings)} warning{'s' if len(warnings) != 1 else ''}" if warnings else ""
     if today:
         subject = (f"{_d(day)}: {_pct(today['horizon'])} · QQQ {_pct(today.get('QQQ', 0.0))} · "
@@ -529,6 +532,19 @@ def build_cycle_failed(tb: str) -> Email:
                     "The engine will not retry today. The next attempt is the next weekday's 9:00 AM ET "
                     "cycle, so check the account before then."],
         callout=[f"Error: {last}"], detail=tb.strip())
+
+
+def build_orders_rejected(lines: List[str]) -> Email:
+    n = len(lines)
+    return _event(
+        kicker="Horizon · Action needed", tone="action",
+        title=f"The broker rejected {n} order{'s' if n != 1 else ''}",
+        subject=f"{n} order{'s' if n != 1 else ''} rejected this morning",
+        paragraphs=["This morning's cycle ran, but the broker refused the order(s) below, so "
+                    "those trades did not happen. Every other order went in.",
+                    "The next weekday's 9:00 AM ET cycle plans again from the actual holdings. "
+                    "If the same order is refused again, the account needs a look."],
+        callout=lines)
 
 
 def build_stale_data(as_of: str, completed: str, limit_days: int) -> Email:

@@ -519,6 +519,9 @@ def test_evening_report_content():
                                             cycle_note="No trades this morning.", outlook=outlook,
                                             warnings=[], **common)
     assert subj == "Fri Oct 30: -4.01% · QQQ -3.47% · SPY -1.77% · held", subj
+    subj, _, _ = build_evening_report(trades=[], trade_reason=None, cycle_note=None, outlook=outlook,
+                                      warnings=["x"], cycle_failed=True, **common)
+    assert subj.endswith("· SPY -1.77% · cycle failed · 1 warning"), subj
     for label in ("Today", "Week to date", "Month to date", "Since Sep 4"):
         assert label in text and label in html
     assert "Last session" not in text and "Last session" not in html
@@ -871,6 +874,119 @@ def test_pulse_levered_etf_expression():
     assert LEVERED_ASSET not in PulseStrategy().universe()
 
 
+def test_sells_fit_held_shares():
+    """A full exit sells exactly the shares held, whichever way the price moved
+    overnight. Planned at the prior close, the 2026-11-06 QLD exit asked for
+    12.1581 shares with 11.7972 held, and the broker refused it. No other sell
+    asks for more than is available. Buys pass through unchanged."""
+    from ..engine.main import fit_sells_to_positions
+    pos = {"QLD": {"qty": 11.7972, "qty_available": 11.7972, "market_value": 935.0},
+           "QQQM": {"qty": 10.9228, "qty_available": 10.9228, "market_value": 3082.0},
+           "PDBC": {"qty": 68.6171, "market_value": 1255.0},       # no qty_available: use qty
+           "SHV": {"qty": 11.377, "qty_available": 0.0, "market_value": 1253.0}}
+    target = {"QQQM": 2500.0, "PDBC": 900.0, "SHV": 1000.0}        # QLD -> 0: full exit
+    sell = lambda s, q, px: {"symbol": s, "side": "sell", "qty": q, "notional": q * px}
+    for planned in (12.1581, 11.5051):                              # up overnight / down overnight
+        out = fit_sells_to_positions([sell("QLD", planned, 76.9)], pos, target)
+        assert out[0]["qty"] == 11.7972, out
+        assert abs(out[0]["notional"] - 11.7972 * 76.9) < 1e-6
+    out = {o["symbol"]: o for o in fit_sells_to_positions(
+        [sell("QQQM", 2.0, 280.0), sell("PDBC", 99.0, 18.0), sell("SHV", 1.0, 110.0),
+         {"symbol": "IAU", "side": "buy", "qty": 3.0, "notional": 180.0}], pos, target)}
+    assert out["QQQM"]["qty"] == 2.0                                # partial sell within holdings
+    assert out["PDBC"]["qty"] == 68.6171                            # capped at the shares held
+    assert "SHV" not in out                                         # nothing available: no order
+    assert out["IAU"] == {"symbol": "IAU", "side": "buy", "qty": 3.0, "notional": 180.0}
+
+
+class _Alerts:
+    def __init__(self):
+        self.critical_calls = []
+
+    def critical(self, subject, body="", html=None):
+        self.critical_calls.append(subject)
+
+    def warning(self, subject, body="", html=None):
+        pass
+
+    def heartbeat(self, subject, body="", html=None):
+        pass
+
+
+def test_rejected_order_does_not_stop_the_cycle():
+    """A broker refusal of one order (OrderRejected) is reported, and the rest
+    of the cycle's orders still go in. A one-time rebalance with a refused
+    order is not marked done, so it retries at the next cycle."""
+    import os
+    from ..config import build_default_config
+    from ..engine import main as M
+    from ..engine.broker import OrderRejected
+    from ..engine.killswitch import KillSwitch
+
+    class _Refuses(_SpyBroker):
+        refused = None
+
+        def submit_market_order(self, symbol, side, qty, client_order_id):
+            if self.refused is None:
+                self.refused = symbol
+                raise OrderRejected(f"{side} {symbol} qty={qty:g}: insufficient qty available")
+            return super().submit_market_order(symbol, side, qty, client_order_id)
+
+    env = {k: os.environ.get(k) for k in ("ALGO_OUTPUT_DIR", "HORIZON_ALERTS_ENABLED")}
+    real_staleness = M.data_staleness_days
+    M.data_staleness_days = lambda as_of, now=None: 0
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            os.environ["ALGO_OUTPUT_DIR"], os.environ["HORIZON_ALERTS_ENABLED"] = d, "0"
+            broker, alerts = _Refuses(), _Alerts()
+            summary = M.run_cycle(broker, registry.build_all(), build_default_config(),
+                                  OwnershipLedger(), KillSwitch(), alerts, dry_run=False)
+            token_recorded = (M.state_dir() / M._REBALANCE_TOKEN_FILE).exists()
+    finally:
+        M.data_staleness_days = real_staleness
+        for k, v in env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+    assert broker.refused and len(broker.writes) == summary["orders_planned"] - 1 > 0
+    assert summary["orders_submitted"] == len(broker.writes) and summary["status"] == "traded"
+    assert any("rejected" in w and broker.refused in w for w in summary["warnings"]), summary
+    assert alerts.critical_calls == ["1 order rejected this morning"], alerts.critical_calls
+    assert summary["forced"] and not token_recorded, "a refused rebalance must retry"
+
+
+def test_failed_cycle_is_recorded():
+    """A cycle that stops with an error is recorded as failed for the day, so
+    the evening report does not call it "held"."""
+    import os
+    from ..config import build_default_config
+    from ..engine import main as M
+    from ..engine.killswitch import KillSwitch
+    env = os.environ.get("ALGO_OUTPUT_DIR")
+    real = M.run_cycle
+
+    def boom(*a, **k):
+        raise RuntimeError("boom")
+
+    M.run_cycle = boom
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            os.environ["ALGO_OUTPUT_DIR"] = d
+            alerts = _Alerts()
+            M._safe_cycle(None, {}, build_default_config(), OwnershipLedger(), KillSwitch(),
+                          alerts, dry_run=False)
+            summary = M.load_cycle_summary()
+    finally:
+        M.run_cycle = real
+        if env is None:
+            os.environ.pop("ALGO_OUTPUT_DIR", None)
+        else:
+            os.environ["ALGO_OUTPUT_DIR"] = env
+    assert summary["status"] == "failed" and "stopped with an error" in summary["warnings"][0]
+    assert alerts.critical_calls, "the failure alert must still go out"
+
+
 def test_recovery_credit_confirmation():
     """Recovery mode (docs/CREDIT_STUDY_PREREG.md): "price+credit" needs both
     confirmations, "credit" can lead price, every rule ends at a new high, the
@@ -931,6 +1047,8 @@ def main() -> int:
              test_alerter_resend_transport, test_performance_from_daily_closes,
              test_event_emails_are_actionable,
              test_pulse_levered_etf_expression, test_recovery_credit_confirmation,
+             test_sells_fit_held_shares, test_rejected_order_does_not_stop_the_cycle,
+             test_failed_cycle_is_recorded,
              test_no_lookahead, test_single_source_of_truth,
              test_strategies_decide_cleanly, test_risk_overlay_recovers,
              test_ledger_roundtrip, test_harness_smoke,
